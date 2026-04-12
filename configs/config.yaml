@@ -1,0 +1,62 @@
+server:
+  port: 8080
+  mode: debug  # debug / release / test
+  env: development  # development / production
+  base_url: "http://localhost:8090"  # 后端服务对外地址
+  platform_domain: "tokenhubhk.com"  # main platform domain; custom agent domains resolve tenants
+
+database:
+  host: 127.0.0.1
+  port: 3306
+  user: root
+  password: root
+  dbname: tokenhub
+  max_open_conns: 100
+  max_idle_conns: 10
+  conn_max_lifetime: 3600  # seconds
+
+redis:
+  addr: 127.0.0.1:6379
+  password: ""
+  db: 0
+
+jwt:
+  secret: "Kx9mP2$vL5nQ8wR3jF6hT0yB4cA7dG1eU2iO5pS8aW1xZ3bN6vC9kM4qJ7fH0gD"
+  expire: 720  # hours (30 days)
+
+log:
+  level: info  # debug / info / warn / error
+  dir: ./logs
+  max_size: 100    # MB
+  max_age: 30      # days
+  max_backups: 5
+
+ratelimit:
+  enabled: true
+  max_requests: 100
+  window_seconds: 60
+
+i18n:
+  default_lang: en
+  locales_dir: ./internal/pkg/i18n/locales
+
+payment:
+  wechat:
+    app_id: ""
+    mch_id: ""
+    api_key: ""
+    cert_serial_no: ""
+    private_key_path: ""
+    notify_url: "https://api.tokenhub.com/api/v1/callback/wechat"
+  alipay:
+    app_id: ""
+    private_key: ""
+    alipay_public_key: ""
+    notify_url: "https://api.tokenhub.com/api/v1/callback/alipay"
+  stripe:
+    secret_key: ""
+    webhook_secret: ""
+  paypal:
+    client_id: ""
+    client_secret: ""
+    sandbox: true

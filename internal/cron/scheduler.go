@@ -12,6 +12,7 @@ import (
 
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/credits"
+	pkgredis "tokenhub-server/internal/pkg/redis"
 	"tokenhub-server/internal/service/balance"
 	channelsvc "tokenhub-server/internal/service/channel"
 	"tokenhub-server/internal/service/member"
@@ -96,6 +97,7 @@ func (s *Scheduler) Start() {
 	s.registerTask("consume_rotate", "每月1号: 月消费轮转", true)
 	s.registerTask("member_degrade", "每月1号: 会员降级检查", true)
 	s.registerTask("logs_cleanup", "每日04:00: 清理7天前调用日志", true)
+	s.registerTask("inflight_reset", "每5分钟: 重置渠道在途请求计数", true)
 
 	// 启动每小时任务（冻结超时释放 + 对账）
 	go s.runEveryHour()
@@ -107,6 +109,8 @@ func (s *Scheduler) Start() {
 	go s.runMonthly()
 	// 启动日志清理任务（每日04:00）
 	go s.runLogsCleanup()
+	// 启动在途请求计数重置（防进程崩溃残留）
+	go s.runInflightReset()
 
 	zap.L().Info("定时任务调度器已启动",
 		zap.String("timezone", shanghaiLoc.String()),
@@ -501,6 +505,36 @@ func (s *Scheduler) cleanupOldLogs(ctx context.Context) error {
 	return nil
 }
 
+// ==================== 在途请求计数重置 ====================
+
+// runInflightReset 每5分钟重置渠道在途请求计数器
+// 防止 Pod 崩溃后 Redis HINCRBY 计数不归零导致负载路由偏差
+func (s *Scheduler) runInflightReset() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.safeRunNamed("inflight_reset", "重置在途请求计数", func(ctx context.Context) error {
+				if s.redis == nil {
+					return nil
+				}
+				deleted, err := s.redis.Del(ctx, "channel:inflight", "stream:active:global").Result()
+				if err != nil {
+					return fmt.Errorf("重置计数失败: %w", err)
+				}
+				if deleted > 0 {
+					zap.L().Debug("在途请求计数已重置", zap.Int64("keys_deleted", deleted))
+				}
+				return nil
+			})
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
 // ==================== 业务逻辑 ====================
 
 // settleCommissions 自动结算超过7天的PENDING佣金
@@ -696,6 +730,21 @@ func (s *Scheduler) safeRunNamed(taskID, taskName string, fn func(context.Contex
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+
+	// 分布式锁：同一时刻只有一个进程/Pod 执行此任务
+	// 支持多 Worker 副本部署（K8s 水平扩容安全）
+	if s.redis != nil {
+		lockKey := "cron:" + taskName
+		lock, err := pkgredis.Lock(ctx, lockKey, 10*time.Minute)
+		if err != nil {
+			// 另一个实例已在执行，静默跳过
+			zap.L().Debug("定时任务已被其他实例锁定，跳过",
+				zap.String("task", taskName),
+			)
+			return
+		}
+		defer lock.Unlock(ctx)
+	}
 
 	zap.L().Info("定时任务开始执行", zap.String("task", taskName))
 	start := time.Now()

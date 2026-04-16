@@ -240,7 +240,7 @@ func RefreshDefaultRoutes(ctx context.Context, db *gorm.DB, rds *goredis.Client,
 
 	// 6. 事务：清空旧路由 + 批量写入新路由
 	txErr := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("custom_channel_id = ?", defaultCC.ID).
+		if err := tx.Unscoped().Where("custom_channel_id = ?", defaultCC.ID).
 			Delete(&model.CustomChannelRoute{}).Error; err != nil {
 			return fmt.Errorf("删除旧路由失败: %w", err)
 		}

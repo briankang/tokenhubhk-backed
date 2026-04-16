@@ -29,8 +29,12 @@ const (
 	openAPIRateMax = 60
 )
 
+// apiKeyCacheTTL API Key Redis 缓存有效期（减轻多副本下的 DB 查询压力）
+const apiKeyCacheTTL = 5 * time.Minute
+
 // OpenAPIAuth 返回 Open API 专用 Bearer Token (API Key) 认证中间件。
 // 从 Authorization: Bearer <api_key> 提取 API Key，验证有效性并注入 user_id/tenant_id。
+// 使用 Redis 缓存 API Key 元数据，减轻多 Gateway Pod 高并发时的 DB 查询压力。
 func OpenAPIAuth(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 提取 Bearer Token
@@ -46,16 +50,26 @@ func OpenAPIAuth(db *gorm.DB) gin.HandlerFunc {
 		hashStr := hex.EncodeToString(hash[:])
 
 		var apiKey model.ApiKey
-		err := db.Where("key_hash = ?", hashStr).First(&apiKey).Error
-		if err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				response.Error(c, http.StatusUnauthorized, errcode.ErrApiKeyInvalid)
+		cacheKey := "apikey:hash:" + hashStr
+
+		// 1. 先查 Redis 缓存
+		if err := pkgredis.GetJSON(c.Request.Context(), cacheKey, &apiKey); err == nil && apiKey.ID > 0 {
+			// 缓存命中
+		} else {
+			// 2. 缓存未命中，查 DB
+			err := db.Where("key_hash = ?", hashStr).First(&apiKey).Error
+			if err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					response.Error(c, http.StatusUnauthorized, errcode.ErrApiKeyInvalid)
+					c.Abort()
+					return
+				}
+				response.Error(c, http.StatusInternalServerError, errcode.ErrInternal)
 				c.Abort()
 				return
 			}
-			response.Error(c, http.StatusInternalServerError, errcode.ErrInternal)
-			c.Abort()
-			return
+			// 3. 写入 Redis 缓存
+			_ = pkgredis.SetJSON(c.Request.Context(), cacheKey, &apiKey, apiKeyCacheTTL)
 		}
 
 		// 检查 Key 是否激活

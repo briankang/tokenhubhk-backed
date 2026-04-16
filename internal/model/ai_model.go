@@ -86,8 +86,9 @@ type AIModel struct {
 	CacheExplicitInputPriceRMB float64 `gorm:"type:decimal(20,6);default:0" json:"cache_explicit_input_price_rmb"` // 显式缓存命中价，元/百万Token（both模式专用，如阿里云显式缓存）
 	CacheWritePriceRMB         float64 `gorm:"type:decimal(20,6);default:0" json:"cache_write_price_rmb"`         // 缓存写入溢价，元/百万Token（Anthropic/阿里云显式缓存专用）
 	CacheStoragePriceRMB       float64 `gorm:"type:decimal(20,6);default:0" json:"cache_storage_price_rmb"`       // 缓存存储价，元/百万Token/小时（火山引擎/Gemini显式缓存）
-	Tags             string `gorm:"type:varchar(500)" json:"tags,omitempty"`                 // 搜索标签（逗号分隔，如 "DeepSeek,深度求索"），支持跨供应商搜索
-	CallCount        int64  `gorm:"type:bigint;default:0;index" json:"call_count"`           // 累计调用次数
+	Tags             string  `gorm:"type:varchar(500)" json:"tags,omitempty"`                 // 搜索标签（逗号分隔，如 "DeepSeek,深度求索"），支持跨供应商搜索
+	CallCount        int64   `gorm:"type:bigint;default:0;index" json:"call_count"`           // 累计调用次数
+	Discount         float64 `gorm:"type:decimal(5,4);default:0" json:"discount"`             // 模型独立折扣（0=未设置，继承供应商折扣；>0 如0.85=85折）
 
 	Category ModelCategory `gorm:"foreignKey:CategoryID" json:"category,omitempty"` // 关联分类
 	Supplier Supplier      `gorm:"foreignKey:SupplierID" json:"supplier,omitempty"` // 关联供应商

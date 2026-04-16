@@ -325,12 +325,12 @@ func (h *CustomChannelHandler) Delete(c *gin.Context) {
 
 	// 事务：先删路由和访问控制，再删主表
 	txErr := h.db.Transaction(func(tx *gorm.DB) error {
-		// 删除关联的路由规则
-		if err := tx.Where("custom_channel_id = ?", cc.ID).Delete(&model.CustomChannelRoute{}).Error; err != nil {
+		// 删除关联的路由规则（硬删除，避免唯一索引冲突）
+		if err := tx.Unscoped().Where("custom_channel_id = ?", cc.ID).Delete(&model.CustomChannelRoute{}).Error; err != nil {
 			return err
 		}
 		// 删除关联的访问控制列表
-		if err := tx.Where("custom_channel_id = ?", cc.ID).Delete(&model.CustomChannelAccess{}).Error; err != nil {
+		if err := tx.Unscoped().Where("custom_channel_id = ?", cc.ID).Delete(&model.CustomChannelAccess{}).Error; err != nil {
 			return err
 		}
 		return tx.Delete(&cc).Error
@@ -487,8 +487,8 @@ func (h *CustomChannelHandler) BatchRoutes(c *gin.Context) {
 
 	// 事务：全量替换路由（先删后建）
 	txErr := h.db.Transaction(func(tx *gorm.DB) error {
-		// 删除旧路由
-		if err := tx.Where("custom_channel_id = ?", cc.ID).Delete(&model.CustomChannelRoute{}).Error; err != nil {
+		// 删除旧路由（硬删除，避免唯一索引冲突）
+		if err := tx.Unscoped().Where("custom_channel_id = ?", cc.ID).Delete(&model.CustomChannelRoute{}).Error; err != nil {
 			return err
 		}
 		// 批量创建新路由

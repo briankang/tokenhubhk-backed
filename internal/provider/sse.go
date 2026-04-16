@@ -3,13 +3,14 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	goredis "github.com/redis/go-redis/v9"
 	"tokenhub-server/internal/pkg/logger"
 
 	"github.com/gin-gonic/gin"
@@ -183,46 +184,86 @@ func SSEWriter(c *gin.Context, reader StreamReader, includeUsage bool) (*SSEResu
 	}
 }
 
-// StreamManager 并发流式请求管理器，支持优雅关闭
+// StreamManager 并发流式请求管理器，支持优雅关闭。
+// 使用 Redis 全局计数器实现跨 Pod 共享并发限制。
+// Redis 不可用时 fail-open（允许流式请求通过）。
 type StreamManager struct {
-	wg      sync.WaitGroup
-	active  atomic.Int64
-	maxConn int64
+	wg         sync.WaitGroup
+	redis      *goredis.Client
+	maxConn    int64
+	counterKey string
 }
 
-// NewStreamManager 创建新的流式请求管理器，指定最大并发流数
-func NewStreamManager(maxConcurrent int64) *StreamManager {
+// acquireScript Lua 原子 check-and-increment 脚本
+const acquireScript = `
+	local current = tonumber(redis.call("GET", KEYS[1]) or "0")
+	if current >= tonumber(ARGV[1]) then
+		return 0
+	end
+	redis.call("INCR", KEYS[1])
+	redis.call("EXPIRE", KEYS[1], 600)
+	return 1
+`
+
+// NewStreamManager 创建新的流式请求管理器，指定最大并发流数。
+// redis 参数可为 nil（降级为无全局限制）。
+func NewStreamManager(maxConcurrent int64, redis ...*goredis.Client) *StreamManager {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 1000
 	}
+	var rds *goredis.Client
+	if len(redis) > 0 {
+		rds = redis[0]
+	}
 	return &StreamManager{
-		maxConn: maxConcurrent,
+		maxConn:    maxConcurrent,
+		redis:      rds,
+		counterKey: "stream:active:global",
 	}
 }
 
-// Acquire 尝试获取一个流槽位，达到最大并发数时返回false
+// Acquire 尝试获取一个流槽位（Redis 全局限制）。达到最大并发数时返回 false。
 func (m *StreamManager) Acquire() bool {
-	current := m.active.Load()
-	if current >= m.maxConn {
-		return false
+	if m.redis == nil {
+		// Redis 不可用，fail-open
+		m.wg.Add(1)
+		return true
 	}
-	m.active.Add(1)
-	m.wg.Add(1)
-	return true
+	result, err := m.redis.Eval(context.Background(), acquireScript,
+		[]string{m.counterKey}, m.maxConn).Int64()
+	if err != nil {
+		// Redis 出错，fail-open
+		m.wg.Add(1)
+		return true
+	}
+	if result == 1 {
+		m.wg.Add(1)
+		return true
+	}
+	return false
 }
 
 // Release 释放一个流槽位
 func (m *StreamManager) Release() {
-	m.active.Add(-1)
+	if m.redis != nil {
+		m.redis.Decr(context.Background(), m.counterKey)
+	}
 	m.wg.Done()
 }
 
-// ActiveCount 返回当前活跃流数量
+// ActiveCount 返回全局活跃流数量
 func (m *StreamManager) ActiveCount() int64 {
-	return m.active.Load()
+	if m.redis == nil {
+		return 0
+	}
+	val, err := m.redis.Get(context.Background(), m.counterKey).Int64()
+	if err != nil {
+		return 0
+	}
+	return val
 }
 
-// Wait 阻塞直到所有活跃流完成
+// Wait 阻塞直到本 Pod 内所有活跃流完成
 func (m *StreamManager) Wait() {
 	m.wg.Wait()
 }

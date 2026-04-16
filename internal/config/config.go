@@ -8,8 +8,17 @@ import (
 	"github.com/spf13/viper"
 )
 
+// ServiceRole 服务角色常量
+const (
+	RoleGateway  = "gateway"  // API 网关 / 模型中转
+	RoleBackend  = "backend"  // 用户 + 管理后台
+	RoleWorker   = "worker"   // 后台任务 + 重操作执行器
+	RoleMonolith = ""         // 单体模式（全功能，向后兼容）
+)
+
 // AppConfig 应用程序全局配置结构体
 type AppConfig struct {
+	Service   ServiceConfig   `mapstructure:"service"`
 	Server    ServerConfig    `mapstructure:"server"`
 	Database  DatabaseConfig  `mapstructure:"database"`
 	Redis     RedisConfig     `mapstructure:"redis"`
@@ -18,6 +27,35 @@ type AppConfig struct {
 	RateLimit RateLimitConfig `mapstructure:"ratelimit"`
 	I18n      I18nConfig      `mapstructure:"i18n"`
 	Payment   PaymentConfig   `mapstructure:"payment"`
+}
+
+// ServiceConfig 服务角色配置
+type ServiceConfig struct {
+	Role          string `mapstructure:"role"`           // gateway / backend / worker / ""(monolith)
+	RunMigrations bool   `mapstructure:"run_migrations"` // 是否执行数据库迁移（仅 backend 为 true）
+	TaskSignKey   string `mapstructure:"task_sign_key"`  // Redis Stream 任务签名密钥
+}
+
+// IsGateway 判断是否为 API 网关角色
+func (s *ServiceConfig) IsGateway() bool { return s.Role == RoleGateway }
+
+// IsBackend 判断是否为后台服务角色
+func (s *ServiceConfig) IsBackend() bool { return s.Role == RoleBackend }
+
+// IsWorker 判断是否为后台 Worker 角色
+func (s *ServiceConfig) IsWorker() bool { return s.Role == RoleWorker }
+
+// IsMonolith 判断是否为单体模式（默认）
+func (s *ServiceConfig) IsMonolith() bool { return s.Role == RoleMonolith }
+
+// ShouldRunMigrations 判断是否应执行数据库迁移
+func (s *ServiceConfig) ShouldRunMigrations() bool {
+	return s.RunMigrations || s.IsMonolith()
+}
+
+// ShouldRunScheduler 判断是否应启动定时任务调度器
+func (s *ServiceConfig) ShouldRunScheduler() bool {
+	return s.IsWorker() || s.IsMonolith()
 }
 
 // PaymentConfig 支付网关配置集合
@@ -203,6 +241,11 @@ func applyDefaults() {
 
 // bindEnvVars 为Docker部署显式绑定环境变量
 func bindEnvVars() {
+	// 服务角色
+	_ = viper.BindEnv("service.role", "SERVICE_ROLE")
+	_ = viper.BindEnv("service.run_migrations", "RUN_MIGRATIONS")
+	_ = viper.BindEnv("service.task_sign_key", "TASK_SIGN_KEY")
+
 	_ = viper.BindEnv("server.port", "SERVER_PORT")
 	_ = viper.BindEnv("server.mode", "SERVER_MODE")
 	_ = viper.BindEnv("database.host", "DATABASE_HOST")
@@ -210,6 +253,8 @@ func bindEnvVars() {
 	_ = viper.BindEnv("database.user", "DATABASE_USER")
 	_ = viper.BindEnv("database.password", "DATABASE_PASSWORD")
 	_ = viper.BindEnv("database.dbname", "DATABASE_DBNAME")
+	_ = viper.BindEnv("database.max_open_conns", "DATABASE_MAX_OPEN_CONNS")
+	_ = viper.BindEnv("database.max_idle_conns", "DATABASE_MAX_IDLE_CONNS")
 	_ = viper.BindEnv("redis.addr", "REDIS_ADDR")
 	_ = viper.BindEnv("redis.password", "REDIS_PASSWORD")
 	_ = viper.BindEnv("redis.db", "REDIS_DB")

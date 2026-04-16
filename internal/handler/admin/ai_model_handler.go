@@ -19,6 +19,7 @@ import (
 	"tokenhub-server/internal/pkg/response"
 	aimodelsvc "tokenhub-server/internal/service/aimodel"
 	"tokenhub-server/internal/service/modeldiscovery"
+	"tokenhub-server/internal/taskqueue"
 )
 
 // invalidatePublicModelsCache 清除公开模型列表缓存，使管理员操作立即对用户可见
@@ -28,45 +29,57 @@ func invalidatePublicModelsCache() {
 
 // AIModelHandler AI模型管理接口处理器
 type AIModelHandler struct {
-	svc *aimodelsvc.AIModelService
+	svc    *aimodelsvc.AIModelService
+	bridge *taskqueue.SSEBridge // nil=单体模式，非nil=委派模式
 }
 
 // NewAIModelHandler 创建AI模型管理Handler实例
-func NewAIModelHandler(svc *aimodelsvc.AIModelService) *AIModelHandler {
+func NewAIModelHandler(svc *aimodelsvc.AIModelService, bridge ...*taskqueue.SSEBridge) *AIModelHandler {
 	if svc == nil {
 		panic("admin ai model handler: service is nil")
 	}
-	return &AIModelHandler{svc: svc}
+	h := &AIModelHandler{svc: svc}
+	if len(bridge) > 0 {
+		h.bridge = bridge[0]
+	}
+	return h
+}
+
+// LabelDTO 模型标签 k:v 数据传输对象（公开 API 使用）
+type LabelDTO struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 // PublicModelResponse 公开模型列表响应格式（供前端 /models 页面使用）
 // 字段命名遵循前端 AdminModel 类型定义
 type PublicModelResponse struct {
-	ID                 uint     `json:"id"`                    // 模型 ID
-	ModelID            string   `json:"model_id"`              // 模型标识符（如 gpt-4o）
-	Name               string   `json:"name"`                  // 展示名称
-	Provider           string   `json:"provider"`              // 供应商名称
-	ProviderIcon       string   `json:"provider_icon"`         // 供应商图标（emoji）
-	Description        string   `json:"description"`           // 模型描述
-	ContextWindow      int      `json:"context_window"`        // 上下文窗口大小
-	InputPrice         int64    `json:"input_price"`           // 输入价格（积分/百万token）
-	OutputPrice        int64    `json:"output_price"`          // 输出价格（积分/百万token）
-	InputPriceRMB      float64  `json:"input_price_rmb"`       // 输入价格（人民币/百万token）
-	OutputPriceRMB     float64  `json:"output_price_rmb"`      // 输出价格（人民币/百万token）
-	Capabilities       []string `json:"capabilities"`          // 能力标签
-	Status             string   `json:"status"`                // 状态：online/offline
-	IsNew              bool     `json:"is_new"`                // 是否新品
-	IsFeatured         bool     `json:"is_featured"`           // 是否推荐
-	MaxTokens          int      `json:"max_tokens"`            // 最大输出 Token 数
-	ModelType          string   `json:"model_type"`            // 模型类型: LLM/VLM/ImageGeneration/VideoGeneration/Audio 等
-	Tags               string   `json:"tags"`                  // 搜索标签（逗号分隔）
-	Discount           int      `json:"discount,omitempty"`    // 折扣百分比（如85表示85折），0表示无折扣信息
-	AvgLatencyMs       int64    `json:"avg_latency_ms,omitempty"`  // 平均延迟（毫秒），最近24小时
-	SuccessRate        float64  `json:"success_rate,omitempty"`    // 成功率（0-100），最近24小时
-	RequestCount       int64    `json:"request_count,omitempty"`   // 请求量，最近24小时
+	ID                 uint       `json:"id"`                    // 模型 ID
+	ModelID            string     `json:"model_id"`              // 模型标识符（如 gpt-4o）
+	Name               string     `json:"name"`                  // 展示名称
+	Provider           string     `json:"provider"`              // 供应商名称
+	ProviderIcon       string     `json:"provider_icon"`         // 供应商图标（emoji）
+	Description        string     `json:"description"`           // 模型描述
+	ContextWindow      int        `json:"context_window"`        // 上下文窗口大小
+	InputPrice         int64      `json:"input_price"`           // 输入价格（积分/百万token）
+	OutputPrice        int64      `json:"output_price"`          // 输出价格（积分/百万token）
+	InputPriceRMB      float64    `json:"input_price_rmb"`       // 输入价格（人民币/百万token）
+	OutputPriceRMB     float64    `json:"output_price_rmb"`      // 输出价格（人民币/百万token）
+	Capabilities       []string   `json:"capabilities"`          // 能力标签
+	Status             string     `json:"status"`                // 状态：online/offline
+	IsNew              bool       `json:"is_new"`                // 是否新品
+	IsFeatured         bool       `json:"is_featured"`           // 是否推荐
+	MaxTokens          int        `json:"max_tokens"`            // 最大输出 Token 数
+	ModelType          string     `json:"model_type"`            // 模型类型: LLM/VLM/ImageGeneration/VideoGeneration/Audio 等
+	Tags               string     `json:"tags"`                  // 搜索标签（逗号分隔）
+	Labels             []LabelDTO `json:"labels,omitempty"`      // k:v 标签列表（热卖/开源/优惠等）
+	Discount           int        `json:"discount,omitempty"`    // 折扣百分比（如85表示85折），0表示无折扣信息
+	AvgLatencyMs       int64      `json:"avg_latency_ms,omitempty"`  // 平均延迟（毫秒），最近24小时
+	SuccessRate        float64    `json:"success_rate,omitempty"`    // 成功率（0-100），最近24小时
+	RequestCount       int64      `json:"request_count,omitempty"`   // 请求量，最近24小时
 	// 多计费单位支持（v3.2）
-	PricingUnit        string   `json:"pricing_unit,omitempty"`    // 计费单位: per_million_tokens / per_image / per_second / per_minute / per_10k_characters / per_million_characters / per_call / per_hour
-	Variant            string   `json:"variant,omitempty"`         // 变体/质量档（如 1024x1024/hd/720p）
+	PricingUnit        string     `json:"pricing_unit,omitempty"`    // 计费单位: per_million_tokens / per_image / per_second / per_minute / per_10k_characters / per_million_characters / per_call / per_hour
+	Variant            string     `json:"variant,omitempty"`         // 变体/质量档（如 1024x1024/hd/720p）
 }
 
 // providerIconMap 供应商图标映射（emoji）
@@ -164,9 +177,13 @@ func toPublicResponse(m model.AIModel) PublicModelResponse {
 	outputPrice := int64(outputPriceRMB * 10000)
 
 	// 计算折扣百分比（基于输入价格）
+	// 只有折扣力度超过10%（即售价低于原价9折以下）才在前端展示折扣标签
 	discount := 0
 	if m.InputCostRMB > 0 && inputPriceRMB < m.InputCostRMB {
-		discount = int(math.Round(inputPriceRMB / m.InputCostRMB * 100))
+		d := int(math.Round(inputPriceRMB / m.InputCostRMB * 100))
+		if d < 90 { // < 9折才显示（折扣 > 10%）
+			discount = d
+		}
 	}
 
 	return PublicModelResponse{
@@ -192,6 +209,17 @@ func toPublicResponse(m model.AIModel) PublicModelResponse {
 		PricingUnit:     m.PricingUnit,
 		Variant:         m.Variant,
 	}
+}
+
+// Stats 返回模型统计数量（总数/已启用/在线），直接聚合全量数据，不受分页限制
+// GET /api/v1/admin/ai-models/stats
+func (h *AIModelHandler) Stats(c *gin.Context) {
+	stats, err := h.svc.GetStats(c.Request.Context())
+	if err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	response.Success(c, stats)
 }
 
 // List 分页获取AI模型列表 GET /api/v1/admin/ai-models
@@ -276,6 +304,26 @@ func (h *AIModelHandler) PublicList(c *gin.Context) {
 			list[i].AvgLatencyMs = int64(s.AvgLatency)
 			list[i].SuccessRate = s.SuccessRate
 			list[i].RequestCount = s.RequestCount
+		}
+	}
+
+	// 批量加载模型 k:v 标签（一次查询，避免 N+1）
+	modelIDs := make([]uint, len(models))
+	for i, m := range models {
+		modelIDs[i] = m.ID
+	}
+	var allLabels []model.ModelLabel
+	database.DB.Where("model_id IN ?", modelIDs).Find(&allLabels)
+	labelMap := make(map[uint][]LabelDTO, len(models))
+	for _, lbl := range allLabels {
+		labelMap[lbl.ModelID] = append(labelMap[lbl.ModelID], LabelDTO{
+			Key:   lbl.LabelKey,
+			Value: lbl.LabelValue,
+		})
+	}
+	for i, m := range models {
+		if lbls, ok := labelMap[m.ID]; ok {
+			list[i].Labels = lbls
 		}
 	}
 
@@ -674,6 +722,19 @@ type ScannedOfflineGroup struct {
 // ScanOfflineAll GET /admin/models/scanned-offline
 // 聚合所有API型供应商的扫描下线模型列表
 func (h *AIModelHandler) ScanOfflineAll(c *gin.Context) {
+	// 三服务模式：委派给 Worker
+	if h.bridge != nil {
+		result, err := h.bridge.PublishAndWait(c.Request.Context(), taskqueue.TaskScanOffline, nil)
+		if err != nil {
+			response.ErrorMsg(c, http.StatusInternalServerError, 50001, err.Error())
+			return
+		}
+		// 直接返回 Worker 的 JSON 结果
+		c.Data(http.StatusOK, "application/json", []byte(`{"code":0,"message":"ok","data":`+result.Data+`}`))
+		return
+	}
+
+	// 单体模式：本地执行
 	startTime := time.Now()
 
 	// 查询所有活跃的 API 型供应商

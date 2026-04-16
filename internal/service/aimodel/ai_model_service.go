@@ -81,12 +81,35 @@ func (s *AIModelService) List(ctx context.Context, page, pageSize int) ([]model.
 	return models, total, nil
 }
 
+// ModelStats 模型统计数量，直接从数据库聚合，不受分页限制
+type ModelStats struct {
+	Total   int64 `json:"total"`
+	Enabled int64 `json:"enabled"`
+	Online  int64 `json:"online"`
+}
+
+// GetStats 返回全量模型统计：总数、已启用数、在线数
+func (s *AIModelService) GetStats(ctx context.Context) (*ModelStats, error) {
+	var stats ModelStats
+	db := s.db.WithContext(ctx).Model(&model.AIModel{})
+	if err := db.Count(&stats.Total).Error; err != nil {
+		return nil, fmt.Errorf("failed to count total models: %w", err)
+	}
+	if err := s.db.WithContext(ctx).Model(&model.AIModel{}).Where("is_active = ?", true).Count(&stats.Enabled).Error; err != nil {
+		return nil, fmt.Errorf("failed to count enabled models: %w", err)
+	}
+	if err := s.db.WithContext(ctx).Model(&model.AIModel{}).Where("status = ?", "online").Count(&stats.Online).Error; err != nil {
+		return nil, fmt.Errorf("failed to count online models: %w", err)
+	}
+	return &stats, nil
+}
+
 // ListWithFilter 带供应商和搜索过滤的分页模型列表
 func (s *AIModelService) ListWithFilter(ctx context.Context, page, pageSize int, supplierID uint, search string) ([]model.AIModel, int64, error) {
 	if page < 1 {
 		page = 1
 	}
-	if pageSize < 1 || pageSize > 500 {
+	if pageSize < 1 || pageSize > 10000 {
 		pageSize = 20
 	}
 	var total int64

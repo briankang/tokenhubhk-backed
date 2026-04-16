@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
-	"sync"
-	"sync/atomic"
+	"strconv"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
-	"github.com/sony/gobreaker/v2"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
@@ -23,20 +21,16 @@ import (
 // ChannelRouter 渠道路由引擎，为模型请求选择最优渠道。
 // 基于 CustomChannel 统一路由体系，支持显式路由和自动发现两种模式。
 // 集成优先级/权重/最小负载策略，并配合熔断器保护和备份规则
+// loadCounterKey Redis Hash key，存储所有渠道的全局在途请求数
+const loadCounterKey = "channel:inflight"
+
 type ChannelRouter struct {
-	db       *gorm.DB
-	redis    *goredis.Client
-	breakers map[uint]*gobreaker.CircuitBreaker[interface{}]
-	mu       sync.RWMutex
-	logger   *zap.Logger
+	db     *gorm.DB
+	redis  *goredis.Client
+	logger *zap.Logger
 
-	// 每个分组的轮询计数器
-	rrCounters map[uint]*atomic.Uint64
-	rrMu       sync.RWMutex
-
-	// 每个渠道的负载计数器（在途请求数）
-	loadCounters map[uint]*atomic.Int64
-	loadMu       sync.RWMutex
+	// 熔断器配置（所有渠道共享同一配置）
+	breakerCfg RedisCircuitBreakerConfig
 
 	groupSvc  *ChannelGroupService
 	backupSvc *BackupService
@@ -48,14 +42,12 @@ func NewChannelRouter(db *gorm.DB, redis *goredis.Client, groupSvc *ChannelGroup
 		panic("ChannelRouter: db is nil")
 	}
 	return &ChannelRouter{
-		db:           db,
-		redis:        redis,
-		breakers:     make(map[uint]*gobreaker.CircuitBreaker[interface{}]),
-		logger:       logger.L,
-		rrCounters:   make(map[uint]*atomic.Uint64),
-		loadCounters: make(map[uint]*atomic.Int64),
-		groupSvc:     groupSvc,
-		backupSvc:    backupSvc,
+		db:         db,
+		redis:      redis,
+		logger:     logger.L,
+		breakerCfg: DefaultBreakerConfig(),
+		groupSvc:   groupSvc,
+		backupSvc:  backupSvc,
 	}
 }
 
@@ -411,7 +403,7 @@ func (r *ChannelRouter) applyStrategy(strategy string, candidates []RouteCandida
 	var available []RouteCandidate
 	for _, c := range candidates {
 		breaker := r.getOrCreateBreaker(c.Channel.ID)
-		if breaker.State() != gobreaker.StateOpen {
+		if !breaker.IsOpen(context.Background()) {
 			available = append(available, c)
 		}
 	}
@@ -515,51 +507,54 @@ func (r *ChannelRouter) selectCandidateByPriority(candidates []RouteCandidate) *
 	return r.selectCandidateByWeight(topGroup)
 }
 
-// selectCandidateByRoundRobin 轮询选择候选
+// selectCandidateByRoundRobin 轮询选择候选（Redis 全局共享计数器）
 // 使用 groupKey 作为计数器 key，保证同一分组的轮询独立
 func (r *ChannelRouter) selectCandidateByRoundRobin(candidates []RouteCandidate, groupKey uint) *RouteCandidate {
 	if len(candidates) == 0 {
 		return nil
 	}
 
-	// 使用 groupKey + 偏移量（避免与渠道组ID冲突）作为轮询计数器key
-	rrKey := groupKey + 2000000 // 偏移量避免与旧渠道组/混合渠道ID冲突
-	r.rrMu.Lock()
-	if _, ok := r.rrCounters[rrKey]; !ok {
-		r.rrCounters[rrKey] = &atomic.Uint64{}
+	key := fmt.Sprintf("rr:group:%d", groupKey)
+	idx, err := r.redis.Incr(context.Background(), key).Result()
+	if err != nil {
+		// Redis 不可用时降级为随机选择
+		return &candidates[rand.Intn(len(candidates))]
 	}
-	counter := r.rrCounters[rrKey]
-	r.rrMu.Unlock()
-
-	idx := counter.Add(1) - 1
-	return &candidates[idx%uint64(len(candidates))]
+	return &candidates[(idx-1)%int64(len(candidates))]
 }
 
-// selectCandidateByLeastLoad 选择在途请求最少的候选
-// 基于每个候选 Channel 的负载计数器
+// selectCandidateByLeastLoad 选择在途请求最少的候选（Redis 全局负载计数）
 func (r *ChannelRouter) selectCandidateByLeastLoad(candidates []RouteCandidate) *RouteCandidate {
 	if len(candidates) == 0 {
 		return nil
 	}
 
-	var best *RouteCandidate
+	// 批量读取所有候选渠道的在途请求数
+	fields := make([]string, len(candidates))
+	for i, c := range candidates {
+		fields[i] = fmt.Sprintf("%d", c.Channel.ID)
+	}
+	vals, err := r.redis.HMGet(context.Background(), loadCounterKey, fields...).Result()
+	if err != nil {
+		// Redis 不可用时降级为随机选择
+		return &candidates[rand.Intn(len(candidates))]
+	}
+
+	var best int
 	var bestLoad int64 = 1<<63 - 1
-
-	r.loadMu.RLock()
-	defer r.loadMu.RUnlock()
-
-	for i := range candidates {
+	for i, v := range vals {
 		var load int64
-		if counter, ok := r.loadCounters[candidates[i].Channel.ID]; ok {
-			load = counter.Load()
+		if v != nil {
+			if s, ok := v.(string); ok {
+				load, _ = strconv.ParseInt(s, 10, 64)
+			}
 		}
 		if load < bestLoad {
 			bestLoad = load
-			best = &candidates[i]
+			best = i
 		}
 	}
-
-	return best
+	return &candidates[best]
 }
 
 // ======================== 渠道组降级路由（兼容旧数据）========================
@@ -599,16 +594,20 @@ func (r *ChannelRouter) fallbackToChannelGroup(ctx context.Context, modelName st
 
 // ======================== 负载跟踪 ========================
 
-// RecordResult 记录请求结果，用于熔断器和负载跟踪
+// RecordResult 记录请求结果，用于熔断器和负载跟踪（Redis 全局共享）
 func (r *ChannelRouter) RecordResult(channelID uint, success bool, latencyMs int, statusCode int) {
-	// 减少负载计数器
-	r.loadMu.RLock()
-	if counter, ok := r.loadCounters[channelID]; ok {
-		counter.Add(-1)
-	}
-	r.loadMu.RUnlock()
+	ctx := context.Background()
 
-	if !success {
+	// 减少全局负载计数器
+	field := fmt.Sprintf("%d", channelID)
+	r.redis.HIncrBy(ctx, loadCounterKey, field, -1)
+
+	// 记录熔断器结果
+	breaker := r.getOrCreateBreaker(channelID)
+	if success {
+		breaker.RecordSuccess(ctx)
+	} else {
+		breaker.RecordFailure(ctx)
 		r.logger.Warn("channel request failed",
 			zap.Uint("channel_id", channelID),
 			zap.Int("status_code", statusCode),
@@ -617,14 +616,10 @@ func (r *ChannelRouter) RecordResult(channelID uint, success bool, latencyMs int
 	}
 }
 
-// IncrementLoad 增加渠道的在途请求计数
+// IncrementLoad 增加渠道的在途请求计数（Redis 全局共享）
 func (r *ChannelRouter) IncrementLoad(channelID uint) {
-	r.loadMu.Lock()
-	if _, ok := r.loadCounters[channelID]; !ok {
-		r.loadCounters[channelID] = &atomic.Int64{}
-	}
-	r.loadCounters[channelID].Add(1)
-	r.loadMu.Unlock()
+	field := fmt.Sprintf("%d", channelID)
+	r.redis.HIncrBy(context.Background(), loadCounterKey, field, 1)
 }
 
 // ======================== 渠道组辅助方法 ========================
@@ -761,8 +756,7 @@ func (r *ChannelRouter) selectWithBreaker(ctx context.Context, group *model.Chan
 	var available []model.Channel
 	for _, ch := range channels {
 		breaker := r.getOrCreateBreaker(ch.ID)
-		state := breaker.State()
-		if state != gobreaker.StateOpen {
+		if !breaker.IsOpen(context.Background()) {
 			available = append(available, ch)
 		}
 	}
@@ -799,7 +793,7 @@ func (r *ChannelRouter) selectWithBreaker(ctx context.Context, group *model.Chan
 func (r *ChannelRouter) selectFallbackChain(ctx context.Context, channels []model.Channel) (*model.Channel, error) {
 	for i := range channels {
 		breaker := r.getOrCreateBreaker(channels[i].ID)
-		if breaker.State() != gobreaker.StateOpen {
+		if !breaker.IsOpen(context.Background()) {
 			r.IncrementLoad(channels[i].ID)
 			return &channels[i], nil
 		}
@@ -867,47 +861,51 @@ func (r *ChannelRouter) selectByWeight(channels []model.Channel) *model.Channel 
 	return &channels[0]
 }
 
-// selectByRoundRobin 按分组轮询选择渠道
+// selectByRoundRobin 按分组轮询选择渠道（Redis 全局共享计数器）
 func (r *ChannelRouter) selectByRoundRobin(channels []model.Channel, groupID uint) *model.Channel {
 	if len(channels) == 0 {
 		return nil
 	}
 
-	r.rrMu.Lock()
-	if _, ok := r.rrCounters[groupID]; !ok {
-		r.rrCounters[groupID] = &atomic.Uint64{}
+	key := fmt.Sprintf("rr:group:%d", groupID)
+	idx, err := r.redis.Incr(context.Background(), key).Result()
+	if err != nil {
+		return &channels[rand.Intn(len(channels))]
 	}
-	counter := r.rrCounters[groupID]
-	r.rrMu.Unlock()
-
-	idx := counter.Add(1) - 1
-	return &channels[idx%uint64(len(channels))]
+	return &channels[(idx-1)%int64(len(channels))]
 }
 
 // selectByLeastLoad 选择在途请求最少的渠道
+// selectByLeastLoad 选择在途请求最少的渠道（Redis 全局负载计数）
 func (r *ChannelRouter) selectByLeastLoad(channels []model.Channel) *model.Channel {
 	if len(channels) == 0 {
 		return nil
 	}
 
-	var best *model.Channel
-	var bestLoad int64 = 1<<63 - 1
-
-	r.loadMu.RLock()
-	defer r.loadMu.RUnlock()
-
+	fields := make([]string, len(channels))
 	for i := range channels {
+		fields[i] = fmt.Sprintf("%d", channels[i].ID)
+	}
+	vals, err := r.redis.HMGet(context.Background(), loadCounterKey, fields...).Result()
+	if err != nil {
+		return &channels[rand.Intn(len(channels))]
+	}
+
+	var best int
+	var bestLoad int64 = 1<<63 - 1
+	for i, v := range vals {
 		var load int64
-		if counter, ok := r.loadCounters[channels[i].ID]; ok {
-			load = counter.Load()
+		if v != nil {
+			if s, ok := v.(string); ok {
+				load, _ = strconv.ParseInt(s, 10, 64)
+			}
 		}
 		if load < bestLoad {
 			bestLoad = load
-			best = &channels[i]
+			best = i
 		}
 	}
-
-	return best
+	return &channels[best]
 }
 
 // selectByCostFirst 优先选择成本最低的渠道
@@ -921,61 +919,25 @@ func (r *ChannelRouter) selectByCostFirst(channels []model.Channel, modelName st
 
 // ======================== 熔断器 ========================
 
-// getOrCreateBreaker 获取或创建渠道的熔断器实例
-func (r *ChannelRouter) getOrCreateBreaker(channelID uint) *gobreaker.CircuitBreaker[interface{}] {
-	r.mu.RLock()
-	if cb, ok := r.breakers[channelID]; ok {
-		r.mu.RUnlock()
-		return cb
-	}
-	r.mu.RUnlock()
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// 双重检查锁定
-	if cb, ok := r.breakers[channelID]; ok {
-		return cb
-	}
-
-	settings := gobreaker.Settings{
-		Name:        fmt.Sprintf("channel-%d", channelID),
-		MaxRequests: 3,                // 半开状态允许 3 个请求
-		Interval:    30 * time.Second, // 关闭状态每 30s 重置计数
-		Timeout:     60 * time.Second, // 开启状态保持 60s 后进入半开
-		ReadyToTrip: func(counts gobreaker.Counts) bool {
-			// 失败率 > 50%（至少 5 个请求），或连续失败 >= 5 次时触发熔断
-			if counts.ConsecutiveFailures >= 5 {
-				return true
-			}
-			if counts.Requests >= 5 {
-				failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-				return failureRatio > 0.5
-			}
-			return false
-		},
-		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
-			r.logger.Warn("熔断器状态变更",
-				zap.String("name", name),
-				zap.String("from", from.String()),
-				zap.String("to", to.String()),
-			)
-			// 将熔断器状态同步到 Redis 实现分布式可见性
-			if r.redis != nil {
-				ctx := context.Background()
-				key := fmt.Sprintf("breaker:state:%d", channelID)
-				_ = pkgredis.Set(ctx, key, to.String(), 5*time.Minute)
-			}
-		},
-	}
-
-	cb := gobreaker.NewCircuitBreaker[interface{}](settings)
-	r.breakers[channelID] = cb
-	return cb
+// getOrCreateBreaker 创建渠道的 Redis 分布式熔断器实例（无状态，每次创建即可）
+func (r *ChannelRouter) getOrCreateBreaker(channelID uint) *RedisCircuitBreaker {
+	return NewRedisCircuitBreaker(r.redis, channelID, r.breakerCfg)
 }
 
-// Execute 将函数调用包装在熔断器保护中执行
+// Execute 将函数调用包装在分布式熔断器保护中执行
 func (r *ChannelRouter) Execute(channelID uint, fn func() (interface{}, error)) (interface{}, error) {
+	ctx := context.Background()
 	cb := r.getOrCreateBreaker(channelID)
-	return cb.Execute(fn)
+
+	if cb.IsOpen(ctx) {
+		return nil, fmt.Errorf("circuit breaker is open for channel %d", channelID)
+	}
+
+	result, err := fn()
+	if err != nil {
+		cb.RecordFailure(ctx)
+	} else {
+		cb.RecordSuccess(ctx)
+	}
+	return result, err
 }

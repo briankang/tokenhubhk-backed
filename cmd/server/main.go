@@ -137,22 +137,27 @@ func main() {
 	// 6.1 缓存预热：服务启动时加载高频数据到 Redis
 	router.RunCacheWarmer()
 
-	// 6.2 初始化定时任务调度器
-	memberLevelSvc := memberSvc.NewMemberLevelService(database.DB, pkgredis.Client)
-	balanceSvc := balance.NewBalanceService(database.DB, pkgredis.Client)
-	discoverySvc := modeldiscovery.NewDiscoveryService(database.DB)
-	scraperSvc := pricescraper.NewPriceScraperService(database.DB)
-	scheduler := cron.NewScheduler(database.DB, pkgredis.Client, memberLevelSvc, balanceSvc,
-		cron.WithDiscoveryService(discoverySvc),
-		cron.WithPriceScraperService(scraperSvc),
-	)
-	scheduler.Start()
-	defer scheduler.Stop()
+	// 6.2 初始化定时任务调度器（仅在需要时启动，支持 SERVICE_ROLE 跳过）
+	if config.Global.Service.ShouldRunScheduler() {
+		memberLevelSvc := memberSvc.NewMemberLevelService(database.DB, pkgredis.Client)
+		balanceSvc := balance.NewBalanceService(database.DB, pkgredis.Client)
+		discoverySvc := modeldiscovery.NewDiscoveryService(database.DB)
+		scraperSvc := pricescraper.NewPriceScraperService(database.DB)
+		scheduler := cron.NewScheduler(database.DB, pkgredis.Client, memberLevelSvc, balanceSvc,
+			cron.WithDiscoveryService(discoverySvc),
+			cron.WithPriceScraperService(scraperSvc),
+		)
+		scheduler.Start()
+		defer scheduler.Stop()
 
-	// 6.3 注册定时任务管理路由（需要 Scheduler 实例，在 router.Setup 之后注册）
-	cronHandler := adminHandler.NewCronTaskHandler(scheduler)
-	adminGroup := engine.Group("/api/v1/admin")
-	cronHandler.Register(adminGroup)
+		// 注册定时任务管理路由
+		cronHandler := adminHandler.NewCronTaskHandler(scheduler)
+		adminGroup := engine.Group("/api/v1/admin")
+		cronHandler.Register(adminGroup)
+		logger.L.Info("scheduler started")
+	} else {
+		logger.L.Info("scheduler skipped (SERVICE_ROLE not monolith/worker)")
+	}
 
 	// 7. Start HTTP server
 	// WriteTimeout 设为 30 分钟以支持长任务（如一键扫描预览检测全部模型 + 调用上游 /v1/models，

@@ -16,25 +16,32 @@ import (
 	"tokenhub-server/internal/service/aimodel"
 	"tokenhub-server/internal/service/audit"
 	"tokenhub-server/internal/service/modeldiscovery"
+	"tokenhub-server/internal/taskqueue"
 )
 
 // ModelSyncHandler 模型同步管理接口处理器
-// 提供模型自动发现、渠道-模型映射查询和编辑功能
+// 提供模型自动发现、渠道-模型映射查询和编辑功能。
+// 当 bridge 不为 nil 时，SyncAll 等重操作委派给 Worker 执行。
 type ModelSyncHandler struct {
 	discoveryService *modeldiscovery.DiscoveryService
 	db               *gorm.DB
 	auditService     *audit.AuditService
 	modelChecker     *aimodel.ModelChecker
+	bridge           *taskqueue.SSEBridge // nil=单体模式，非nil=委派模式
 }
 
 // NewModelSyncHandler 创建模型同步处理器实例
-func NewModelSyncHandler(db *gorm.DB) *ModelSyncHandler {
-	return &ModelSyncHandler{
+func NewModelSyncHandler(db *gorm.DB, bridge ...*taskqueue.SSEBridge) *ModelSyncHandler {
+	h := &ModelSyncHandler{
 		discoveryService: modeldiscovery.NewDiscoveryService(db),
 		db:               db,
 		auditService:     audit.NewAuditService(db),
 		modelChecker:     aimodel.NewModelChecker(db),
 	}
+	if len(bridge) > 0 {
+		h.bridge = bridge[0]
+	}
+	return h
 }
 
 // syncAllResponse 同步全部模型的响应（含检测结果）
@@ -51,6 +58,18 @@ type syncAllResponse struct {
 // 遍历所有 active 状态的渠道，调用供应商 /v1/models API 拉取模型列表
 // 同步完成后自动检测新增模型可用性，并写入审计日志
 func (h *ModelSyncHandler) SyncAll(c *gin.Context) {
+	// 三服务模式：委派给 Worker
+	if h.bridge != nil {
+		result, err := h.bridge.PublishAndWait(c.Request.Context(), taskqueue.TaskModelSyncAll, nil)
+		if err != nil {
+			response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+			return
+		}
+		response.Success(c, json.RawMessage(result.Data))
+		return
+	}
+
+	// 单体模式：本地执行
 	result, err := h.discoveryService.SyncAllActive()
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
@@ -120,13 +139,25 @@ func (h *ModelSyncHandler) SyncAll(c *gin.Context) {
 // POST /api/v1/admin/models/sync/:channelId
 // 根据指定的 channelId 调用对应供应商的模型列表 API
 func (h *ModelSyncHandler) SyncByChannel(c *gin.Context) {
-	// 解析渠道 ID
 	channelID, err := strconv.ParseUint(c.Param("channelId"), 10, 64)
 	if err != nil || channelID == 0 {
 		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
 		return
 	}
 
+	// 三服务模式：委派给 Worker
+	if h.bridge != nil {
+		payload := taskqueue.ModelSyncPayload{ChannelID: uint(channelID)}
+		result, err := h.bridge.PublishAndWait(c.Request.Context(), taskqueue.TaskModelSync, payload)
+		if err != nil {
+			response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+			return
+		}
+		response.Success(c, json.RawMessage(result.Data))
+		return
+	}
+
+	// 单体模式
 	result, err := h.discoveryService.SyncFromChannel(uint(channelID))
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
@@ -320,7 +351,14 @@ func (h *ModelSyncHandler) BatchUpdateSellingPrice(c *gin.Context) {
 	}
 
 	updated := 0
+	skipped := 0
 	for _, m := range models {
+		// 跳过成本价为0的模型，避免创建无意义的0元售价记录
+		if m.InputCostRMB == 0 && m.OutputCostRMB == 0 {
+			skipped++
+			continue
+		}
+
 		sellingInputRMB := float64(int(m.InputCostRMB*req.Discount*10000+0.5)) / 10000
 		sellingOutputRMB := float64(int(m.OutputCostRMB*req.Discount*10000+0.5)) / 10000
 
@@ -346,5 +384,103 @@ func (h *ModelSyncHandler) BatchUpdateSellingPrice(c *gin.Context) {
 	response.Success(c, gin.H{
 		"message": "批量售价更新成功",
 		"updated": updated,
+		"skipped": skipped,
+	})
+}
+
+// FillSellingPrices 一键补全售价
+// POST /api/v1/admin/models/fill-selling-prices
+// 请求体: { "discount": 0.9 } — 可选，默认0.9（9折）
+// 为所有有成本价但无有效售价的模型自动创建 ModelPricing 记录
+func (h *ModelSyncHandler) FillSellingPrices(c *gin.Context) {
+	var req struct {
+		Discount float64 `json:"discount"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	if req.Discount <= 0 || req.Discount > 10 {
+		req.Discount = 0.9
+	}
+
+	// 查找有成本价但无有效售价的模型：
+	// 1) 无 ModelPricing 记录
+	// 2) 有 ModelPricing 记录但 input_price_rmb = 0 且 output_price_rmb = 0
+	var models []model.AIModel
+	err := h.db.
+		Where("(input_cost_rmb > 0 OR output_cost_rmb > 0)").
+		Preload("Pricing").
+		Find(&models).Error
+	if err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrDatabase.Code, err.Error())
+		return
+	}
+
+	created := 0
+	updated := 0
+	for _, m := range models {
+		needsFill := m.Pricing == nil ||
+			(m.Pricing.InputPriceRMB == 0 && m.Pricing.OutputPriceRMB == 0)
+		if !needsFill {
+			continue
+		}
+
+		sellingInputRMB := float64(int(m.InputCostRMB*req.Discount*10000+0.5)) / 10000
+		sellingOutputRMB := float64(int(m.OutputCostRMB*req.Discount*10000+0.5)) / 10000
+
+		if m.Pricing == nil {
+			// 创建新记录
+			pricing := model.ModelPricing{
+				ModelID:             m.ID,
+				InputPriceRMB:       sellingInputRMB,
+				InputPricePerToken:  int64(sellingInputRMB * 10000),
+				OutputPriceRMB:      sellingOutputRMB,
+				OutputPricePerToken: int64(sellingOutputRMB * 10000),
+			}
+			h.db.Create(&pricing)
+			created++
+		} else {
+			// 更新已有的0值记录
+			m.Pricing.InputPriceRMB = sellingInputRMB
+			m.Pricing.InputPricePerToken = int64(sellingInputRMB * 10000)
+			m.Pricing.OutputPriceRMB = sellingOutputRMB
+			m.Pricing.OutputPricePerToken = int64(sellingOutputRMB * 10000)
+			h.db.Save(m.Pricing)
+			updated++
+		}
+	}
+
+	invalidatePublicModelsCache()
+	response.Success(c, gin.H{
+		"message":  fmt.Sprintf("售价补全完成：新建 %d 条，更新 %d 条", created, updated),
+		"created":  created,
+		"updated":  updated,
+		"discount": req.Discount,
+	})
+}
+
+// BatchUpdateDiscount 批量修改模型独立折扣
+// PUT /api/v1/admin/models/batch-discount
+// 请求体: { "ids": [1,2,3], "discount": 0.85 }
+// discount: 模型独立折扣（0=清除，恢复继承供应商折扣；>0 如0.85=85折）
+func (h *ModelSyncHandler) BatchUpdateDiscount(c *gin.Context) {
+	var req struct {
+		IDs      []uint  `json:"ids" binding:"required,min=1"`
+		Discount float64 `json:"discount" binding:"min=0,lte=10"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
+		return
+	}
+
+	result := h.db.Model(&model.AIModel{}).
+		Where("id IN ?", req.IDs).
+		Update("discount", req.Discount)
+	if result.Error != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrDatabase.Code, result.Error.Error())
+		return
+	}
+
+	response.Success(c, gin.H{
+		"message": "批量折扣更新成功",
+		"updated": result.RowsAffected,
 	})
 }

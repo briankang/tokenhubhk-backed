@@ -52,8 +52,14 @@ import (
 	pricescraper "tokenhub-server/internal/service/pricescraper"
 	"tokenhub-server/internal/service/task"
 	"tokenhub-server/internal/service/parammapping"
+	"tokenhub-server/internal/taskqueue"
 	"github.com/spf13/viper"
 )
+
+// taskBridge 全局 SSE 桥接器，由 SetupBackend() 初始化。
+// 非 nil 时 admin 重操作 handler 将通过此桥接器委派给 Worker。
+// Setup()（单体模式）中为 nil，handler 在本进程内执行。
+var taskBridge *taskqueue.SSEBridge
 
 // Setup 注册所有路由和中间件到 Gin 引擎
 func Setup(r *gin.Engine) {
@@ -265,6 +271,177 @@ func Setup(r *gin.Engine) {
 	registerOpenAICompatibleRoutes(r)
 
 	// ========== MCP Routes (MCP协议) ==========
+	registerMCPHandlers(v1)
+}
+
+// SetupGateway 仅注册 API 网关路由 (/v1/* OpenAI 兼容接口)。
+// 用于 gateway 角色的独立进程，只处理模型中转的热路径。
+func SetupGateway(r *gin.Engine) {
+	// 初始化白标服务（域名解析）
+	domainResolver := whitelabel.NewDomainResolver(database.DB, redis.Client)
+
+	// 全局中间件（与 Setup 一致）
+	r.Use(middleware.Recovery())
+	r.Use(middleware.CORS())
+	r.Use(middleware.RequestLogger())
+	r.Use(middleware.I18n())
+	r.Use(middleware.TenantResolveMiddleware(domainResolver, viper.GetString("server.platform_domain")))
+	r.Use(middleware.MultiLevelRateLimiter())
+
+	// 健康检查
+	r.GET("/health", func(c *gin.Context) {
+		response.Success(c, gin.H{"status": "ok", "role": "gateway"})
+	})
+
+	// OpenAI 兼容路由 (/v1/*)
+	registerOpenAICompatibleRoutes(r)
+}
+
+// SetupBackend 注册用户 + 管理后台路由 (/api/v1/*)。
+// 用于 backend 角色的独立进程，处理 Dashboard API、管理后台、支付、MCP 等。
+func SetupBackend(r *gin.Engine) {
+	// 初始化 SSE 桥接器（委派重操作给 Worker）
+	signingKey := config.Global.Service.TaskSignKey
+	if signingKey == "" {
+		signingKey = config.Global.JWT.Secret
+	}
+	publisher := taskqueue.NewPublisher(redis.Client, signingKey)
+	taskBridge = taskqueue.NewSSEBridge(publisher)
+
+	// 初始化白标服务
+	domainResolver := whitelabel.NewDomainResolver(database.DB, redis.Client)
+
+	// 全局中间件
+	r.Use(middleware.Recovery())
+	r.Use(middleware.CORS())
+	r.Use(middleware.RequestLogger())
+	r.Use(middleware.I18n())
+	r.Use(middleware.TenantResolveMiddleware(domainResolver, viper.GetString("server.platform_domain")))
+	r.Use(middleware.MultiLevelRateLimiter())
+
+	// 健康检查
+	r.GET("/health", func(c *gin.Context) {
+		response.Success(c, gin.H{"status": "ok", "role": "backend"})
+	})
+
+	// API v1 路由组
+	v1 := r.Group("/api/v1")
+
+	// 安装向导
+	registerSetupHandlers(v1)
+	v1.Use(middleware.SetupGuard(database.DB))
+
+	// 认证路由
+	registerAuthHandlers(v1)
+
+	// 公开文档
+	docsGroup := v1.Group("/docs")
+	docsGroup.Use(middleware.CacheMiddleware(cachesvc.TTLStandard))
+	{
+		registerPublicDocHandlers(docsGroup)
+	}
+
+	// 公开数据
+	publicGroup := v1.Group("/public")
+	publicGroup.Use(middleware.CacheMiddleware(cachesvc.TTLLong))
+	{
+		registerPublicPaymentMethodsHandler(publicGroup)
+		registerLocaleHandler(publicGroup)
+		registerPublicModelHandlers(publicGroup)
+		registerParamSupportHandler(publicGroup)
+		registerPublicConfigHandlers(publicGroup)
+		annPublicHandler := public.NewAnnouncementPublicHandler(database.DB)
+		annPublicHandler.RegisterPublicBanner(publicGroup)
+	}
+
+	// 公开 POST 路由
+	publicWriteGroup := v1.Group("/public")
+	{
+		registerPartnerApplicationHandler(publicWriteGroup)
+		registerReferralClickHandler(publicWriteGroup)
+	}
+
+	// 支付回调
+	registerPaymentCallbacks(v1)
+
+	// 已认证路由
+	authorized := v1.Group("")
+	authorized.Use(middleware.Auth())
+	authorized.Use(middleware.MemberRateLimiter(database.DB, redis.Client))
+	authorized.Use(middleware.DataScope())
+	authorized.Use(middleware.Idempotent())
+
+	// 管理员路由
+	adminGroup := authorized.Group("/admin")
+	adminGroup.Use(middleware.RequireRole("ADMIN"))
+	{
+		registerAdminUserHandlers(adminGroup)
+		registerChannelHandlers(adminGroup)
+		registerOrchestrationHandlers(adminGroup)
+		registerDocHandlers(adminGroup)
+		registerAdminReportHandlers(adminGroup)
+		registerPricingHandlers(adminGroup)
+		registerQuotaHandlers(adminGroup)
+		registerAdminReferralHandlers(adminGroup)
+		registerAdminCommissionOverrideHandlers(adminGroup)
+		registerAdminGuardHandlers(adminGroup)
+		registerAdminWithdrawalHandlers(adminGroup)
+		registerAdminConfigAuditHandlers(adminGroup)
+		registerPaymentConfigHandlers(adminGroup)
+		registerCacheHandlers(adminGroup)
+		registerRateLimitHandlers(adminGroup)
+		registerLevelAdminHandlers(adminGroup)
+		registerExchangeRateHandlers(adminGroup)
+		registerReconciliationHandler(adminGroup)
+		registerCustomChannelHandlers(adminGroup)
+
+		channelStatsHandler := admin.NewChannelStatsHandler(database.DB, redis.Client)
+		channelStatsHandler.Register(adminGroup)
+
+		registerPriceScraperHandlers(adminGroup)
+		registerModelSyncHandlers(adminGroup)
+		registerTaskHandlers(adminGroup)
+
+		apiCallLogSvc := apikey.NewApiKeyService(database.DB, redis.Client, config.Global.JWT.Secret)
+		apiCallLogHandler := admin.NewApiCallLogHandler(database.DB, apiCallLogSvc)
+		apiCallLogHandler.Register(adminGroup)
+
+		registerParamMappingHandlers(adminGroup)
+
+		partnerAdminHandler := admin.NewPartnerApplicationAdminHandler(database.DB)
+		partnerAdminHandler.Register(adminGroup)
+
+		announcementAdminHandler := admin.NewAnnouncementHandler(database.DB)
+		announcementAdminHandler.Register(adminGroup)
+	}
+
+	// 用户路由
+	userGroup := authorized.Group("/user")
+	{
+		registerUserHandlers(userGroup)
+		registerUserBalanceHandlers(userGroup)
+		registerUserReferralHandlers(userGroup)
+		registerUserAvailableChannelsHandlers(userGroup)
+		registerUserMemberHandlers(userGroup)
+		registerUserWithdrawalHandlers(userGroup)
+		notificationHandler := userhandler.NewNotificationHandler(database.DB)
+		notificationHandler.Register(userGroup)
+	}
+
+	// 支付路由
+	registerPaymentHandlers(authorized, adminGroup)
+
+	// Chat 路由
+	chatGroup := v1.Group("/chat")
+	{
+		chatGroup.Use(middleware.RateLimit())
+		registerChatHandlers(chatGroup)
+	}
+
+	// Open API
+	registerOpenAPIHandlers(v1)
+
+	// MCP
 	registerMCPHandlers(v1)
 }
 
@@ -619,12 +796,14 @@ func registerAdminModelCategoryHandlers(rg *gin.RouterGroup) {
 }
 
 // registerAdminAIModelHandlers 初始化 AI 模型服务并注册路由
+// taskBridge 非 nil 时（SetupBackend 模式）将重操作委派给 Worker
 func registerAdminAIModelHandlers(rg *gin.RouterGroup) {
 	db := database.DB
 	svc := aimodelsvc.NewAIModelService(db)
-	handler := admin.NewAIModelHandler(svc)
+	handler := admin.NewAIModelHandler(svc, taskBridge)
 
 	rg.GET("/ai-models", handler.List)
+	rg.GET("/ai-models/stats", handler.Stats) // 全量统计，不受分页限制
 	rg.POST("/ai-models", handler.Create)
 	rg.GET("/ai-models/:id", handler.GetByID)
 	rg.PUT("/ai-models/:id", handler.Update)
@@ -635,7 +814,7 @@ func registerAdminAIModelHandlers(rg *gin.RouterGroup) {
 
 	// 模型可用性批量检测
 	checker := aimodelsvc.NewModelChecker(db)
-	checkHandler := admin.NewModelCheckHandler(checker)
+	checkHandler := admin.NewModelCheckHandler(checker, taskBridge)
 	rg.POST("/models/batch-check", checkHandler.BatchCheck)              // SSE 实时进度（旧版自动下线，定时任务用）
 	rg.POST("/models/batch-check-sync", checkHandler.BatchCheckSync)     // 同步返回（旧版自动下线）
 	rg.POST("/models/check-preview", checkHandler.Preview)               // SSE 实时进度（dry-run 扫描预览，前端"一键检测"用）
@@ -652,6 +831,16 @@ func registerAdminAIModelHandlers(rg *gin.RouterGroup) {
 	rg.POST("/models/deprecation-scan", handler.DeprecationScan) // 扫描可能下线的模型
 	rg.POST("/models/bulk-deprecate", handler.BulkDeprecate)     // 批量下线 + 创建公告
 	rg.GET("/models/scanned-offline", handler.ScanOfflineAll)    // 所有供应商扫描下线模型汇总
+
+	// ===== 模型 k:v 标签系统 =====
+	// 注意：batch/label-keys 路由必须在 :id 参数路由前注册，避免路径冲突
+	labelHandler := admin.NewModelLabelHandler(db)
+	rg.GET("/models/label-keys", labelHandler.ListKeys)          // 获取所有已用标签键（自动补全）
+	rg.POST("/models/batch-labels", labelHandler.BatchAssign)    // 批量添加标签
+	rg.DELETE("/models/batch-labels", labelHandler.BatchRemove)  // 批量移除标签
+	rg.GET("/ai-models/:id/labels", labelHandler.ListByModel)    // 获取模型标签列表
+	rg.POST("/ai-models/:id/labels", labelHandler.Upsert)        // 添加标签
+	rg.DELETE("/ai-models/:id/labels", labelHandler.Remove)      // 删除标签
 }
 
 // registerQuotaHandlers 初始化额度/余额管理处理器
@@ -958,12 +1147,14 @@ func registerReferralClickHandler(rg *gin.RouterGroup) {
 // PUT    /admin/channel-models/:id       — 编辑映射（火山引擎 ep-xxx 映射标准模型）
 func registerModelSyncHandlers(rg *gin.RouterGroup) {
 	db := database.DB
-	handler := admin.NewModelSyncHandler(db)
+	handler := admin.NewModelSyncHandler(db, taskBridge)
 
 	// 批量操作路由必须在 :id 参数路由之前注册，避免 Gin 将 "batch-*" 匹配为 :id
 	rg.PUT("/models/batch-status", handler.BatchUpdateModelStatus)
 	rg.DELETE("/models/batch-delete", handler.BatchDeleteModels)
 	rg.PUT("/models/batch-selling-price", handler.BatchUpdateSellingPrice)
+	rg.PUT("/models/batch-discount", handler.BatchUpdateDiscount)
+	rg.POST("/models/fill-selling-prices", handler.FillSellingPrices)
 
 	rg.POST("/models/sync", handler.SyncAll)
 	rg.POST("/models/sync/:channelId", handler.SyncByChannel)

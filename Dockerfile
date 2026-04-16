@@ -29,8 +29,9 @@ RUN for i in 1 2 3 4 5; do \
       go mod tidy && break || sleep 5; \
     done
 
-# Build binary
+# Build binaries（原单体入口 + 新统一入口）
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o server ./cmd/server/
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o tokenhub ./cmd/tokenhub/
 
 # Stage 2: Run (Debian slim 对 Chromium 兼容性更好)
 FROM debian:bookworm-slim
@@ -47,8 +48,9 @@ ENV ROD_BROWSER_BIN=/usr/bin/chromium
 
 WORKDIR /app
 
-# Copy binary from builder
+# Copy binaries from builder
 COPY --from=builder /build/server .
+COPY --from=builder /build/tokenhub .
 
 # Copy configs and locale files
 COPY --from=builder /build/configs ./configs

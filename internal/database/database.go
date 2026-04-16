@@ -2,6 +2,7 @@ package database
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -89,6 +90,13 @@ func Init(cfg config.DatabaseConfig, logger *zap.Logger) error {
 	if err := seedDefaults(); err != nil {
 		if logger != nil {
 			logger.Warn("seed defaults failed", zap.Error(err))
+		}
+	}
+
+	// 幂等写入模型标签种子数据（热卖/开源/优惠）
+	if err := seedModelLabels(); err != nil {
+		if logger != nil {
+			logger.Warn("seed model labels failed", zap.Error(err))
 		}
 	}
 
@@ -267,6 +275,9 @@ func autoMigrate() error {
 		// --- 站内公告/通知系统 ---
 		&model.Announcement{},         // 管理员发布的站内公告
 		&model.UserAnnouncementRead{}, // 用户公告已读记录
+
+		// --- 模型 k:v 标签系统 ---
+		&model.ModelLabel{}, // 模型标签（热卖/开源/优惠等，支持自定义 k:v）
 	)
 }
 
@@ -354,6 +365,52 @@ func Close() error {
 			return err
 		}
 		return sqlDB.Close()
+	}
+	return nil
+}
+
+// seedModelLabels 幂等写入模型标签种子数据
+// 根据模型名称模糊匹配预置热卖/开源/优惠标签，每次启动安全重复执行
+func seedModelLabels() error {
+	type rule struct {
+		patterns []string
+		key      string
+		value    string
+	}
+	rules := []rule{
+		// 热卖模型：DeepSeek V3/R1、Qwen 3系列、Moonshot/Kimi、MiniMax
+		{[]string{"deepseek-v3", "deepseek-r1", "qwen3", "moonshot", "kimi", "minimax"}, "tag", "hot"},
+		// 开源模型：DeepSeek 全系、Qwen 全系、Yi、Baichuan、GLM
+		{[]string{"deepseek-", "qwen", "yi-", "baichuan", "glm-"}, "license", "open-source"},
+		// 优惠模型：DeepSeek V3/R1-Distill、Qwen Turbo/Plus
+		{[]string{"deepseek-v3", "deepseek-r1-distill", "qwen-turbo", "qwen-plus"}, "tag", "discount"},
+	}
+
+	var models []model.AIModel
+	if err := DB.Select("id, model_name").Find(&models).Error; err != nil {
+		return err
+	}
+
+	for _, m := range models {
+		name := strings.ToLower(m.ModelName)
+		for _, r := range rules {
+			for _, p := range r.patterns {
+				if strings.Contains(name, strings.ToLower(p)) {
+					label := model.ModelLabel{
+						ModelID:    m.ID,
+						LabelKey:   r.key,
+						LabelValue: r.value,
+					}
+					// FirstOrCreate 保证幂等：已存在则跳过
+					DB.FirstOrCreate(&label, model.ModelLabel{
+						ModelID:    m.ID,
+						LabelKey:   r.key,
+						LabelValue: r.value,
+					})
+					break // 同一规则只写一次
+				}
+			}
+		}
 	}
 	return nil
 }

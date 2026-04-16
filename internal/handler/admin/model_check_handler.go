@@ -12,22 +12,36 @@ import (
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 	aimodelsvc "tokenhub-server/internal/service/aimodel"
+	"tokenhub-server/internal/taskqueue"
 )
 
 // ModelCheckHandler 模型可用性检测 API 处理器
+// 当 bridge 不为 nil 时，重操作委派给 Worker 异步执行（三服务模式）；
+// 当 bridge 为 nil 时，在本进程内执行（单体模式兼容）。
 type ModelCheckHandler struct {
 	checker *aimodelsvc.ModelChecker
+	bridge  *taskqueue.SSEBridge // nil=单体模式（本地执行），非nil=委派给 Worker
 }
 
 // NewModelCheckHandler 创建模型检测处理器
-func NewModelCheckHandler(checker *aimodelsvc.ModelChecker) *ModelCheckHandler {
-	return &ModelCheckHandler{checker: checker}
+func NewModelCheckHandler(checker *aimodelsvc.ModelChecker, bridge ...*taskqueue.SSEBridge) *ModelCheckHandler {
+	h := &ModelCheckHandler{checker: checker}
+	if len(bridge) > 0 {
+		h.bridge = bridge[0]
+	}
+	return h
 }
 
 // BatchCheck 一键批量检测所有在线模型 POST /api/v1/admin/models/batch-check
 // 使用 SSE 实时推送进度，最后返回完整结果
 func (h *ModelCheckHandler) BatchCheck(c *gin.Context) {
-	// 设置 SSE 头
+	// 三服务模式：委派给 Worker
+	if h.bridge != nil {
+		h.bridge.PublishAndStream(c, taskqueue.TaskBatchCheck, taskqueue.BatchCheckPayload{})
+		return
+	}
+
+	// 单体模式：本地执行（原有逻辑）
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -35,7 +49,6 @@ func (h *ModelCheckHandler) BatchCheck(c *gin.Context) {
 
 	progressCh := make(chan aimodelsvc.BatchCheckProgress, 100)
 
-	// 在后台运行检测
 	type checkResult struct {
 		results []aimodelsvc.ModelCheckResult
 		err     error
@@ -53,14 +66,12 @@ func (h *ModelCheckHandler) BatchCheck(c *gin.Context) {
 		return
 	}
 
-	// 推送进度事件
 	for progress := range progressCh {
 		fmt.Fprintf(c.Writer, "data: {\"type\":\"progress\",\"total\":%d,\"checked\":%d,\"available\":%d,\"failed\":%d,\"disabled\":%d}\n\n",
 			progress.Total, progress.Checked, progress.Available, progress.Failed, progress.Disabled)
 		flusher.Flush()
 	}
 
-	// 等待最终结果
 	res := <-resultCh
 	if res.err != nil {
 		fmt.Fprintf(c.Writer, "data: {\"type\":\"error\",\"message\":\"%s\"}\n\n", res.err.Error())
@@ -68,7 +79,6 @@ func (h *ModelCheckHandler) BatchCheck(c *gin.Context) {
 		return
 	}
 
-	// 统计汇总
 	available := 0
 	failed := 0
 	disabled := 0
@@ -91,13 +101,24 @@ func (h *ModelCheckHandler) BatchCheck(c *gin.Context) {
 // BatchCheckSync 同步版本的批量检测（非SSE，等全部完成后一次返回）
 // POST /api/v1/admin/models/batch-check-sync
 func (h *ModelCheckHandler) BatchCheckSync(c *gin.Context) {
+	// 三服务模式：委派给 Worker 并等待结果
+	if h.bridge != nil {
+		result, err := h.bridge.PublishAndWait(c.Request.Context(), taskqueue.TaskBatchCheck, taskqueue.BatchCheckPayload{})
+		if err != nil {
+			response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+			return
+		}
+		response.Success(c, json.RawMessage(result.Data))
+		return
+	}
+
+	// 单体模式
 	results, err := h.checker.BatchCheck(c.Request.Context(), nil)
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return
 	}
 
-	// 构建详细汇总（含错误分类和解决方案建议）
 	summary := aimodelsvc.BuildDetailedSummary(results)
 	response.Success(c, summary)
 }

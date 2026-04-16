@@ -41,7 +41,7 @@ func (s *PricingService) SetModelPricing(ctx context.Context, pricing *model.Mod
 	err := s.db.WithContext(ctx).Where("model_id = ?", pricing.ModelID).First(&existing).Error
 	if err == nil {
 		// Update existing
-		if err := s.db.WithContext(ctx).Model(&existing).Updates(map[string]interface{}{
+		if err := s.db.WithContext(ctx).Model(&model.ModelPricing{}).Where("id = ?", existing.ID).Updates(map[string]interface{}{
 			"input_price_per_token":  pricing.InputPricePerToken,
 			"output_price_per_token": pricing.OutputPricePerToken,
 			"currency":               pricing.Currency,
@@ -119,7 +119,7 @@ func (s *PricingService) UpdateModelPricing(ctx context.Context, id uint, pricin
 		return fmt.Errorf("query model pricing: %w", err)
 	}
 
-	if err := s.db.WithContext(ctx).Model(&existing).Updates(map[string]interface{}{
+	if err := s.db.WithContext(ctx).Model(&model.ModelPricing{}).Where("id = ?", existing.ID).Updates(map[string]interface{}{
 		"input_price_per_token":  pricing.InputPricePerToken,
 		"output_price_per_token": pricing.OutputPricePerToken,
 		"currency":               pricing.Currency,
@@ -172,7 +172,7 @@ func (s *PricingService) SetLevelDiscount(ctx context.Context, discount *model.A
 	var existing model.AgentLevelDiscount
 	err := query.First(&existing).Error
 	if err == nil {
-		if err := s.db.WithContext(ctx).Model(&existing).Updates(map[string]interface{}{
+		if err := s.db.WithContext(ctx).Model(&model.AgentLevelDiscount{}).Where("id = ?", existing.ID).Updates(map[string]interface{}{
 			"input_discount":  discount.InputDiscount,
 			"output_discount": discount.OutputDiscount,
 		}).Error; err != nil {
@@ -234,7 +234,7 @@ func (s *PricingService) UpdateLevelDiscount(ctx context.Context, id uint, disco
 		return fmt.Errorf("query level discount: %w", err)
 	}
 
-	if err := s.db.WithContext(ctx).Model(&existing).Updates(map[string]interface{}{
+	if err := s.db.WithContext(ctx).Model(&model.AgentLevelDiscount{}).Where("id = ?", existing.ID).Updates(map[string]interface{}{
 		"level":           discount.Level,
 		"model_id":        discount.ModelID,
 		"input_discount":  discount.InputDiscount,
@@ -293,7 +293,7 @@ func (s *PricingService) SetAgentPricing(ctx context.Context, pricing *model.Age
 		Where("tenant_id = ? AND model_id = ?", pricing.TenantID, pricing.ModelID).
 		First(&existing).Error
 	if err == nil {
-		if err := s.db.WithContext(ctx).Model(&existing).Updates(map[string]interface{}{
+		if err := s.db.WithContext(ctx).Model(&model.AgentPricing{}).Where("id = ?", existing.ID).Updates(map[string]interface{}{
 			"pricing_type":  pricing.PricingType,
 			"input_price":   pricing.InputPrice,
 			"output_price":  pricing.OutputPrice,
@@ -367,7 +367,7 @@ func (s *PricingService) UpdateAgentPricing(ctx context.Context, id uint, pricin
 		return fmt.Errorf("query agent pricing: %w", err)
 	}
 
-	if err := s.db.WithContext(ctx).Model(&existing).Updates(map[string]interface{}{
+	if err := s.db.WithContext(ctx).Model(&model.AgentPricing{}).Where("id = ?", existing.ID).Updates(map[string]interface{}{
 		"pricing_type":  pricing.PricingType,
 		"input_price":   pricing.InputPrice,
 		"output_price":  pricing.OutputPrice,

@@ -16,8 +16,8 @@ import (
 
 const (
 	defaultBaseURL    = "http://localhost:8090"
-	defaultAdminEmail = "admin@tokenhub.ai"
-	defaultAdminPass  = "Admin@123456"
+	defaultAdminEmail = "admin@tokenhubhk.com"
+	defaultAdminPass  = "admin123456"
 )
 
 var (
@@ -69,6 +69,8 @@ func TestMain(m *testing.M) {
 		fmt.Println("WARN: admin login failed:", err)
 	} else {
 		adminToken = token
+		// 清除 Redis 缓存（含 ratelimit:* key），避免 IP 限流干扰测试
+		doPost(baseURL+"/api/v1/admin/cache/clear-all", nil, adminToken) //nolint
 	}
 
 	// Register a regular user for user-scoped tests
@@ -124,6 +126,8 @@ func doRequest(method, url string, body interface{}, token string) (*apiResponse
 		return nil, 0, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// 测试跳过 IP 限流（需服务端配置 RATE_LIMIT_BYPASS_TOKEN）
+	req.Header.Set("X-Test-Skip-RateLimit", "th-test-bypass-2026")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

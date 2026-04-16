@@ -29,6 +29,7 @@ func (h *CacheHandler) Register(rg *gin.RouterGroup) {
 	{
 		cache.POST("/clear-all", h.ClearAll)
 		cache.POST("/clear/:prefix", h.ClearByPrefix)
+		cache.POST("/clear-channel-routes", h.ClearChannelRouteCache)
 		cache.POST("/warm", h.Warm)
 		cache.GET("/stats", h.Stats)
 	}
@@ -83,6 +84,41 @@ func (h *CacheHandler) ClearByPrefix(c *gin.Context) {
 		"pattern": pattern,
 		"deleted": deleted,
 		"message": "缓存已清除",
+	})
+}
+
+// ClearChannelRouteCache 一键清理渠道路由缓存
+// POST /api/v1/admin/cache/clear-channel-routes
+// 清理 custom_channel:* 和 custom_channel_routes:* 两类缓存
+func (h *CacheHandler) ClearChannelRouteCache(c *gin.Context) {
+	ctx := c.Request.Context()
+	var totalDeleted int64
+
+	// 清理 custom_channel:* 缓存（渠道配置）
+	d1, err1 := h.cacheSvc.DeleteByPattern(ctx, "custom_channel:*")
+	if err1 != nil {
+		logger.L.Error("清除渠道配置缓存失败", zap.Error(err1))
+	} else {
+		totalDeleted += d1
+	}
+
+	// 清理 custom_channel_routes:* 缓存（路由规则）
+	d2, err2 := h.cacheSvc.DeleteByPattern(ctx, "custom_channel_routes:*")
+	if err2 != nil {
+		logger.L.Error("清除路由规则缓存失败", zap.Error(err2))
+	} else {
+		totalDeleted += d2
+	}
+
+	if err1 != nil && err2 != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, 50001, "清除渠道路由缓存失败")
+		return
+	}
+
+	logger.L.Info("管理员一键清除渠道路由缓存", zap.Int64("deleted", totalDeleted))
+	response.Success(c, gin.H{
+		"deleted": totalDeleted,
+		"message": "渠道路由缓存已清除",
 	})
 }
 

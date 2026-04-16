@@ -1,8 +1,11 @@
 package channel
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -42,6 +45,7 @@ func NewChannelHealthChecker(db *gorm.DB, redis *goredis.Client) *ChannelHealthC
 }
 
 // StartHealthCheck 启动后台协程定期检查所有活跃渠道的健康状态
+// 同时启动自动恢复协程，每30分钟尝试恢复被禁用的渠道
 func (c *ChannelHealthChecker) StartHealthCheck(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 5 * time.Minute
@@ -63,6 +67,21 @@ func (c *ChannelHealthChecker) StartHealthCheck(ctx context.Context, interval ti
 				return
 			case <-ticker.C:
 				c.checkAll(ctx)
+			}
+		}
+	}()
+
+	// 启动自动恢复协程（每30分钟检查被禁用的渠道）
+	go func() {
+		recoveryTicker := time.NewTicker(30 * time.Minute)
+		defer recoveryTicker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-recoveryTicker.C:
+				c.tryRecoverDisabledChannels(ctx)
 			}
 		}
 	}()
@@ -174,5 +193,117 @@ func (c *ChannelHealthChecker) UpdateStatus(ctx context.Context, channelID uint,
 		// 成功时重置失败计数器
 		failKey := fmt.Sprintf("channel:health:fail_count:%d", channelID)
 		c.redis.Del(ctx, failKey)
+	}
+}
+
+// CheckChannelWithChat 使用轻量 Chat Completion 请求探测渠道可用性
+// 发送最短的聊天请求（max_tokens=1）来验证渠道的完整调用链路是否可用
+func (c *ChannelHealthChecker) CheckChannelWithChat(ctx context.Context, channel *model.Channel) *HealthResult {
+	if channel == nil {
+		return nil
+	}
+
+	result := &HealthResult{
+		ChannelID: channel.ID,
+		CheckedAt: time.Now(),
+	}
+
+	start := time.Now()
+
+	// 构造最小化的 Chat Completion 请求
+	chatReqBody := map[string]interface{}{
+		"model": "gpt-3.5-turbo", // 使用最便宜的模型做探针
+		"messages": []map[string]string{
+			{"role": "user", "content": "hi"},
+		},
+		"max_tokens": 1,
+	}
+	bodyBytes, _ := json.Marshal(chatReqBody)
+
+	url := buildChatURL(channel.Endpoint)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		result.Error = fmt.Sprintf("failed to create request: %v", err)
+		return result
+	}
+	req.Header.Set("Authorization", "Bearer "+channel.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	result.LatencyMs = time.Since(start).Milliseconds()
+
+	if err != nil {
+		result.Error = fmt.Sprintf("request failed: %v", err)
+		return result
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	result.StatusCode = resp.StatusCode
+	if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+		result.Healthy = true
+	} else {
+		result.Error = fmt.Sprintf("upstream returned %d", resp.StatusCode)
+	}
+
+	return result
+}
+
+// tryRecoverDisabledChannels 尝试恢复被自动禁用的渠道
+// 对 status=disabled 的渠道执行 Chat Completion 探针
+// 连续3次成功后恢复为 active 状态
+func (c *ChannelHealthChecker) tryRecoverDisabledChannels(ctx context.Context) {
+	var channels []model.Channel
+	if err := c.db.WithContext(ctx).Where("status = ?", "disabled").Find(&channels).Error; err != nil {
+		c.logger.Error("查询禁用渠道失败", zap.Error(err))
+		return
+	}
+
+	if len(channels) == 0 {
+		return
+	}
+
+	c.logger.Info("尝试恢复禁用渠道", zap.Int("count", len(channels)))
+
+	for i := range channels {
+		ch := &channels[i]
+		checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		result := c.CheckChannelWithChat(checkCtx, ch)
+		cancel()
+
+		if result == nil {
+			continue
+		}
+
+		recoveryKey := fmt.Sprintf("channel:health:recovery_count:%d", ch.ID)
+
+		if result.Healthy {
+			// 探针成功，增加恢复计数
+			count, err := c.redis.Incr(ctx, recoveryKey).Result()
+			if err != nil {
+				continue
+			}
+			c.redis.Expire(ctx, recoveryKey, 2*time.Hour)
+
+			if count >= 3 {
+				// 连续3次成功，恢复渠道
+				c.logger.Info("渠道自动恢复",
+					zap.Uint("channel_id", ch.ID),
+					zap.String("channel_name", ch.Name))
+				c.db.WithContext(ctx).Model(&model.Channel{}).
+					Where("id = ?", ch.ID).
+					Update("status", "active")
+				c.redis.Del(ctx, recoveryKey)
+			} else {
+				c.logger.Info("渠道恢复探测成功",
+					zap.Uint("channel_id", ch.ID),
+					zap.Int64("recovery_count", count),
+					zap.String("need", "3"))
+			}
+		} else {
+			// 探针失败，重置恢复计数
+			c.redis.Del(ctx, recoveryKey)
+		}
 	}
 }

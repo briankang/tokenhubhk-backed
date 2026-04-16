@@ -5,7 +5,7 @@ import (
 )
 
 // MemberLevel 会员等级配置表 - 基于消费驱动的自动升降级体系
-// 等级从 V0（普通用户）到 V4（钻石会员），每个等级拥有不同的折扣率、赠送额度和使用限额
+// 等级从 V0（普通用户）到 V4（钻石会员），每个等级拥有不同的折扣率和限流配置
 // 采用双轨存储：积分(int64) + 人民币等值(float64)，折扣率为 float64
 type MemberLevel struct {
 	ID                  uint    `gorm:"primaryKey" json:"id"`
@@ -15,11 +15,8 @@ type MemberLevel struct {
 	MinTotalConsume     int64   `gorm:"type:bigint;not null;default:0" json:"min_total_consume"`           // 累计消费门槛（积分 credits）
 	MinTotalConsumeRMB  float64 `gorm:"type:decimal(16,4);default:0" json:"min_total_consume_rmb"`         // 累计消费门槛（人民币）
 	ModelDiscount       float64 `gorm:"type:decimal(5,2);not null;default:1.00" json:"model_discount"`     // 模型调用折扣率（0.80=8折，1.00=无折扣）
-	MonthlyGift         int64   `gorm:"type:bigint;not null;default:0" json:"monthly_gift"`                // 每月赠送额度（积分 credits）
-	MonthlyGiftRMB      float64 `gorm:"type:decimal(16,4);default:0" json:"monthly_gift_rmb"`              // 每月赠送额度（人民币）
-	MaxTokensPerReq     int     `gorm:"not null;default:4096" json:"max_tokens_per_req"`                   // 单次请求最大 Token 数
-	DailyLimit          int64   `gorm:"type:bigint;not null;default:100000" json:"daily_limit"`            // 每日消费限额（积分 credits），0 表示不限
-	DailyLimitRMB       float64 `gorm:"type:decimal(16,4);default:10" json:"daily_limit_rmb"`              // 每日消费限额（人民币）
+	DefaultRPM          int     `gorm:"not null;default:60" json:"default_rpm"`                            // 每分钟请求数默认值（Requests Per Minute）
+	DefaultTPM          int     `gorm:"not null;default:100000" json:"default_tpm"`                        // 每分钟最大Token数默认值（Tokens Per Minute）
 	DegradeMonths       int     `gorm:"not null;default:3" json:"degrade_months"`                          // 连续不达标月数触发降级
 	IsActive            bool    `gorm:"not null;default:true" json:"is_active"`                            // 是否启用
 	CreatedAt           time.Time `json:"created_at"`

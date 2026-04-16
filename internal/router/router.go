@@ -9,7 +9,6 @@ import (
 	"tokenhub-server/internal/config"
 	"tokenhub-server/internal/database"
 	"tokenhub-server/internal/handler/admin"
-	agenthandler "tokenhub-server/internal/handler/agent"
 	authhandler "tokenhub-server/internal/handler/auth"
 	chathandler "tokenhub-server/internal/handler/chat"
 	paymenthandler "tokenhub-server/internal/handler/payment"
@@ -25,15 +24,17 @@ import (
 	channelsvc "tokenhub-server/internal/service/channel"
 	docsvc "tokenhub-server/internal/service/doc"
 	membersvc "tokenhub-server/internal/service/member"
-	agentlevelsvc "tokenhub-server/internal/service/agent"
 	modelcatsvc "tokenhub-server/internal/service/modelcategory"
 	orchsvc "tokenhub-server/internal/service/orchestration"
 	"tokenhub-server/internal/service/permission"
 	paymentsvc "tokenhub-server/internal/service/payment"
 	balancesvc "tokenhub-server/internal/service/balance"
 	"tokenhub-server/internal/service/pricing"
+	configauditsvc "tokenhub-server/internal/service/configaudit"
+	guardsvc "tokenhub-server/internal/service/guard"
 	referralsvc "tokenhub-server/internal/service/referral"
 	"tokenhub-server/internal/service/report"
+	withdrawalsvc "tokenhub-server/internal/service/withdrawal"
 	setupsvc "tokenhub-server/internal/service/setup"
 	suppliersvc "tokenhub-server/internal/service/supplier"
 	usersvc "tokenhub-server/internal/service/user"
@@ -49,6 +50,8 @@ import (
 	cachesvc "tokenhub-server/internal/service/cache"
 	codingsvc "tokenhub-server/internal/service/coding"
 	pricescraper "tokenhub-server/internal/service/pricescraper"
+	"tokenhub-server/internal/service/task"
+	"tokenhub-server/internal/service/parammapping"
 	"github.com/spf13/viper"
 )
 
@@ -56,7 +59,6 @@ import (
 func Setup(r *gin.Engine) {
 	// 初始化白标服务
 	domainResolver := whitelabel.NewDomainResolver(database.DB, redis.Client)
-	wlService := whitelabel.NewWhiteLabelService(database.DB, redis.Client)
 
 	// 全局中间件
 	r.Use(middleware.Recovery())
@@ -95,9 +97,6 @@ func Setup(r *gin.Engine) {
 	publicGroup := v1.Group("/public")
 	publicGroup.Use(middleware.CacheMiddleware(cachesvc.TTLLong)) // 公开接口长缓存 2h
 	{
-		wlHandler := agenthandler.NewWhiteLabelHandler(wlService, domainResolver)
-		wlHandler.RegisterPublic(publicGroup)
-
 		// --- Public payment methods ---
 		registerPublicPaymentMethodsHandler(publicGroup)
 
@@ -107,11 +106,24 @@ func Setup(r *gin.Engine) {
 		// --- 公开模型列表（无需认证，供前端 /models 页面使用） ---
 		registerPublicModelHandlers(publicGroup)
 
-		// --- 代理申请公开接口 ---
-		registerAgentApplicationPublicHandlers(publicGroup)
+		// --- 参数支持情况查询 ---
+		registerParamSupportHandler(publicGroup)
 
-		// --- 代理等级公开接口（无需认证，供 /agent-panel 页面展示） ---
-		registerPublicAgentLevelHandlers(publicGroup)
+		// --- 邀请和注册配置（公开，供前端动态展示） ---
+		registerPublicConfigHandlers(publicGroup)
+
+		// --- 公开公告 Banner（供 Dashboard 头部滚动展示）---
+		annPublicHandler := public.NewAnnouncementPublicHandler(database.DB)
+		annPublicHandler.RegisterPublicBanner(publicGroup)
+	}
+
+	// --- 公开 POST 路由（无缓存） ---
+	publicWriteGroup := v1.Group("/public")
+	{
+		// --- 合作伙伴线索申请 ---
+		registerPartnerApplicationHandler(publicWriteGroup)
+		// --- 邀请链接点击追踪 ---
+		registerReferralClickHandler(publicWriteGroup)
 	}
 
 	// --- 支付回调 (无 JWT, 签名验证) ---
@@ -120,6 +132,7 @@ func Setup(r *gin.Engine) {
 	// --- 已认证路由 ---
 	authorized := v1.Group("")
 	authorized.Use(middleware.Auth())
+	authorized.Use(middleware.MemberRateLimiter(database.DB, redis.Client))
 	authorized.Use(middleware.DataScope())
 	authorized.Use(middleware.Idempotent())
 
@@ -151,6 +164,18 @@ func Setup(r *gin.Engine) {
 		// --- Referral config management ---
 		registerAdminReferralHandlers(adminGroup)
 
+		// --- Commission override management (v3.1 特殊用户加佣) ---
+		registerAdminCommissionOverrideHandlers(adminGroup)
+
+		// --- Guard / Disposable email (v3.1 反欺诈配置) ---
+		registerAdminGuardHandlers(adminGroup)
+
+		// --- Withdrawal v3.1 (管理员审核) ---
+		registerAdminWithdrawalHandlers(adminGroup)
+
+		// --- Config Audit Log (v3.1 统一审计日志查询) ---
+		registerAdminConfigAuditHandlers(adminGroup)
+
 		// --- Payment config management ---
 		registerPaymentConfigHandlers(adminGroup)
 
@@ -169,47 +194,40 @@ func Setup(r *gin.Engine) {
 		// ========== Reconciliation Routes (对账报告) ==========
 		registerReconciliationHandler(adminGroup)
 
-		// ========== Model Commission Routes (模型佣金配置) ==========
-		registerModelCommissionHandlers(adminGroup)
-
-		// ========== Agent Application Routes (代理申请审核) ==========
-		registerAgentApplicationAdminHandlers(adminGroup)
-
 		// ========== Custom Channel Routes (自定义渠道管理) ==========
 		registerCustomChannelHandlers(adminGroup)
+
+		// ========== Channel Stats Routes (渠道监控统计) ==========
+		channelStatsHandler := admin.NewChannelStatsHandler(database.DB, redis.Client)
+		channelStatsHandler.Register(adminGroup)
 
 		// ========== Price Scraper Routes (价格爬虫管理) ==========
 		registerPriceScraperHandlers(adminGroup)
 
 		// ========== Model Sync Routes (模型自动发现与同步) ==========
 		registerModelSyncHandlers(adminGroup)
+
+		// ========== Background Task Routes (后台任务管理) ==========
+		registerTaskHandlers(adminGroup)
+
+		// ========== API Call Log Routes (API调用全链路日志) ==========
+		apiCallLogSvc := apikey.NewApiKeyService(database.DB, redis.Client, config.Global.JWT.Secret)
+		apiCallLogHandler := admin.NewApiCallLogHandler(database.DB, apiCallLogSvc)
+		apiCallLogHandler.Register(adminGroup)
+
+		// ========== Param Mapping Routes (参数映射管理) ==========
+		registerParamMappingHandlers(adminGroup)
+
+		// ========== Partner Applications Routes (合作伙伴线索管理) ==========
+		partnerAdminHandler := admin.NewPartnerApplicationAdminHandler(database.DB)
+		partnerAdminHandler.Register(adminGroup)
+
+		// ========== Announcement Routes (站内公告管理) ==========
+		announcementAdminHandler := admin.NewAnnouncementHandler(database.DB)
+		announcementAdminHandler.Register(adminGroup)
 	}
 
-	// 代理商路由 (需要 AGENT_L* 角色)
-	agentGroup := authorized.Group("/agent")
-	agentGroup.Use(middleware.RequireRole("AGENT_L1", "AGENT_L2", "AGENT_L3"))
-	{
-		// --- Agent dashboard/pricing/usage/stats ---
-		registerAgentDashboardHandlers(agentGroup)
-
-		// --- Whitelabel configuration ---
-		registerAgentWhiteLabelHandlers(agentGroup, wlService, domainResolver)
-
-		// --- Sub-agent management ---
-		registerAgentTenantHandlers(agentGroup)
-
-		// --- Agent user management ---
-		registerAgentUserHandlers(agentGroup)
-
-		// --- Agent report, keys, and consumption ---
-		registerAgentReportHandlers(agentGroup)
-
-		// --- Agent commissions ---
-		registerAgentCommissionHandlers(agentGroup)
-
-		// --- 代理等级相关（申请/档案/进度/团队/提现）---
-		registerAgentLevelHandlers(agentGroup)
-	}
+	// 代理商机制已物理移除 (v3.1)
 
 	// 用户路由 (任何已认证用户)
 	userGroup := authorized.Group("/user")
@@ -221,6 +239,13 @@ func Setup(r *gin.Engine) {
 
 		// --- 会员等级相关（档案/等级列表/升级进度）---
 		registerUserMemberHandlers(userGroup)
+
+		// --- 提现申请 v3.1 ---
+		registerUserWithdrawalHandlers(userGroup)
+
+		// --- 站内通知（公告已读状态）---
+		notificationHandler := userhandler.NewNotificationHandler(database.DB)
+		notificationHandler.Register(userGroup)
 	}
 
 	// --- 支付路由 (JWT 认证) ---
@@ -351,24 +376,6 @@ func notImplemented(c *gin.Context) {
 	})
 }
 
-// registerAgentWhiteLabelHandlers 初始化白标处理器并注册代理商路由
-func registerAgentWhiteLabelHandlers(rg *gin.RouterGroup, svc *whitelabel.WhiteLabelService, resolver *whitelabel.DomainResolver) {
-	handler := agenthandler.NewWhiteLabelHandler(svc, resolver)
-	handler.RegisterAgent(rg)
-}
-
-// registerAgentTenantHandlers 初始化子代理管理处理器
-func registerAgentTenantHandlers(rg *gin.RouterGroup) {
-	handler := agenthandler.NewAgentTenantHandler(database.DB)
-	handler.Register(rg)
-}
-
-// registerAgentUserHandlers 初始化代理商用户管理处理器
-func registerAgentUserHandlers(rg *gin.RouterGroup) {
-	handler := agenthandler.NewAgentUserHandler(database.DB)
-	handler.Register(rg)
-}
-
 // registerDocHandlers 初始化文档服务并注册管理员路由
 func registerDocHandlers(rg *gin.RouterGroup) {
 	db := database.DB
@@ -402,25 +409,6 @@ func registerAdminReportHandlers(rg *gin.RouterGroup) {
 
 	reportHandler := admin.NewReportHandler(reportSvc, profitCalc)
 	reportHandler.Register(rg)
-}
-
-// registerAgentReportHandlers 初始化报表服务并注册代理商报表/密钥/消费路由
-func registerAgentReportHandlers(rg *gin.RouterGroup) {
-	db := database.DB
-	redisClient := redis.Client
-
-	permSvc := permission.NewPermissionService(db, redisClient)
-	profitCalc := report.NewProfitCalculator(db)
-	reportSvc := report.NewReportService(db, redisClient, profitCalc, permSvc)
-
-	agentReportHandler := agenthandler.NewReportHandler(reportSvc, profitCalc, permSvc)
-	agentReportHandler.Register(rg)
-
-	keysHandler := agenthandler.NewKeysHandler(db, permSvc, reportSvc)
-	keysHandler.Register(rg)
-
-	consumptionHandler := agenthandler.NewConsumptionHandler(reportSvc)
-	consumptionHandler.Register(rg)
 }
 
 // StartStatsAggregator 启动后台统计聚合任务
@@ -550,12 +538,15 @@ func registerUserHandlers(rg *gin.RouterGroup) {
 	rg.PUT("/password", profileHandler.ChangePassword)
 	rg.POST("/change-password", profileHandler.ChangePassword)
 
-	apiKeySvc := apikey.NewApiKeyService(db, redisClient)
+	apiKeySvc := apikey.NewApiKeyService(db, redisClient, config.Global.JWT.Secret)
 	apiKeyHandler := userhandler.NewApiKeyHandler(apiKeySvc)
 
 	rg.GET("/api-keys", apiKeyHandler.List)
 	rg.POST("/api-keys", apiKeyHandler.Generate)
+	rg.GET("/api-keys/:id/reveal", apiKeyHandler.Reveal)
 	rg.PUT("/api-keys/:id", apiKeyHandler.Update)
+	rg.PUT("/api-keys/:id/disable", apiKeyHandler.Disable)
+	rg.PUT("/api-keys/:id/enable", apiKeyHandler.Enable)
 	rg.DELETE("/api-keys/:id", apiKeyHandler.Revoke)
 
 	// --- User available models ---
@@ -563,7 +554,7 @@ func registerUserHandlers(rg *gin.RouterGroup) {
 	availableModelsHandler.Register(rg)
 
 	// --- User usage/billing ---
-	usageHandler := userhandler.NewUsageHandler(db)
+	usageHandler := userhandler.NewUsageHandlerWithBalance(db, balancesvc.NewBalanceService(db, redisClient))
 	usageHandler.Register(rg)
 }
 
@@ -584,6 +575,7 @@ func registerPricingHandlers(rg *gin.RouterGroup) {
 
 	rg.GET("/model-pricings", handler.ListModelPricings)
 	rg.POST("/model-pricings", handler.CreateModelPricing)
+	rg.POST("/model-pricings/repair", handler.RepairPricing)
 	rg.PUT("/model-pricings/:id", handler.UpdateModelPricing)
 	rg.DELETE("/model-pricings/:id", handler.DeleteModelPricing)
 	rg.GET("/price-matrix", handler.GetPriceMatrix)
@@ -637,8 +629,29 @@ func registerAdminAIModelHandlers(rg *gin.RouterGroup) {
 	rg.GET("/ai-models/:id", handler.GetByID)
 	rg.PUT("/ai-models/:id", handler.Update)
 	rg.DELETE("/ai-models/:id", handler.Delete)
-	rg.POST("/ai-models/:id/verify", handler.Verify)     // 验证模型并上线
-	rg.POST("/ai-models/:id/offline", handler.SetOffline) // 将模型下线
+	rg.POST("/ai-models/:id/verify", handler.Verify)         // 验证模型并上线
+	rg.POST("/ai-models/:id/offline", handler.SetOffline)    // 将模型下线
+	rg.POST("/ai-models/:id/reactivate", handler.Reactivate) // 手动重新上线（清空失败序列）
+
+	// 模型可用性批量检测
+	checker := aimodelsvc.NewModelChecker(db)
+	checkHandler := admin.NewModelCheckHandler(checker)
+	rg.POST("/models/batch-check", checkHandler.BatchCheck)              // SSE 实时进度（旧版自动下线，定时任务用）
+	rg.POST("/models/batch-check-sync", checkHandler.BatchCheckSync)     // 同步返回（旧版自动下线）
+	rg.POST("/models/check-preview", checkHandler.Preview)               // SSE 实时进度（dry-run 扫描预览，前端"一键检测"用）
+	rg.POST("/models/check-preview-sync", checkHandler.PreviewSync)      // 同步返回（dry-run 扫描预览）
+	rg.POST("/models/check-selected", checkHandler.CheckSelected)        // 检测勾选的模型
+	rg.GET("/models/check-history", checkHandler.GetCheckHistory)        // 检测历史
+	rg.GET("/models/check-latest", checkHandler.GetLatestSummary)        // 最近一次汇总
+	// 后台检测任务（新版：一键检测创建任务，异步执行，按供应商查看结果）
+	rg.POST("/models/check-task", checkHandler.CreateCheckTask)          // 创建并启动后台检测任务
+	rg.GET("/models/check-tasks", checkHandler.GetCheckTasks)            // 任务列表
+	rg.GET("/models/check-tasks/:id", checkHandler.GetCheckTaskDetail)   // 任务详情（含供应商分组结果）
+
+	// 模型下线扫描与批量下线（结合公告系统）
+	rg.POST("/models/deprecation-scan", handler.DeprecationScan) // 扫描可能下线的模型
+	rg.POST("/models/bulk-deprecate", handler.BulkDeprecate)     // 批量下线 + 创建公告
+	rg.GET("/models/scanned-offline", handler.ScanOfflineAll)    // 所有供应商扫描下线模型汇总
 }
 
 // registerQuotaHandlers 初始化额度/余额管理处理器
@@ -670,22 +683,6 @@ func registerAdminMiscHandlers(rg *gin.RouterGroup) {
 	rg.GET("/stats/daily", handler.DailyStats)
 }
 
-// registerAgentDashboardHandlers 初始化代理商仪表盘/定价/用量/统计处理器
-func registerAgentDashboardHandlers(rg *gin.RouterGroup) {
-	db := database.DB
-	redisClient := redis.Client
-
-	permSvc := permission.NewPermissionService(db, redisClient)
-	profitCalc := report.NewProfitCalculator(db)
-	reportSvc := report.NewReportService(db, redisClient, profitCalc, permSvc)
-
-	pricingCalc := pricing.NewPricingCalculator(db)
-	pricingSvc := pricing.NewPricingService(db, pricingCalc)
-
-	handler := agenthandler.NewDashboardHandler(reportSvc, pricingSvc)
-	handler.Register(rg)
-}
-
 // registerAdminReferralHandlers 初始化邀请配置管理处理器
 func registerAdminReferralHandlers(rg *gin.RouterGroup) {
 	db := database.DB
@@ -694,11 +691,39 @@ func registerAdminReferralHandlers(rg *gin.RouterGroup) {
 	handler.Register(rg)
 }
 
-// registerAgentCommissionHandlers 初始化代理商佣金处理器
-func registerAgentCommissionHandlers(rg *gin.RouterGroup) {
-	db := database.DB
-	svc := referralsvc.NewReferralService(db)
-	handler := agenthandler.NewCommissionHandler(svc)
+// registerAdminCommissionOverrideHandlers 初始化特殊用户加佣 CRUD
+func registerAdminCommissionOverrideHandlers(rg *gin.RouterGroup) {
+	handler := admin.NewCommissionOverrideHandler()
+	handler.Register(rg)
+}
+
+// registerAdminGuardHandlers 初始化 v3.1 反欺诈配置与一次性邮箱管理路由
+func registerAdminGuardHandlers(rg *gin.RouterGroup) {
+	svc := guardsvc.NewService(database.DB, redis.Client)
+	handler := admin.NewGuardConfigHandler(svc)
+	handler.Register(rg)
+}
+
+// registerAdminWithdrawalHandlers 初始化 v3.1 提现审核路由
+func registerAdminWithdrawalHandlers(rg *gin.RouterGroup) {
+	balSvc := balancesvc.NewBalanceService(database.DB, redis.Client)
+	svc := withdrawalsvc.NewService(database.DB, balSvc)
+	handler := admin.NewWithdrawalAdminHandler(svc)
+	handler.Register(rg)
+}
+
+// registerAdminConfigAuditHandlers 初始化 v3.1 配置审计日志查询路由
+func registerAdminConfigAuditHandlers(rg *gin.RouterGroup) {
+	svc := configauditsvc.NewService(database.DB)
+	handler := admin.NewConfigAuditHandler(svc)
+	handler.Register(rg)
+}
+
+// registerUserWithdrawalHandlers 初始化 v3.1 用户提现申请路由
+func registerUserWithdrawalHandlers(rg *gin.RouterGroup) {
+	balSvc := balancesvc.NewBalanceService(database.DB, redis.Client)
+	svc := withdrawalsvc.NewService(database.DB, balSvc)
+	handler := userhandler.NewWithdrawalHandler(svc)
 	handler.Register(rg)
 }
 
@@ -742,6 +767,15 @@ func registerPublicPaymentMethodsHandler(rg *gin.RouterGroup) {
 	svc := paymentsvc.NewPaymentConfigService(db)
 	handler := admin.NewPaymentConfigHandler(svc)
 	rg.GET("/payment-methods", handler.GetActivePaymentMethods)
+}
+
+// registerPublicConfigHandlers 注册公开配置接口（邀请返佣 + 注册赠送）
+func registerPublicConfigHandlers(rg *gin.RouterGroup) {
+	db := database.DB
+	referralSvc := referralsvc.NewReferralService(db)
+	balanceSvc := balancesvc.NewBalanceService(db, redis.Client)
+	handler := public.NewConfigHandler(referralSvc, balanceSvc)
+	handler.Register(rg)
 }
 
 // registerSetupHandlers 注册安装向导路由组 (/api/v1/setup/)
@@ -801,10 +835,6 @@ func registerOpenAICompatibleRoutes(r *gin.Engine) {
 	modelsHandler := v1handler.NewModelsHandler(db)
 	modelsHandler.Register(v1Group)
 
-	// --- /v1/embeddings --- 向量嵌入（占位）
-	embeddingsHandler := v1handler.NewEmbeddingsHandler()
-	embeddingsHandler.Register(v1Group)
-
 	// --- /v1/chat/completions + /v1/completions --- 补全端点
 	groupSvc := channelsvc.NewChannelGroupService(db)
 	backupSvc := channelsvc.NewBackupService(db, redisClient)
@@ -816,11 +846,37 @@ func registerOpenAICompatibleRoutes(r *gin.Engine) {
 	commCalc := referralsvc.NewCommissionCalculator(db)
 	codSvc := codingsvc.NewCodingService(db)
 
+	paramSvc := parammapping.NewParamMappingService(db)
+	tpmLimiter := middleware.NewTPMLimiter(db, redisClient)
 	completionsHandler := v1handler.NewCompletionsHandler(
 		db, codSvc, channelRouter,
-		pricingCalc, apiKeySvc, balSvc, commCalc,
+		pricingCalc, apiKeySvc, balSvc, commCalc, paramSvc, tpmLimiter,
 	)
 	completionsHandler.Register(v1Group)
+
+	// --- /v1/embeddings --- 向量嵌入端点（透传至上游，按 PricingUnit 计费）
+	embeddingsHandler := v1handler.NewEmbeddingsHandler(
+		db, channelRouter, apiKeySvc, balSvc, pricingCalc,
+	)
+	embeddingsHandler.Register(v1Group)
+
+	// --- /v1/images/generations --- 图像生成端点
+	imagesHandler := v1handler.NewImagesHandler(
+		db, codSvc, channelRouter, apiKeySvc, balSvc, paramSvc, pricingCalc,
+	)
+	imagesHandler.Register(v1Group)
+
+	// --- /v1/videos/generations --- 视频生成端点
+	videosHandler := v1handler.NewVideosHandler(
+		db, codSvc, channelRouter, apiKeySvc, balSvc, paramSvc, pricingCalc,
+	)
+	videosHandler.Register(v1Group)
+
+	// --- /v1/audio/speech + /v1/audio/transcriptions --- 语音合成 / 识别端点
+	audioHandler := v1handler.NewAudioHandler(
+		db, codSvc, channelRouter, apiKeySvc, balSvc, paramSvc, pricingCalc,
+	)
+	audioHandler.Register(v1Group)
 }
 
 // registerUserMemberHandlers 初始化会员等级服务并注册用户会员路由
@@ -833,24 +889,13 @@ func registerUserMemberHandlers(rg *gin.RouterGroup) {
 	handler.Register(rg)
 }
 
-// registerAgentLevelHandlers 初始化代理等级服务并注册代理等级路由
-func registerAgentLevelHandlers(rg *gin.RouterGroup) {
-	db := database.DB
-	redisClient := redis.Client
-
-	svc := agentlevelsvc.NewAgentLevelService(db, redisClient)
-	handler := agenthandler.NewAgentLevelHandler(svc)
-	handler.Register(rg)
-}
-
 // registerLevelAdminHandlers 初始化等级管理服务并注册管理员路由
 func registerLevelAdminHandlers(rg *gin.RouterGroup) {
 	db := database.DB
 	redisClient := redis.Client
 
 	memberSvc := membersvc.NewMemberLevelService(db, redisClient)
-	agentSvc := agentlevelsvc.NewAgentLevelService(db, redisClient)
-	handler := admin.NewLevelAdminHandler(memberSvc, agentSvc)
+	handler := admin.NewLevelAdminHandler(memberSvc)
 	handler.Register(rg)
 }
 
@@ -882,28 +927,26 @@ func registerPublicModelHandlers(rg *gin.RouterGroup) {
 	rg.GET("/models", handler.PublicList)
 }
 
-// registerModelCommissionHandlers 注册模型佣金配置管理路由
-func registerModelCommissionHandlers(rg *gin.RouterGroup) {
-	db := database.DB
-	handler := admin.NewModelCommissionHandler(db)
-	handler.Register(rg)
+// registerParamSupportHandler 注册参数支持情况查询接口（无需认证）
+// GET /api/v1/public/param-support?supplier={supplier_code}
+func registerParamSupportHandler(rg *gin.RouterGroup) {
+	svc := parammapping.NewParamMappingService(database.DB)
+	h := public.NewParamSupportHandler(svc)
+	rg.GET("/param-support", h.GetParamSupport)
 }
 
-// registerAgentApplicationPublicHandlers 注册代理申请公开接口
-// POST /api/v1/public/agent-applications — 提交申请（无需认证）
-func registerAgentApplicationPublicHandlers(rg *gin.RouterGroup) {
-	db := database.DB
-	handler := public.NewAgentApplicationHandler(db)
-	handler.RegisterPublic(rg)
+// registerPartnerApplicationHandler 注册合作伙伴线索申请接口（无需认证，无缓存）
+// POST /api/v1/public/partner-applications
+func registerPartnerApplicationHandler(rg *gin.RouterGroup) {
+	h := public.NewPartnerApplicationHandler(database.DB)
+	h.Register(rg)
 }
 
-// registerAgentApplicationAdminHandlers 注册代理申请管理接口
-// GET  /api/v1/admin/agent-applications — 申请列表
-// PUT  /api/v1/admin/agent-applications/:id/review — 审核
-func registerAgentApplicationAdminHandlers(rg *gin.RouterGroup) {
-	db := database.DB
-	handler := public.NewAgentApplicationHandler(db)
-	handler.RegisterAdmin(rg)
+// registerReferralClickHandler 注册邀请链接点击追踪接口（无需认证，无缓存）
+// POST /api/v1/public/referral/click
+func registerReferralClickHandler(rg *gin.RouterGroup) {
+	h := public.NewReferralClickHandler(database.DB)
+	h.Register(rg)
 }
 
 // registerModelSyncHandlers 注册模型自动发现与同步管理路由
@@ -920,6 +963,7 @@ func registerModelSyncHandlers(rg *gin.RouterGroup) {
 	// 批量操作路由必须在 :id 参数路由之前注册，避免 Gin 将 "batch-*" 匹配为 :id
 	rg.PUT("/models/batch-status", handler.BatchUpdateModelStatus)
 	rg.DELETE("/models/batch-delete", handler.BatchDeleteModels)
+	rg.PUT("/models/batch-selling-price", handler.BatchUpdateSellingPrice)
 
 	rg.POST("/models/sync", handler.SyncAll)
 	rg.POST("/models/sync/:channelId", handler.SyncByChannel)
@@ -930,12 +974,13 @@ func registerModelSyncHandlers(rg *gin.RouterGroup) {
 // registerCustomChannelHandlers 注册自定义渠道管理路由
 func registerCustomChannelHandlers(rg *gin.RouterGroup) {
 	db := database.DB
-	handler := admin.NewCustomChannelHandler(db)
+	handler := admin.NewCustomChannelHandler(db, redis.Client)
 
 	rg.GET("/custom-channels", handler.List)
 	rg.POST("/custom-channels", handler.Create)
 	// 具体路径路由必须在参数路由之前注册，避免 Gin 将 "default" 匹配为 :id
 	rg.POST("/custom-channels/default/refresh", handler.RefreshDefault)
+	rg.GET("/custom-channels/default/refresh/status", handler.GetRefreshStatus)
 	rg.PUT("/custom-channels/:id", handler.Update)
 	rg.DELETE("/custom-channels/:id", handler.Delete)
 	rg.PATCH("/custom-channels/:id/toggle", handler.Toggle)
@@ -952,14 +997,6 @@ func registerUserAvailableChannelsHandlers(rg *gin.RouterGroup) {
 	handler.Register(rg)
 }
 
-// registerPublicAgentLevelHandlers 注册代理等级公开接口
-// GET /api/v1/public/agent-levels — 查询所有启用的代理等级（无需认证）
-func registerPublicAgentLevelHandlers(rg *gin.RouterGroup) {
-	db := database.DB
-	handler := public.NewAgentLevelPublicHandler(db)
-	rg.GET("/agent-levels", handler.GetPublicAgentLevels)
-}
-
 // registerPriceScraperHandlers 注册价格爬虫管理路由
 // POST /admin/models/preview-prices  — 预览价格变更（爬取并对比，不写DB）
 // POST /admin/models/apply-prices    — 应用价格更新（事务写入）
@@ -973,4 +1010,33 @@ func registerPriceScraperHandlers(rg *gin.RouterGroup) {
 	rg.POST("/models/preview-prices", handler.PreviewPrices)
 	rg.POST("/models/apply-prices", handler.ApplyPrices)
 	rg.GET("/models/price-sync-logs", handler.GetSyncLogs)
+}
+
+// registerTaskHandlers 注册后台任务管理路由
+func registerTaskHandlers(rg *gin.RouterGroup) {
+	db := database.DB
+	taskSvc := task.NewTaskService(db)
+	handler := admin.NewTaskHandler(taskSvc)
+
+	rg.POST("/tasks", handler.CreateTask)
+	rg.GET("/tasks", handler.ListTasks)
+	rg.GET("/tasks/:id", handler.GetTask)
+	rg.POST("/tasks/:id/cancel", handler.CancelTask)
+	rg.POST("/tasks/:id/apply-prices", handler.ApplyTaskPrices)
+}
+
+// registerParamMappingHandlers 注册平台参数映射管理路由
+func registerParamMappingHandlers(rg *gin.RouterGroup) {
+	svc := parammapping.NewParamMappingService(database.DB)
+	handler := admin.NewParamMappingHandler(svc)
+
+	rg.GET("/param-mappings", handler.ListParams)
+	rg.GET("/param-mappings/:id", handler.GetParam)
+	rg.POST("/param-mappings", handler.CreateParam)
+	rg.PUT("/param-mappings/:id", handler.UpdateParam)
+	rg.DELETE("/param-mappings/:id", handler.DeleteParam)
+	rg.POST("/param-mappings/:id/mappings", handler.UpsertMapping)
+	rg.DELETE("/param-mappings/mappings/:mappingId", handler.DeleteMapping)
+	rg.GET("/param-mappings/supplier/:code", handler.GetMappingsBySupplier)
+	rg.PUT("/param-mappings/supplier/:code", handler.BatchUpdateMappings)
 }

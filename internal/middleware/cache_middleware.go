@@ -53,9 +53,8 @@ func CacheMiddleware(ttl time.Duration) gin.HandlerFunc {
 		// 构建缓存 Key
 		cacheKey := buildCacheKey(c)
 
-		// 尝试从缓存读取
-		ctx := c.Request.Context()
-		cached, err := svc.Get(ctx, cacheKey)
+		// 尝试从缓存读取（使用请求上下文，确保请求取消时 Redis 调用也能及时中断）
+		cached, err := svc.Get(c.Request.Context(), cacheKey)
 		if err == nil && len(cached) > 0 {
 			// 缓存命中，直接返回
 			c.Header("X-Cache", "HIT")
@@ -81,9 +80,16 @@ func CacheMiddleware(ttl time.Duration) gin.HandlerFunc {
 
 		// 仅缓存 200 响应
 		if recorder.statusCode == http.StatusOK && recorder.body.Len() > 0 {
+			// 复制响应体到新切片，避免 goroutine 访问已被释放的 buffer
+			bodyCopy := make([]byte, recorder.body.Len())
+			copy(bodyCopy, recorder.body.Bytes())
 			go func() {
-				// 异步写入缓存，不阻塞响应
-				if err := svc.Set(ctx, cacheKey, recorder.body.Bytes(), ttl); err != nil {
+				// 异步写入缓存，不阻塞响应。
+				// 必须使用独立的 context，否则请求结束后 c.Request.Context() 会立即被取消，
+				// 导致 Redis Set 调用报 "context canceled" 无法写入缓存。
+				writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := svc.Set(writeCtx, cacheKey, bodyCopy, ttl); err != nil {
 					if logger.L != nil {
 						logger.L.Warn("写入接口缓存失败",
 							zap.String("key", cacheKey),

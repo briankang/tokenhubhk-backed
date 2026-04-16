@@ -14,6 +14,7 @@ import (
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/credits"
 	pkgredis "tokenhub-server/internal/pkg/redis"
+	"tokenhub-server/internal/service/referral"
 )
 
 const (
@@ -257,6 +258,13 @@ func (s *BalanceService) Deduct(ctx context.Context, userID, tenantID uint, cred
 	}
 
 	s.InvalidateCache(ctx, userID)
+
+	// v3.1: 尝试解锁邀请归因(被邀者累计消费达门槛后邀请人才能拿佣金)
+	// 失败不阻塞消费流程
+	referral.TryUnlockAttribution(ctx, s.db, userID)
+	// v3.1: 尝试发放被邀者一次性奖励(累计消费达 InviteeUnlockCredits)
+	referral.TryGrantInviteeBonus(ctx, s.db, userID)
+
 	return &ub, nil
 }
 
@@ -371,6 +379,12 @@ func (s *BalanceService) UpdateQuotaConfig(ctx context.Context, cfg *model.Quota
 	}
 	existing.DefaultFreeQuota = cfg.DefaultFreeQuota
 	existing.RegistrationBonus = cfg.RegistrationBonus
+	// v3.1 邀请双向奖励字段
+	existing.InviteeBonus = cfg.InviteeBonus
+	existing.InviteeUnlockCredits = cfg.InviteeUnlockCredits
+	existing.InviterBonus = cfg.InviterBonus
+	existing.InviterUnlockPaidRMB = cfg.InviterUnlockPaidRMB
+	existing.InviterMonthlyCap = cfg.InviterMonthlyCap
 	existing.Description = cfg.Description
 	return s.db.WithContext(ctx).Save(&existing).Error
 }
@@ -590,6 +604,13 @@ func (s *BalanceService) SettleBalance(ctx context.Context, freezeID string, act
 	}
 
 	s.InvalidateCache(ctx, fr.UserID)
+
+	// v3.1: 结算后尝试解锁邀请归因 + 发放被邀者奖励
+	if actualCredits > 0 {
+		referral.TryUnlockAttribution(ctx, s.db, fr.UserID)
+		referral.TryGrantInviteeBonus(ctx, s.db, fr.UserID)
+	}
+
 	return nil
 }
 

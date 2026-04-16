@@ -41,10 +41,24 @@ func Init(cfg config.DatabaseConfig, logger *zap.Logger) error {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 
+	// 注册连接初始化回调，确保每个新连接都使用 utf8mb4
+	DB.Callback().Create().Before("gorm:create").Register("set_charset", func(db *gorm.DB) {
+		db.Exec("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci")
+	})
+	DB.Callback().Query().Before("gorm:query").Register("set_charset", func(db *gorm.DB) {
+		db.Exec("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci")
+	})
+	DB.Callback().Update().Before("gorm:update").Register("set_charset", func(db *gorm.DB) {
+		db.Exec("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci")
+	})
+
 	sqlDB, err := DB.DB()
 	if err != nil {
 		return fmt.Errorf("failed to get underlying sql.DB: %w", err)
 	}
+
+	// 立即设置当前连接的字符集
+	DB.Exec("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci")
 
 	// 连接池配置
 	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
@@ -225,17 +239,34 @@ func autoMigrate() error {
 		&model.FreezeRecord{},
 		&model.MemberLevel{},
 		&model.UserMemberProfile{},
-		&model.AgentLevel{},
-		&model.UserAgentProfile{},
 		&model.WithdrawalRequest{},
 		&model.ExchangeRate{},
-		&model.ModelCommissionConfig{}, // 模型级别佣金配置
-		&model.AgentApplication{},    // 代理申请表
 		&model.CustomChannel{},       // 自定义渠道
 		&model.CustomChannelRoute{},  // 自定义渠道路由规则
 		&model.CustomChannelAccess{}, // 自定义渠道访问控制
 		&model.ChannelModel{},        // 渠道-模型映射（标准模型名 <-> 供应商模型ID）
 		&model.PriceSyncLog{},        // 价格同步历史日志
+		&model.ModelCheckLog{},       // 模型可用性检测记录
+		&model.ModelCheckTask{},      // 模型检测后台任务
+		&model.BackgroundTask{},     // 后台异步任务
+		&model.ApiCallLog{},         // API 调用全链路日志
+		&model.PlatformParam{},      // 平台标准参数定义
+		&model.SupplierParamMapping{}, // 供应商参数映射
+
+		// --- v3.1 新增模型:邀请返佣 / 特殊加佣 / 风控 / 配置审计 ---
+		&model.ReferralAttribution{},    // 邀请归因快照
+		&model.UserCommissionOverride{}, // 特殊用户加佣配置
+		&model.RegistrationGuard{},      // 注册风控配置
+		&model.RegistrationEvent{},      // 注册行为审计日志
+		&model.EmailOTPToken{},          // 邮箱 OTP 验证码
+		&model.ConfigAuditLog{},         // 配置变更审计日志
+		&model.DisposableEmailDomain{},  // 一次性邮箱域名黑名单
+
+		&model.PartnerApplication{}, // 合作伙伴线索申请
+
+		// --- 站内公告/通知系统 ---
+		&model.Announcement{},         // 管理员发布的站内公告
+		&model.UserAnnouncementRead{}, // 用户公告已读记录
 	)
 }
 

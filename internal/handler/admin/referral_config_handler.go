@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"tokenhub-server/internal/middleware"
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 	"tokenhub-server/internal/service/referral"
@@ -47,18 +48,79 @@ func (h *ReferralConfigHandler) UpdateConfig(c *gin.Context) {
 	}
 
 	var req struct {
+		// v3.1 核心字段
+		CommissionRate       *float64 `json:"commissionRate"`
+		AttributionDays      *int     `json:"attributionDays"`
+		LifetimeCapCredits   *int64   `json:"lifetimeCapCredits"`
+		MinPaidCreditsUnlock *int64   `json:"minPaidCreditsUnlock"`
+		MinWithdrawAmount    *int64   `json:"minWithdrawAmount"`
+		SettleDays           *int     `json:"settleDays"`
+		IsActive             *bool    `json:"isActive"`
+		// 兼容字段(v3.x 弃用,保留以避免破坏性改动)
 		PersonalCashbackRate *float64 `json:"personalCashbackRate"`
 		L1CommissionRate     *float64 `json:"l1CommissionRate"`
 		L2CommissionRate     *float64 `json:"l2CommissionRate"`
 		L3CommissionRate     *float64 `json:"l3CommissionRate"`
-		MinWithdrawAmount    *float64 `json:"minWithdrawAmount"`
-		IsActive             *bool    `json:"isActive"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, http.StatusBadRequest, errcode.ErrBadRequest)
 		return
 	}
 
+	// v3.1 字段校验:commission_rate [0, 0.80], attribution_days [7, 3650], settle_days [1, 90]
+	if req.CommissionRate != nil {
+		v := *req.CommissionRate
+		if v < 0 || v > 0.80 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "commissionRate must be in [0, 0.80]")
+			return
+		}
+		cfg.CommissionRate = v
+	}
+	if req.AttributionDays != nil {
+		v := *req.AttributionDays
+		if v < 7 || v > 3650 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "attributionDays must be in [7, 3650]")
+			return
+		}
+		cfg.AttributionDays = v
+	}
+	if req.LifetimeCapCredits != nil {
+		v := *req.LifetimeCapCredits
+		if v < 0 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "lifetimeCapCredits must be >= 0")
+			return
+		}
+		cfg.LifetimeCapCredits = v
+	}
+	if req.MinPaidCreditsUnlock != nil {
+		v := *req.MinPaidCreditsUnlock
+		if v < 0 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "minPaidCreditsUnlock must be >= 0")
+			return
+		}
+		cfg.MinPaidCreditsUnlock = v
+	}
+	if req.MinWithdrawAmount != nil {
+		v := *req.MinWithdrawAmount
+		if v < 0 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "minWithdrawAmount must be >= 0")
+			return
+		}
+		cfg.MinWithdrawAmount = v
+	}
+	if req.SettleDays != nil {
+		v := *req.SettleDays
+		if v < 1 || v > 90 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "settleDays must be in [1, 90]")
+			return
+		}
+		cfg.SettleDays = v
+	}
+	if req.IsActive != nil {
+		cfg.IsActive = *req.IsActive
+	}
+
+	// 兼容字段仍允许更新
 	if req.PersonalCashbackRate != nil {
 		cfg.PersonalCashbackRate = *req.PersonalCashbackRate
 	}
@@ -71,17 +133,15 @@ func (h *ReferralConfigHandler) UpdateConfig(c *gin.Context) {
 	if req.L3CommissionRate != nil {
 		cfg.L3CommissionRate = *req.L3CommissionRate
 	}
-	if req.MinWithdrawAmount != nil {
-		cfg.MinWithdrawAmount = int64(*req.MinWithdrawAmount)
-	}
-	if req.IsActive != nil {
-		cfg.IsActive = *req.IsActive
-	}
 
 	if err := h.svc.UpdateConfig(c.Request.Context(), cfg); err != nil {
 		response.Error(c, http.StatusInternalServerError, errcode.ErrInternal)
 		return
 	}
+
+	// 清除公开配置缓存，使管理员变更立即对 /partners 等公开页可见
+	middleware.CacheInvalidate("cache:/api/v1/public/referral-config*")
+
 	response.Success(c, cfg)
 }
 

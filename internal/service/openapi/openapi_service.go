@@ -50,8 +50,13 @@ func (s *OpenAPIService) GetConsumptionSummary(ctx context.Context, userID uint,
 		dateFmt = "%%Y-%%m-%%d"
 	}
 
-	query := s.db.WithContext(ctx).Table("channel_logs").
-		Select(fmt.Sprintf("DATE_FORMAT(created_at, '%s') as period, COUNT(*) as total_requests, SUM(request_tokens + response_tokens) as total_tokens, 0 as total_cost", dateFmt)).
+	// 从 api_call_logs 聚合（含 cost_credits），channel_logs 无费用字段
+	query := s.db.WithContext(ctx).Table("api_call_logs").
+		Select(fmt.Sprintf(
+			"DATE_FORMAT(created_at, '%s') as period, "+
+				"COUNT(*) as total_requests, "+
+				"COALESCE(SUM(total_tokens),0) as total_tokens, "+
+				"COALESCE(SUM(cost_credits),0) as cost_credits_sum", dateFmt)).
 		Where("user_id = ? AND status_code = 200", userID).
 		Group("period").
 		Order("period ASC")
@@ -63,9 +68,25 @@ func (s *OpenAPIService) GetConsumptionSummary(ctx context.Context, userID uint,
 		query = query.Where("created_at <= ?", dateTo+" 23:59:59")
 	}
 
-	var results []ConsumptionSummaryItem
-	if err := query.Find(&results).Error; err != nil {
+	// 临时结构承接聚合值，再转换 credits→RMB
+	var rows []struct {
+		Period         string `gorm:"column:period"`
+		TotalRequests  int64  `gorm:"column:total_requests"`
+		TotalTokens    int64  `gorm:"column:total_tokens"`
+		CostCreditsSum int64  `gorm:"column:cost_credits_sum"`
+	}
+	if err := query.Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("query consumption summary: %w", err)
+	}
+
+	results := make([]ConsumptionSummaryItem, len(rows))
+	for i, r := range rows {
+		results[i] = ConsumptionSummaryItem{
+			Period:        r.Period,
+			TotalRequests: r.TotalRequests,
+			TotalTokens:   r.TotalTokens,
+			TotalCost:     credits.CreditsToRMB(r.CostCreditsSum),
+		}
 	}
 	return results, nil
 }

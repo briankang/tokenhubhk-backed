@@ -23,6 +23,38 @@ func jsonReader(s string) io.Reader {
 	return strings.NewReader(s)
 }
 
+// buildChatURL 根据渠道 endpoint 构建 chat/completions 请求 URL。
+//
+// 不同供应商的 endpoint 约定不同：
+//   - OpenAI: https://api.openai.com          → 需补 /v1/chat/completions
+//   - Alibaba: https://dashscope.../v1        → 直接补 /chat/completions
+//   - Volcengine: https://ark.../api/v3       → 直接补 /chat/completions
+//   - Qianfan V2: https://qianfan.../v2       → 直接补 /chat/completions
+//
+// 规则：endpoint 尾部已有 /vN 版本段时，直接追加 /chat/completions；
+// 否则补全 /v1/chat/completions（兼容原 OpenAI 约定）。
+func buildChatURL(endpoint string) string {
+	e := strings.TrimRight(endpoint, "/")
+	// 检查最后一段是否为版本号（/v 后跟一个或多个数字）
+	lastSlash := strings.LastIndex(e, "/")
+	if lastSlash >= 0 {
+		seg := e[lastSlash+1:]
+		if len(seg) >= 2 && seg[0] == 'v' {
+			allDigits := true
+			for _, c := range seg[1:] {
+				if c < '0' || c > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				return e + "/chat/completions"
+			}
+		}
+	}
+	return e + "/v1/chat/completions"
+}
+
 // ChannelTestResult 渠道连通性测试结果
 type ChannelTestResult struct {
 	ChannelID  uint   `json:"channel_id"`
@@ -272,7 +304,7 @@ func (s *ChannelService) TestChannel(ctx context.Context, id uint) (*ChannelTest
 
 	// 构建最小化测试请求
 	reqBody := fmt.Sprintf(`{"model":"%s","messages":[{"role":"user","content":"hi"}],"max_tokens":1}`, testModel)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ch.Endpoint+"/v1/chat/completions", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, buildChatURL(ch.Endpoint), nil)
 	if err != nil {
 		result.Error = fmt.Sprintf("failed to build request: %v", err)
 		return result, nil
@@ -281,7 +313,7 @@ func (s *ChannelService) TestChannel(ctx context.Context, id uint) (*ChannelTest
 	req.Header.Set("Content-Type", "application/json")
 	req.Body = http.NoBody
 	// 用实际请求体替换
-	req, _ = http.NewRequestWithContext(ctx, http.MethodPost, ch.Endpoint+"/v1/chat/completions",
+	req, _ = http.NewRequestWithContext(ctx, http.MethodPost, buildChatURL(ch.Endpoint),
 		jsonReader(reqBody))
 	req.Header.Set("Authorization", "Bearer "+ch.APIKey)
 	req.Header.Set("Content-Type", "application/json")

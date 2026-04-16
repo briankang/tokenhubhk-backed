@@ -70,7 +70,7 @@ func (p *AzureProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespon
 	}
 
 	oaiReq := convertToOpenAIFormat(req, false)
-	body, err := json.Marshal(oaiReq)
+	body, err := MarshalWithExtra(oaiReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider azure: marshal request: %w", err)
 	}
@@ -109,7 +109,7 @@ func (p *AzureProvider) StreamChat(ctx context.Context, req *ChatRequest) (Strea
 	}
 
 	oaiReq := convertToOpenAIFormat(req, true)
-	body, err := json.Marshal(oaiReq)
+	body, err := MarshalWithExtra(oaiReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider azure: marshal request: %w", err)
 	}
@@ -168,9 +168,9 @@ func convertFromOpenAIResponse(oaiResp *openAIResponse) *ChatResponse {
 	choices := make([]Choice, len(oaiResp.Choices))
 	for i, c := range oaiResp.Choices {
 		choices[i] = Choice{
-			Index:        c.Index,
-			Message:      Message{Role: c.Message.Role, Content: c.Message.Content},
-			FinishReason: c.FinishReason,
+			Index:            c.Index,
+			Message:          Message{Role: c.Message.Role, Content: c.Message.Content, ReasoningContent: c.Message.ReasoningContent},
+			FinishReason:     c.FinishReason,
 		}
 	}
 	resp := &ChatResponse{
@@ -179,11 +179,19 @@ func convertFromOpenAIResponse(oaiResp *openAIResponse) *ChatResponse {
 		Choices: choices,
 	}
 	if oaiResp.Usage != nil {
-		resp.Usage = Usage{
+		u := Usage{
 			PromptTokens:     oaiResp.Usage.PromptTokens,
 			CompletionTokens: oaiResp.Usage.CompletionTokens,
 			TotalTokens:      oaiResp.Usage.TotalTokens,
 		}
+		// 提取缓存命中Token：OpenAI/Azure 走 prompt_tokens_details.cached_tokens，
+		// DeepSeek 走顶层 prompt_cache_hit_tokens
+		if oaiResp.Usage.PromptTokensDetails != nil && oaiResp.Usage.PromptTokensDetails.CachedTokens > 0 {
+			u.CacheReadTokens = oaiResp.Usage.PromptTokensDetails.CachedTokens
+		} else if oaiResp.Usage.PromptCacheHitTokens > 0 {
+			u.CacheReadTokens = oaiResp.Usage.PromptCacheHitTokens
+		}
+		resp.Usage = u
 	}
 	return resp
 }

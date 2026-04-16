@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"tokenhub-server/internal/middleware"
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
@@ -41,29 +42,107 @@ func (h *QuotaHandler) GetQuotaConfig(c *gin.Context) {
 }
 
 // UpdateQuotaConfig 更新配额配置 PUT /api/v1/admin/quota-config
+// v3.1: 支持邀请双向奖励字段(InviteeBonus/InviteeUnlockCredits/InviterBonus/InviterUnlockPaidRMB/InviterMonthlyCap)
+// 所有字段采用指针类型,不传则保持原值
 func (h *QuotaHandler) UpdateQuotaConfig(c *gin.Context) {
+	// 先读取现有配置作为基础值
+	current := h.balanceSvc.GetQuotaConfig(c.Request.Context())
+	if current == nil {
+		current = &model.QuotaConfig{}
+	}
+
 	var req struct {
-		DefaultFreeQuota  int64  `json:"defaultFreeQuota"`  // 积分(credits)
-		RegistrationBonus int64  `json:"registrationBonus"` // 积分(credits)
-		Description       string `json:"description"`
+		DefaultFreeQuota     *int64  `json:"defaultFreeQuota"`
+		RegistrationBonus    *int64  `json:"registrationBonus"`
+		InviteeBonus         *int64  `json:"inviteeBonus"`
+		InviteeUnlockCredits *int64  `json:"inviteeUnlockCredits"`
+		InviterBonus         *int64  `json:"inviterBonus"`
+		InviterUnlockPaidRMB *int64  `json:"inviterUnlockPaidRmb"`
+		InviterMonthlyCap    *int    `json:"inviterMonthlyCap"`
+		Description          *string `json:"description"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, http.StatusBadRequest, errcode.ErrBadRequest)
 		return
 	}
 
-	cfg := &model.QuotaConfig{
-		DefaultFreeQuota:  req.DefaultFreeQuota,
-		RegistrationBonus: req.RegistrationBonus,
-		Description:       req.Description,
+	// v3.1 软边界校验(参考 plan 文档):
+	// default_free_quota       [0, 100000]
+	// registration_bonus       [0, 100000]
+	// invitee_bonus            [0, 100000]
+	// invitee_unlock_credits   [0, 1000000]
+	// inviter_bonus            [0, 500000]
+	// inviter_unlock_paid_rmb  [0, 10000000]
+	// inviter_monthly_cap      [0, 1000]
+	if req.DefaultFreeQuota != nil {
+		v := *req.DefaultFreeQuota
+		if v < 0 || v > 100000 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "defaultFreeQuota must be in [0, 100000]")
+			return
+		}
+		current.DefaultFreeQuota = v
+	}
+	if req.RegistrationBonus != nil {
+		v := *req.RegistrationBonus
+		if v < 0 || v > 100000 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "registrationBonus must be in [0, 100000]")
+			return
+		}
+		current.RegistrationBonus = v
+	}
+	if req.InviteeBonus != nil {
+		v := *req.InviteeBonus
+		if v < 0 || v > 100000 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "inviteeBonus must be in [0, 100000]")
+			return
+		}
+		current.InviteeBonus = v
+	}
+	if req.InviteeUnlockCredits != nil {
+		v := *req.InviteeUnlockCredits
+		if v < 0 || v > 1000000 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "inviteeUnlockCredits must be in [0, 1000000]")
+			return
+		}
+		current.InviteeUnlockCredits = v
+	}
+	if req.InviterBonus != nil {
+		v := *req.InviterBonus
+		if v < 0 || v > 500000 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "inviterBonus must be in [0, 500000]")
+			return
+		}
+		current.InviterBonus = v
+	}
+	if req.InviterUnlockPaidRMB != nil {
+		v := *req.InviterUnlockPaidRMB
+		if v < 0 || v > 10000000 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "inviterUnlockPaidRmb must be in [0, 10000000]")
+			return
+		}
+		current.InviterUnlockPaidRMB = v
+	}
+	if req.InviterMonthlyCap != nil {
+		v := *req.InviterMonthlyCap
+		if v < 0 || v > 1000 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "inviterMonthlyCap must be in [0, 1000]")
+			return
+		}
+		current.InviterMonthlyCap = v
+	}
+	if req.Description != nil {
+		current.Description = *req.Description
 	}
 
-	if err := h.balanceSvc.UpdateQuotaConfig(c.Request.Context(), cfg); err != nil {
+	if err := h.balanceSvc.UpdateQuotaConfig(c.Request.Context(), current); err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return
 	}
 
-	response.Success(c, cfg)
+	// 清除公开配置缓存，使管理员变更立即对 /partners 等公开页可见
+	middleware.CacheInvalidate("cache:/api/v1/public/quota-config*")
+
+	response.Success(c, current)
 }
 
 // RechargeUser 用户充值 POST /api/v1/admin/users/:id/recharge

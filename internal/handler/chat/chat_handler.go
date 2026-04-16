@@ -291,7 +291,7 @@ func (h *ChatHandler) handleStreamCompletion(
 	}
 
 	// SSE 流式转发，不包含 usage 信息（旧的 chat/completions 接口）
-	usage, err := provider.SSEWriter(c, reader, false)
+	sseResult, err := provider.SSEWriter(c, reader, false)
 	latency := time.Since(start).Milliseconds()
 
 	if err != nil {
@@ -305,9 +305,17 @@ func (h *ChatHandler) handleStreamCompletion(
 	}
 
 	h.router.RecordResult(ch.ID, true, int(latency), 200)
-	if usage != nil {
+	warnMsg := ""
+	if sseResult != nil && sseResult.ThinkingOnly {
+		warnMsg = "warn:thinking_only"
+		if sseResult.FinishReason != "" {
+			warnMsg += ":finish=" + sseResult.FinishReason
+		}
+	}
+	if sseResult != nil && sseResult.Usage != nil {
+		usage := sseResult.Usage
 		h.recordLog(ch.ID, req.Model, keyInfo, requestID,
-			usage.PromptTokens, usage.CompletionTokens, int(latency), 200, "")
+			usage.PromptTokens, usage.CompletionTokens, int(latency), 200, warnMsg)
 		// 精确结算
 		cost := h.calculateActualCost(c.Request.Context(), req.Model, keyInfo, *usage)
 		if freezeID != "" && h.balanceSvc != nil {
@@ -319,9 +327,14 @@ func (h *ChatHandler) handleStreamCompletion(
 		if h.commissionCalc != nil && cost > 0 {
 			h.commissionCalc.CalculateCommissionsAsync(keyInfo.UserID, keyInfo.TenantID, cost)
 		}
-	} else if freezeID != "" {
-		// 无usage信息时释放冻结
-		_ = h.balanceSvc.ReleaseFrozen(c.Request.Context(), freezeID)
+	} else {
+		// 无 usage 信息时：释放冻结；若命中 thinking-only 也补写一条日志便于聚合
+		if warnMsg != "" {
+			h.recordLog(ch.ID, req.Model, keyInfo, requestID, 0, 0, int(latency), 200, warnMsg)
+		}
+		if freezeID != "" {
+			_ = h.balanceSvc.ReleaseFrozen(c.Request.Context(), freezeID)
+		}
 	}
 }
 

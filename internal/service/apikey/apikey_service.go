@@ -2,11 +2,15 @@ package apikey
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -48,16 +52,74 @@ type ApiKeyInfo struct {
 
 // ApiKeyService API 密钥服务，管理密钥的生成、验证、列表和撤销
 type ApiKeyService struct {
-	db    *gorm.DB
-	redis *goredis.Client
+	db        *gorm.DB
+	redis     *goredis.Client
+	encKey    []byte // AES-256 加密密钥（32字节，由 JWT Secret 派生）
 }
 
 // NewApiKeyService 创建 API 密钥服务实例，db 不能为 nil 否则 panic
-func NewApiKeyService(db *gorm.DB, redis *goredis.Client) *ApiKeyService {
+// encSecret 用于 AES-GCM 加密存储完整密钥（传空字符串则不加密）
+func NewApiKeyService(db *gorm.DB, redis *goredis.Client, encSecret ...string) *ApiKeyService {
 	if db == nil {
 		panic("apikey service: db is nil")
 	}
-	return &ApiKeyService{db: db, redis: redis}
+	svc := &ApiKeyService{db: db, redis: redis}
+	if len(encSecret) > 0 && encSecret[0] != "" {
+		// 用 SHA256 将任意长度 secret 派生为 32 字节 AES-256 密钥
+		h := sha256.Sum256([]byte(encSecret[0]))
+		svc.encKey = h[:]
+	}
+	return svc
+}
+
+// encryptKey 使用 AES-256-GCM 加密明文密钥
+func (s *ApiKeyService) encryptKey(plainKey string) (string, error) {
+	if len(s.encKey) == 0 {
+		return "", nil // 未配置加密密钥，跳过
+	}
+	block, err := aes.NewCipher(s.encKey)
+	if err != nil {
+		return "", fmt.Errorf("aes cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("gcm: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", fmt.Errorf("nonce: %w", err)
+	}
+	ciphertext := gcm.Seal(nonce, nonce, []byte(plainKey), nil)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+// decryptKey 使用 AES-256-GCM 解密密钥
+func (s *ApiKeyService) decryptKey(encrypted string) (string, error) {
+	if len(s.encKey) == 0 {
+		return "", fmt.Errorf("encryption key not configured")
+	}
+	data, err := base64.StdEncoding.DecodeString(encrypted)
+	if err != nil {
+		return "", fmt.Errorf("base64 decode: %w", err)
+	}
+	block, err := aes.NewCipher(s.encKey)
+	if err != nil {
+		return "", fmt.Errorf("aes cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("gcm: %w", err)
+	}
+	nonceSize := gcm.NonceSize()
+	if len(data) < nonceSize {
+		return "", fmt.Errorf("ciphertext too short")
+	}
+	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", fmt.Errorf("decrypt: %w", err)
+	}
+	return string(plaintext), nil
 }
 
 // CreateKeyOptions 创建 API Key 的选项参数
@@ -127,12 +189,16 @@ func (s *ApiKeyService) GenerateWithOptions(ctx context.Context, userID, tenantI
 		return nil, fmt.Errorf("failed to generate unique api key after %d attempts", maxRetry)
 	}
 
+	// AES-GCM 加密完整密钥用于后续查看
+	encryptedKey, _ := s.encryptKey(fullKey)
+
 	record := &model.ApiKey{
 		TenantID:        tenantID,
 		UserID:          userID,
 		Name:            opts.Name,
 		KeyHash:         hashStr,
 		KeyPrefix:       displayPrefix,
+		KeyEncrypted:    encryptedKey,
 		IsActive:        true,
 		CustomChannelID: opts.CustomChannelID,
 		CreditLimit:     opts.CreditLimit,
@@ -199,7 +265,7 @@ func (s *ApiKeyService) Verify(ctx context.Context, key string) (*ApiKeyInfo, er
 
 	// 更新最后使用时间
 	now := time.Now()
-	_ = s.db.WithContext(ctx).Model(&apiKey).Update("last_used_at", now).Error
+	_ = s.db.WithContext(ctx).Model(&model.ApiKey{}).Where("id = ?", apiKey.ID).Update("last_used_at", now).Error
 
 	info := &ApiKeyInfo{
 		KeyID:           apiKey.ID,
@@ -223,8 +289,14 @@ func (s *ApiKeyService) Verify(ctx context.Context, key string) (*ApiKeyInfo, er
 	return info, nil
 }
 
-// List 分页查询用户的 API Key 列表（密钥已脱敏）
-func (s *ApiKeyService) List(ctx context.Context, userID uint, page, pageSize int) ([]model.ApiKey, int64, error) {
+// ApiKeyWithStats 携带统计信息的 API Key（用于列表展示）
+type ApiKeyWithStats struct {
+	model.ApiKey
+	Requests int64 `json:"requests" gorm:"column:requests"` // 总请求数（从 channel_logs 聚合）
+}
+
+// List 分页查询用户的 API Key 列表（密钥已脱敏），附带请求统计
+func (s *ApiKeyService) List(ctx context.Context, userID uint, page, pageSize int) ([]ApiKeyWithStats, int64, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -245,26 +317,93 @@ func (s *ApiKeyService) List(ctx context.Context, userID uint, page, pageSize in
 		return nil, 0, fmt.Errorf("failed to list api keys: %w", err)
 	}
 
-	return keys, total, nil
+	// 按 api_key_id 精确聚合每个 Key 的累计请求数（全量统计，含失败重试）
+	// 口径说明：
+	//   - 数据源 channel_logs：每次渠道调用 1 行（含失败重试），与仪表板 api_call_logs（每请求 1 行）不同
+	//   - 不做时间过滤，为"全量累计"展示；前端列标题需明确标注
+	type keyStat struct {
+		ApiKeyID uint  `gorm:"column:api_key_id"`
+		Count    int64 `gorm:"column:cnt"`
+	}
+	var stats []keyStat
+	if len(keys) > 0 {
+		keyIDs := make([]uint, 0, len(keys))
+		for _, k := range keys {
+			keyIDs = append(keyIDs, k.ID)
+		}
+		s.db.WithContext(ctx).
+			Table("channel_logs").
+			Select("api_key_id, COUNT(*) as cnt").
+			Where("user_id = ? AND api_key_id IN ?", userID, keyIDs).
+			Group("api_key_id").
+			Scan(&stats)
+	}
+	countByKey := make(map[uint]int64, len(stats))
+	for _, st := range stats {
+		countByKey[st.ApiKeyID] = st.Count
+	}
+
+	// 组装结果
+	result := make([]ApiKeyWithStats, len(keys))
+	for i, k := range keys {
+		result[i] = ApiKeyWithStats{
+			ApiKey:   k,
+			Requests: countByKey[k.ID],
+		}
+	}
+
+	return result, total, nil
 }
 
-// Revoke 撤销指定的 API Key，仅密钥拥有者可操作
+// Revoke 撤销指定的 API Key（兼容旧调用，等同于 Disable）
+// Deprecated: 请使用 Disable
 func (s *ApiKeyService) Revoke(ctx context.Context, id uint, userID uint) error {
+	return s.Disable(ctx, id, userID)
+}
+
+// Disable 禁用指定 API Key（is_active=false），密钥不可再调用但记录保留
+func (s *ApiKeyService) Disable(ctx context.Context, id uint, userID uint) error {
+	return s.setActive(ctx, id, userID, false)
+}
+
+// Enable 启用指定 API Key（is_active=true）
+func (s *ApiKeyService) Enable(ctx context.Context, id uint, userID uint) error {
+	return s.setActive(ctx, id, userID, true)
+}
+
+// setActive 内部统一切换 is_active 状态
+func (s *ApiKeyService) setActive(ctx context.Context, id uint, userID uint, active bool) error {
 	if id == 0 {
 		return fmt.Errorf("api key id is required")
 	}
-
 	result := s.db.WithContext(ctx).Model(&model.ApiKey{}).
 		Where("id = ? AND user_id = ?", id, userID).
-		Update("is_active", false)
+		Update("is_active", active)
 	if result.Error != nil {
-		return fmt.Errorf("failed to revoke api key: %w", result.Error)
+		return fmt.Errorf("failed to set api key active=%v: %w", active, result.Error)
 	}
 	if result.RowsAffected == 0 {
 		return fmt.Errorf("api key not found or not owned by user")
 	}
+	// 缓存失效：等待自然过期（通过 hash 不可直接获得）
+	return nil
+}
 
-	// 缓存失效：此处无法获取 hash，等待自然过期
+// SoftDelete 软删除指定 API Key（GORM 自动写 deleted_at）
+// 删除后用户与管理员均不可见（除非显式 Unscoped）
+func (s *ApiKeyService) SoftDelete(ctx context.Context, id uint, userID uint) error {
+	if id == 0 {
+		return fmt.Errorf("api key id is required")
+	}
+	result := s.db.WithContext(ctx).
+		Where("id = ? AND user_id = ?", id, userID).
+		Delete(&model.ApiKey{})
+	if result.Error != nil {
+		return fmt.Errorf("failed to soft-delete api key: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("api key not found or not owned by user")
+	}
 	return nil
 }
 
@@ -347,6 +486,31 @@ func (s *ApiKeyService) GetByKeyID(ctx context.Context, keyID uint) (*model.ApiK
 		return nil, err
 	}
 	return &apiKey, nil
+}
+
+// RevealKey 解密并返回指定 API Key 的完整明文，仅密钥拥有者可操作
+func (s *ApiKeyService) RevealKey(ctx context.Context, id uint, userID uint) (string, error) {
+	if id == 0 {
+		return "", fmt.Errorf("api key id is required")
+	}
+
+	var apiKey model.ApiKey
+	if err := s.db.WithContext(ctx).Where("id = ? AND user_id = ?", id, userID).First(&apiKey).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", fmt.Errorf("api key not found or not owned by user")
+		}
+		return "", fmt.Errorf("failed to get api key: %w", err)
+	}
+
+	if apiKey.KeyEncrypted == "" {
+		return "", fmt.Errorf("此密钥创建于加密存储功能上线之前，无法恢复完整密钥")
+	}
+
+	plainKey, err := s.decryptKey(apiKey.KeyEncrypted)
+	if err != nil {
+		return "", fmt.Errorf("failed to decrypt key: %w", err)
+	}
+	return plainKey, nil
 }
 
 // getFromCache 从 Redis 缓存获取值

@@ -2,441 +2,627 @@ package pricescraper
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
-	"math"
+	"net"
 	"net/http"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"go.uber.org/zap"
 
-	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/logger"
 )
 
 // =====================================================
 // 火山引擎价格爬虫
-// 从火山引擎文档页面 HTML 解析模型定价表格
-// 目标页面: https://www.volcengine.com/docs/82379/1544106
+// 策略: API 获取模型列表 + 浏览器爬取价格 → 关联匹配
+//
+// 1. GET https://ark.cn-beijing.volces.com/api/v3/models → 模型元数据
+// 2. 浏览器渲染定价页面 → 提取价格表格
+// 3. 按模型名称匹配，将价格关联到 API 模型
 // =====================================================
 
 const (
-	// volcengineURL 火山引擎定价页面地址
-	volcengineURL = "https://www.volcengine.com/docs/82379/1544106"
+	// volcengineAPIURL 火山方舟模型列表 API（OpenAI 兼容）
+	volcengineAPIURL = "https://ark.cn-beijing.volces.com/api/v3/models"
+	// volcenginePriceURL 火山引擎定价页面（需浏览器渲染）
+	volcenginePriceURL = "https://www.volcengine.com/docs/82379/1544106"
 	// volcengineSupplierName 供应商名称标识
 	volcengineSupplierName = "火山引擎"
 )
 
-// VolcengineScraper 火山引擎价格爬虫
+// VolcengineScraper 火山引擎价格爬虫（API + 浏览器混合）
 type VolcengineScraper struct {
-	client *http.Client
+	apiKey     string
+	browserMgr *BrowserManager
+	httpClient *http.Client
 }
 
 // NewVolcengineScraper 创建火山引擎爬虫实例
-func NewVolcengineScraper() *VolcengineScraper {
-	return &VolcengineScraper{
-		client: &http.Client{
-			Timeout: 30 * time.Second,
+func NewVolcengineScraper(apiKey string, browserMgr *BrowserManager) *VolcengineScraper {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
 		},
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		DialContext: (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:  15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ForceAttemptHTTP2:     false,
+	}
+	return &VolcengineScraper{
+		apiKey:     apiKey,
+		browserMgr: browserMgr,
+		httpClient: &http.Client{Timeout: 60 * time.Second, Transport: transport},
 	}
 }
 
-// ScrapePrices 执行火山引擎价格爬取
-// 流程: HTTP GET 页面 → goquery 解析 HTML → 提取定价表格 → 返回结构化数据
+// ---- API 响应结构 ----
+
+type volcAPIResponse struct {
+	Data []volcAPIModel `json:"data"`
+}
+
+type volcAPIModel struct {
+	ID         string           `json:"id"`         // "doubao-seed-2-0-pro-260215"
+	Name       string           `json:"name"`       // "doubao-seed-2.0-pro" (不含版本后缀)
+	Domain     string           `json:"domain"`     // "LLM", "VLM", "Embedding"
+	Status     string           `json:"status"`     // "Shutdown", "Retiring" 或空（活跃）
+	Version    string           `json:"version"`    // "260215"
+	TaskType   []string         `json:"task_type"`  // ["TextGeneration"]
+	Modalities *volcModalities  `json:"modalities"`
+	TokenLimits *volcTokenLimits `json:"token_limits"`
+}
+
+type volcModalities struct {
+	InputModalities  []string `json:"input_modalities"`
+	OutputModalities []string `json:"output_modalities"`
+}
+
+type volcTokenLimits struct {
+	ContextWindow  int `json:"context_window"`
+	MaxInputToken  int `json:"max_input_token_length"`
+	MaxOutputToken int `json:"max_output_token_length"`
+}
+
+// ScrapePrices 执行火山引擎价格获取
+// 1. API 获取模型列表（含元数据）
+// 2. 浏览器爬取定价页面
+// 3. 匹配关联
 func (s *VolcengineScraper) ScrapePrices(ctx context.Context) (*ScrapedPriceData, error) {
 	log := logger.L
 	if log == nil {
 		log = zap.NewNop()
 	}
 
-	// 带重试的 HTTP 请求
-	body, err := s.fetchWithRetry(ctx, volcengineURL, 3)
+	// Step 1: API 获取模型列表
+	apiModels, err := s.fetchModelList(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("获取火山引擎定价页面失败: %w", err)
+		log.Warn("API 获取火山引擎模型列表失败，仅使用浏览器爬取", zap.Error(err))
+		// 降级：仅使用浏览器爬取
+		return s.scrapeByBrowserOnly(ctx)
 	}
-	defer body.Close()
+	log.Info("API 获取火山引擎模型列表成功", zap.Int("models_count", len(apiModels)))
 
-	// 使用 goquery 解析 HTML
-	doc, err := goquery.NewDocumentFromReader(body)
+	// Step 2: 浏览器爬取价格（限时120秒，首次加载需要更多时间）
+	browserCtx, browserCancel := context.WithTimeout(ctx, 120*time.Second)
+	defer browserCancel()
+	priceMap, err := s.scrapePrices(browserCtx)
+	if err != nil {
+		log.Warn("浏览器爬取价格失败，仅返回 API 模型列表（无价格）", zap.Error(err))
+		// 降级：只返回 API 模型列表但无价格
+		return s.apiModelsToScrapedData(apiModels), nil
+	}
+	log.Info("浏览器爬取火山引擎价格成功", zap.Int("price_entries", len(priceMap)))
+
+	// Step 3: 关联匹配
+	scrapedModels := s.matchModelsWithPrices(apiModels, priceMap)
+
+	log.Info("火山引擎价格获取完成",
+		zap.Int("api_models", len(apiModels)),
+		zap.Int("price_entries", len(priceMap)),
+		zap.Int("matched", len(scrapedModels)))
+
+	return &ScrapedPriceData{
+		SupplierName: volcengineSupplierName,
+		FetchedAt:    time.Now(),
+		Models:       scrapedModels,
+		SourceURL:    volcenginePriceURL,
+	}, nil
+}
+
+// fetchModelList 通过 API 获取模型列表（含重试）
+func (s *VolcengineScraper) fetchModelList(ctx context.Context) ([]volcAPIModel, error) {
+	var lastErr error
+	maxRetries := 3
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		models, err := s.doFetchModelList(ctx)
+		if err == nil {
+			return models, nil
+		}
+		lastErr = err
+
+		log := logger.L
+		if log != nil {
+			log.Warn("火山引擎 API 请求失败，准备重试",
+				zap.Int("attempt", attempt),
+				zap.Int("max_retries", maxRetries),
+				zap.Error(err))
+		}
+
+		// 关闭空闲连接，强制建立新连接
+		if s.httpClient.Transport != nil {
+			if t, ok := s.httpClient.Transport.(*http.Transport); ok {
+				t.CloseIdleConnections()
+			}
+		}
+
+		if attempt < maxRetries {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(attempt) * 2 * time.Second):
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("重试 %d 次后仍失败: %w", maxRetries, lastErr)
+}
+
+// doFetchModelList 执行单次 API 请求获取模型列表
+func (s *VolcengineScraper) doFetchModelList(ctx context.Context) ([]volcAPIModel, error) {
+	if s.apiKey == "" {
+		return nil, fmt.Errorf("VOLCENGINE_API_KEY 未配置")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", volcengineAPIURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Connection", "close")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		// 检查是否返回了 HTML（常见于 403/WAF 拦截）
+		bodyStr := string(body[:min(len(body), 200)])
+		if strings.HasPrefix(strings.TrimSpace(bodyStr), "<") {
+			return nil, fmt.Errorf("API 返回 HTML（可能被 WAF 拦截），状态码 %d", resp.StatusCode)
+		}
+		return nil, fmt.Errorf("API 返回 %d: %s", resp.StatusCode, bodyStr)
+	}
+
+	// 验证响应是 JSON 而非 HTML
+	contentType := resp.Header.Get("Content-Type")
+	bodyStr := strings.TrimSpace(string(body))
+	if strings.HasPrefix(bodyStr, "<") {
+		return nil, fmt.Errorf("响应内容为 HTML 而非 JSON (Content-Type: %s)", contentType)
+	}
+
+	var apiResp volcAPIResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		// 提供更友好的错误信息
+		preview := bodyStr
+		if len(preview) > 100 {
+			preview = preview[:100]
+		}
+		return nil, fmt.Errorf("解析 JSON 失败: %w (响应前100字符: %s)", err, preview)
+	}
+
+	// 过滤：只保留活跃的模型（排除 Shutdown/Retiring）
+	var active []volcAPIModel
+	for _, m := range apiResp.Data {
+		if m.Status == "" || m.Status == "Active" {
+			active = append(active, m)
+		}
+	}
+
+	return active, nil
+}
+
+// scrapePrices 浏览器爬取定价页面，返回模型名 → ScrapedModel 的映射
+func (s *VolcengineScraper) scrapePrices(ctx context.Context) (map[string]ScrapedModel, error) {
+	html, err := s.browserMgr.FetchRenderedHTML(ctx, volcenginePriceURL)
+	if err != nil {
+		return nil, fmt.Errorf("获取定价页面失败: %w", err)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	if err != nil {
+		return nil, fmt.Errorf("解析 HTML 失败: %w", err)
+	}
+
+	models := extractPriceTables(doc)
+
+	// 构建名称映射（小写）
+	priceMap := make(map[string]ScrapedModel, len(models))
+	for _, m := range models {
+		key := strings.ToLower(m.ModelName)
+		priceMap[key] = m
+	}
+
+	return priceMap, nil
+}
+
+// normalizeModelName 标准化模型名称用于匹配
+// API 返回 "doubao-1-5-pro-32k" 或 "doubao-seed-2-0-pro"
+// 价格页面使用 "doubao-1.5-pro" 或 "doubao-seed-2.0-pro"
+// 核心差异：版本号中 "1-5" vs "1.5", "2-0" vs "2.0"
+func normalizeModelName(name string) string {
+	name = strings.ToLower(name)
+	// 将数字-数字模式替换为数字.数字（如 1-5 → 1.5, 2-0 → 2.0）
+	result := make([]byte, 0, len(name))
+	for i := 0; i < len(name); i++ {
+		if i > 0 && i < len(name)-1 && name[i] == '-' &&
+			name[i-1] >= '0' && name[i-1] <= '9' &&
+			name[i+1] >= '0' && name[i+1] <= '9' {
+			result = append(result, '.')
+		} else {
+			result = append(result, name[i])
+		}
+	}
+	return string(result)
+}
+
+// matchModelsWithPrices 将 API 模型列表与爬取的价格关联
+func (s *VolcengineScraper) matchModelsWithPrices(apiModels []volcAPIModel, priceMap map[string]ScrapedModel) []ScrapedModel {
+	log := logger.L
+	if log == nil {
+		log = zap.NewNop()
+	}
+
+	// 合并补充价格数据（视频/图片/Embedding/TTS/ASR）
+	supplementary := getVolcengineSupplementaryPrices()
+	for k, v := range supplementary {
+		if _, exists := priceMap[k]; !exists {
+			priceMap[k] = v
+		}
+	}
+
+	var result []ScrapedModel
+	matched := make(map[string]bool) // 记录已匹配的价格条目
+
+	for _, api := range apiModels {
+		sm := ScrapedModel{
+			ModelName:   api.ID,   // 使用完整 ID 作为模型名（含版本）
+			DisplayName: api.Name, // 友好展示名
+			Currency:    "CNY",
+		}
+
+		// 根据 API 模型元数据推断模型类型和计费单位
+		sm.ModelType, sm.PricingUnit = inferModelTypeAndUnit(api)
+
+		// 尝试多种名称匹配价格
+		price, found := s.findPrice(api, priceMap)
+		if found {
+			sm.InputPrice = price.InputPrice
+			sm.OutputPrice = price.OutputPrice
+			sm.PriceTiers = price.PriceTiers
+			sm.PricingUnit = price.PricingUnit
+			sm.ModelType = price.ModelType
+			matched[strings.ToLower(price.ModelName)] = true
+		}
+
+		// 注入缓存定价信息（LLM/VLM 支持 auto 模式缓存）
+		annotateVolcengineCacheSupport(&sm)
+
+		// 只添加有价格的模型
+		if sm.InputPrice > 0 || sm.OutputPrice > 0 {
+			result = append(result, sm)
+		}
+	}
+
+	// 添加价格表中有但 API 中没有的模型（可能是更高层的名称）
+	for key, price := range priceMap {
+		if matched[key] {
+			continue
+		}
+		if price.InputPrice > 0 || price.OutputPrice > 0 {
+			annotateVolcengineCacheSupport(&price)
+			result = append(result, price)
+		}
+	}
+
+	return result
+}
+
+// annotateVolcengineCacheSupport 为火山引擎 LLM/VLM 模型注入缓存定价信息
+// 缓存命中价格 = 基础输入价格 × 40%（节省 60%）
+// 计费单位：元/百万 Token（命中价）+ 元/百万 Token/小时（存储价，独立计费）
+func annotateVolcengineCacheSupport(sm *ScrapedModel) {
+	if sm.ModelType != "LLM" && sm.ModelType != "VLM" {
+		return // 仅 LLM/VLM 支持 Token 缓存
+	}
+	if sm.InputPrice <= 0 {
+		return // 无基础价格时不注入
+	}
+	sm.SupportsCache = true
+	sm.CacheMechanism = "auto"
+	sm.CacheInputPrice = sm.InputPrice * 0.4 // 缓存命中价 = 40% 基础输入价
+	// 注：缓存存储价（元/百万Token/小时）因模型不同而有差异，需在管理后台手动配置
+}
+
+// inferModelTypeAndUnit 根据 API 模型元数据推断模型类型和计费单位
+func inferModelTypeAndUnit(api volcAPIModel) (modelType, pricingUnit string) {
+	nameLower := strings.ToLower(api.Name)
+	idLower := strings.ToLower(api.ID)
+	domainLower := strings.ToLower(api.Domain)
+
+	// 视频生成
+	if strings.Contains(nameLower, "seedance") || strings.Contains(idLower, "seedance") {
+		return "VideoGeneration", PricingUnitPerMillionTokens
+	}
+	// 图片生成
+	if strings.Contains(nameLower, "seedream") || strings.Contains(idLower, "seedream") {
+		return "ImageGeneration", PricingUnitPerImage
+	}
+	// 语音合成
+	if strings.Contains(nameLower, "tts") || strings.Contains(idLower, "tts") ||
+		strings.Contains(nameLower, "语音合成") {
+		return "TTS", PricingUnitPerKChars
+	}
+	// 语音识别
+	if strings.Contains(nameLower, "asr") || strings.Contains(idLower, "asr") ||
+		strings.Contains(nameLower, "语音识别") {
+		return "ASR", PricingUnitPerHour
+	}
+	// Embedding
+	if domainLower == "embedding" || strings.Contains(nameLower, "embedding") || strings.Contains(idLower, "embedding") {
+		return "Embedding", PricingUnitPerMillionTokens
+	}
+	// VLM 视觉语言模型
+	if domainLower == "vlm" || strings.Contains(nameLower, "vision") {
+		return "VLM", PricingUnitPerMillionTokens
+	}
+	// 默认 LLM
+	return "LLM", PricingUnitPerMillionTokens
+}
+
+// getVolcengineSupplementaryPrices 返回火山引擎文档页面未覆盖的模型价格
+// 数据来源: 火山引擎官网定价页面（2026-04 更新）
+// 这些价格因计费单位或文档位置不同，无法被浏览器爬虫自动获取
+func getVolcengineSupplementaryPrices() map[string]ScrapedModel {
+	prices := map[string]ScrapedModel{
+		// ============ 视频生成模型 (Seedance) — 元/百万tokens ============
+		"doubao-seedance-2.0": {
+			ModelName: "doubao-seedance-2.0", DisplayName: "Seedance 2.0（不含视频输入）",
+			InputPrice: 46.0, OutputPrice: 0, Currency: "CNY",
+			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		"doubao-seedance-2.0-video-input": {
+			ModelName: "doubao-seedance-2.0-video-input", DisplayName: "Seedance 2.0（含视频输入）",
+			InputPrice: 28.0, OutputPrice: 0, Currency: "CNY",
+			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		"doubao-seedance-1.5-pro": {
+			ModelName: "doubao-seedance-1.5-pro", DisplayName: "Seedance 1.5 Pro",
+			InputPrice: 15.0, OutputPrice: 0, Currency: "CNY",
+			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		"doubao-seedance-1.0-pro": {
+			ModelName: "doubao-seedance-1.0-pro", DisplayName: "Seedance 1.0 Pro",
+			InputPrice: 10.0, OutputPrice: 0, Currency: "CNY",
+			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
+		},
+
+		// ============ 图片生成模型 (Seedream) — 元/张 ============
+		"doubao-seedream-5.0-lite": {
+			ModelName: "doubao-seedream-5.0-lite", DisplayName: "Seedream 5.0 Lite",
+			InputPrice: 0.22, OutputPrice: 0, Currency: "CNY",
+			ModelType: "ImageGeneration", PricingUnit: PricingUnitPerImage,
+		},
+		"doubao-seedream-4.5": {
+			ModelName: "doubao-seedream-4.5", DisplayName: "Seedream 4.5",
+			InputPrice: 0.25, OutputPrice: 0, Currency: "CNY",
+			ModelType: "ImageGeneration", PricingUnit: PricingUnitPerImage,
+		},
+		"doubao-seedream-4.0": {
+			ModelName: "doubao-seedream-4.0", DisplayName: "Seedream 4.0",
+			InputPrice: 0.20, OutputPrice: 0, Currency: "CNY",
+			ModelType: "ImageGeneration", PricingUnit: PricingUnitPerImage,
+		},
+
+		// ============ Embedding 模型 — 元/百万tokens ============
+		"doubao-embedding-large": {
+			ModelName: "doubao-embedding-large", DisplayName: "Doubao Embedding Large",
+			InputPrice: 0.7, OutputPrice: 0, Currency: "CNY",
+			ModelType: "Embedding", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		"doubao-embedding-large-text": {
+			ModelName: "doubao-embedding-large-text", DisplayName: "Doubao Embedding Large Text",
+			InputPrice: 0.7, OutputPrice: 0, Currency: "CNY",
+			ModelType: "Embedding", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		"doubao-embedding": {
+			ModelName: "doubao-embedding", DisplayName: "Doubao Embedding",
+			InputPrice: 0.5, OutputPrice: 0, Currency: "CNY",
+			ModelType: "Embedding", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		"doubao-embedding-text": {
+			ModelName: "doubao-embedding-text", DisplayName: "Doubao Embedding Text",
+			InputPrice: 0.5, OutputPrice: 0, Currency: "CNY",
+			ModelType: "Embedding", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		"doubao-embedding-vision-text": {
+			ModelName: "doubao-embedding-vision-text", DisplayName: "Doubao Embedding Vision-Text",
+			InputPrice: 0.7, OutputPrice: 0, Currency: "CNY",
+			ModelType: "Embedding", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		"doubao-embedding-vision": {
+			ModelName: "doubao-embedding-vision", DisplayName: "Doubao Embedding Vision",
+			InputPrice: 0.7, OutputPrice: 0, Currency: "CNY",
+			ModelType: "Embedding", PricingUnit: PricingUnitPerMillionTokens,
+		},
+
+		// ============ 语音合成 (TTS) — 元/万字符 ============
+		"doubao-tts-2.0": {
+			ModelName: "doubao-tts-2.0", DisplayName: "豆包语音合成 2.0",
+			InputPrice: 2.8, OutputPrice: 0, Currency: "CNY",
+			ModelType: "TTS", PricingUnit: PricingUnitPerKChars,
+		},
+		"doubao-tts-hd": {
+			ModelName: "doubao-tts-hd", DisplayName: "大模型语音合成",
+			InputPrice: 4.5, OutputPrice: 0, Currency: "CNY",
+			ModelType: "TTS", PricingUnit: PricingUnitPerKChars,
+		},
+
+		// ============ 语音识别 (ASR) — 元/小时 ============
+		"doubao-asr-streaming-2.0": {
+			ModelName: "doubao-asr-streaming-2.0", DisplayName: "豆包流式语音识别 2.0",
+			InputPrice: 0.9, OutputPrice: 0, Currency: "CNY",
+			ModelType: "ASR", PricingUnit: PricingUnitPerHour,
+		},
+		"doubao-asr-hd": {
+			ModelName: "doubao-asr-hd", DisplayName: "大模型流式语音识别",
+			InputPrice: 4.0, OutputPrice: 0, Currency: "CNY",
+			ModelType: "ASR", PricingUnit: PricingUnitPerHour,
+		},
+		"doubao-asr-file": {
+			ModelName: "doubao-asr-file", DisplayName: "录音文件识别（标准版）",
+			InputPrice: 2.0, OutputPrice: 0, Currency: "CNY",
+			ModelType: "ASR", PricingUnit: PricingUnitPerHour,
+		},
+	}
+	return prices
+}
+
+// findPrice 为 API 模型查找匹配的价格
+func (s *VolcengineScraper) findPrice(api volcAPIModel, priceMap map[string]ScrapedModel) (ScrapedModel, bool) {
+	// 尝试匹配策略（按优先级）：
+	candidates := []string{
+		strings.ToLower(api.Name),                    // 原始 name
+		normalizeModelName(api.Name),                 // 标准化 name（1-5 → 1.5）
+		strings.ToLower(api.ID),                      // 完整 ID
+		normalizeModelName(api.ID),                   // 标准化 ID
+	}
+
+	// 去除版本号后缀的 ID（如 doubao-seed-2-0-pro-260215 → doubao-seed-2-0-pro）
+	if api.Version != "" && strings.HasSuffix(api.ID, "-"+api.Version) {
+		baseID := strings.TrimSuffix(api.ID, "-"+api.Version)
+		candidates = append(candidates, strings.ToLower(baseID), normalizeModelName(baseID))
+	}
+
+	// 对 Seedance/Seedream 类模型尝试额外的前缀匹配
+	// API 可能返回 "seedance-2.0" 但补充数据用 "doubao-seedance-2.0"
+	nameLower := strings.ToLower(api.Name)
+	if strings.Contains(nameLower, "seedance") || strings.Contains(nameLower, "seedream") {
+		candidates = append(candidates, "doubao-"+nameLower, "doubao-"+normalizeModelName(api.Name))
+	}
+
+	// Embedding 模型：API 返回名称如 "doubao-embedding-large-text" 但补充数据用 "doubao-embedding-large"
+	// 尝试去除 "-text" 后缀匹配
+	if strings.Contains(nameLower, "embedding") {
+		trimmed := strings.TrimSuffix(nameLower, "-text")
+		candidates = append(candidates, trimmed)
+		// "doubao-embedding-vision" → "doubao-embedding-vision-text"
+		if strings.Contains(nameLower, "vision") && !strings.Contains(nameLower, "vision-text") {
+			candidates = append(candidates, nameLower+"-text")
+		}
+	}
+
+	// 精确匹配
+	for _, candidate := range candidates {
+		if price, ok := priceMap[candidate]; ok {
+			return price, true
+		}
+	}
+
+	// 前缀模糊匹配（用于带版本日期后缀的模型名）
+	// 例如 DB 中 "doubao-seedream-4-0-250828" → 标准化为 "doubao-seedream-4.0-250828"
+	// 补充数据中 "doubao-seedream-4.0" → 前缀匹配成功
+	for _, candidate := range candidates {
+		for key, price := range priceMap {
+			if strings.HasPrefix(candidate, key) && len(candidate) > len(key) {
+				// 确保前缀后面跟的是分隔符（-）或版本日期
+				rest := candidate[len(key):]
+				if rest[0] == '-' {
+					return price, true
+				}
+			}
+		}
+	}
+
+	return ScrapedModel{}, false
+}
+
+// scrapeByBrowserOnly 降级方案：仅使用浏览器爬取（API 不可用时）
+func (s *VolcengineScraper) scrapeByBrowserOnly(ctx context.Context) (*ScrapedPriceData, error) {
+	log := logger.L
+	if log == nil {
+		log = zap.NewNop()
+	}
+
+	log.Info("使用降级方案：仅浏览器爬取火山引擎价格", zap.String("url", volcenginePriceURL))
+
+	html, err := s.browserMgr.FetchRenderedHTML(ctx, volcenginePriceURL)
+	if err != nil {
+		return nil, fmt.Errorf("获取火山引擎渲染页面失败: %w", err)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
 	if err != nil {
 		return nil, fmt.Errorf("解析火山引擎 HTML 失败: %w", err)
 	}
 
-	// 提取所有定价表格
-	models, err := s.extractPriceTables(doc)
-	if err != nil {
-		return nil, fmt.Errorf("提取火山引擎定价表格失败: %w", err)
+	models := extractPriceTables(doc)
+
+	// 合并补充价格数据（视频/图片/Embedding/TTS/ASR）
+	existingNames := make(map[string]bool, len(models))
+	for _, m := range models {
+		existingNames[strings.ToLower(m.ModelName)] = true
+	}
+	for _, sp := range getVolcengineSupplementaryPrices() {
+		if !existingNames[strings.ToLower(sp.ModelName)] {
+			models = append(models, sp)
+		}
 	}
 
-	if len(models) == 0 {
-		log.Warn("火山引擎定价页面未提取到任何模型数据", zap.String("url", volcengineURL))
-	} else {
-		log.Info("火山引擎价格爬取完成",
-			zap.Int("models_count", len(models)),
-			zap.String("url", volcengineURL))
-	}
+	log.Info("火山引擎浏览器爬取完成（含补充数据）", zap.Int("models_count", len(models)))
 
 	return &ScrapedPriceData{
 		SupplierName: volcengineSupplierName,
 		FetchedAt:    time.Now(),
 		Models:       models,
-		SourceURL:    volcengineURL,
+		SourceURL:    volcenginePriceURL,
 	}, nil
 }
 
-// fetchWithRetry 带指数退避重试的 HTTP GET 请求
-// maxRetries: 最大重试次数
-func (s *VolcengineScraper) fetchWithRetry(ctx context.Context, url string, maxRetries int) (io.ReadCloser, error) {
-	log := logger.L
-	if log == nil {
-		log = zap.NewNop()
-	}
-	var lastErr error
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if attempt > 0 {
-			// 指数退避: 1s, 2s, 4s...
-			backoff := time.Duration(math.Pow(2, float64(attempt-1))) * time.Second
-			log.Info("重试获取页面",
-				zap.Int("attempt", attempt+1),
-				zap.Duration("backoff", backoff),
-				zap.String("url", url))
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoff):
-			}
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		// 设置浏览器 UA，避免被反爬拦截
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-
-		resp, err := s.client.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
-			continue
-		}
-
-		return resp.Body, nil
-	}
-
-	return nil, fmt.Errorf("重试 %d 次后仍然失败: %w", maxRetries, lastErr)
-}
-
-// extractPriceTables 从 HTML 文档中提取所有定价表格
-// 火山引擎文档页面通常包含多个表格，每个表格对应一类模型
-func (s *VolcengineScraper) extractPriceTables(doc *goquery.Document) ([]ScrapedModel, error) {
-	var allModels []ScrapedModel
-	log := logger.L
-	if log == nil {
-		log = zap.NewNop()
-	}
-
-	// 遍历页面中所有 <table> 元素
-	doc.Find("table").Each(func(tableIdx int, table *goquery.Selection) {
-		// 解析表头，判断是否为定价表格
-		headers := s.extractTableHeaders(table)
-		if !s.isPriceTable(headers) {
-			return // 非定价表格，跳过
-		}
-
-		log.Debug("发现定价表格",
-			zap.Int("table_index", tableIdx),
-			zap.Strings("headers", headers))
-
-		// 解析表格数据行
-		models := s.parseTableRows(table, headers)
-		allModels = append(allModels, models...)
-	})
-
-	return allModels, nil
-}
-
-// extractTableHeaders 提取表格的表头列名
-func (s *VolcengineScraper) extractTableHeaders(table *goquery.Selection) []string {
-	var headers []string
-	table.Find("thead tr th, thead tr td").Each(func(_ int, th *goquery.Selection) {
-		text := strings.TrimSpace(th.Text())
-		headers = append(headers, text)
-	})
-	// 如果 thead 为空，尝试取第一行 tr
-	if len(headers) == 0 {
-		table.Find("tr").First().Find("th, td").Each(func(_ int, cell *goquery.Selection) {
-			text := strings.TrimSpace(cell.Text())
-			headers = append(headers, text)
+// apiModelsToScrapedData 将 API 模型列表转换为 ScrapedPriceData（无价格）
+func (s *VolcengineScraper) apiModelsToScrapedData(apiModels []volcAPIModel) *ScrapedPriceData {
+	var models []ScrapedModel
+	for _, api := range apiModels {
+		models = append(models, ScrapedModel{
+			ModelName:   api.ID,
+			DisplayName: api.Name,
+			Currency:    "CNY",
+			Warnings:    []string{"API 无价格数据，请检查定价页面"},
 		})
 	}
-	return headers
-}
-
-// isPriceTable 判断表头是否包含价格相关关键字
-// 火山引擎定价表格通常包含"模型"、"价格"或"token"等关键词
-func (s *VolcengineScraper) isPriceTable(headers []string) bool {
-	hasModel := false
-	hasPrice := false
-
-	for _, h := range headers {
-		h = strings.ToLower(h)
-		if strings.Contains(h, "模型") || strings.Contains(h, "model") {
-			hasModel = true
-		}
-		if strings.Contains(h, "价格") || strings.Contains(h, "price") ||
-			strings.Contains(h, "token") || strings.Contains(h, "计费") ||
-			strings.Contains(h, "输入") || strings.Contains(h, "输出") {
-			hasPrice = true
-		}
-	}
-
-	return hasModel && hasPrice
-}
-
-// parseTableRows 解析表格数据行，提取模型名称和价格
-func (s *VolcengineScraper) parseTableRows(table *goquery.Selection, headers []string) []ScrapedModel {
-	var models []ScrapedModel
-	log := logger.L
-	if log == nil {
-		log = zap.NewNop()
-	}
-
-	// 识别各列的语义索引
-	colMap := s.identifyColumns(headers)
-
-	// 遍历数据行（跳过表头行）
-	rows := table.Find("tbody tr")
-	if rows.Length() == 0 {
-		// 没有 tbody，跳过第一行（表头）
-		rows = table.Find("tr").Slice(1, goquery.ToEnd)
-	}
-
-	rows.Each(func(rowIdx int, row *goquery.Selection) {
-		cells := row.Find("td")
-		if cells.Length() == 0 {
-			return
-		}
-
-		// 提取模型名称
-		modelName := ""
-		if colMap.modelCol >= 0 && colMap.modelCol < cells.Length() {
-			modelName = cleanText(cells.Eq(colMap.modelCol).Text())
-		}
-		if modelName == "" {
-			return // 无模型名称，跳过
-		}
-
-		model := ScrapedModel{
-			ModelName:   modelName,
-			DisplayName: modelName,
-			Currency:    "CNY",
-		}
-
-		// 提取输入价格
-		if colMap.inputCol >= 0 && colMap.inputCol < cells.Length() {
-			priceText := cleanText(cells.Eq(colMap.inputCol).Text())
-			price, unit := parsePrice(priceText)
-			model.InputPrice = convertToPerMillion(price, unit)
-		}
-
-		// 提取输出价格
-		if colMap.outputCol >= 0 && colMap.outputCol < cells.Length() {
-			priceText := cleanText(cells.Eq(colMap.outputCol).Text())
-			price, unit := parsePrice(priceText)
-			model.OutputPrice = convertToPerMillion(price, unit)
-		}
-
-		// 尝试提取阶梯价格（如果表格有多个价格列）
-		if len(colMap.tierCols) > 0 {
-			tiers := s.extractTierPrices(cells, colMap)
-			if len(tiers) > 0 {
-				model.PriceTiers = tiers
-			}
-		}
-
-		// 价格兜底：如果基础价格为 0 但有阶梯价格，取第一个阶梯的价格
-		if model.InputPrice == 0 && len(model.PriceTiers) > 0 {
-			model.InputPrice = model.PriceTiers[0].InputPrice
-		}
-		if model.OutputPrice == 0 && len(model.PriceTiers) > 0 {
-			model.OutputPrice = model.PriceTiers[0].OutputPrice
-		}
-
-		if model.InputPrice > 0 || model.OutputPrice > 0 || len(model.PriceTiers) > 0 {
-			models = append(models, model)
-		} else {
-			log.Debug("跳过无价格数据的行",
-				zap.String("model", modelName),
-				zap.Int("row", rowIdx))
-		}
-	})
-
-	return models
-}
-
-// columnMap 表格列的语义映射
-type columnMap struct {
-	modelCol  int   // 模型名称列
-	inputCol  int   // 输入价格列
-	outputCol int   // 输出价格列
-	tierCols  []int // 阶梯价格列（可能有多个）
-}
-
-// identifyColumns 根据表头识别各列的语义
-func (s *VolcengineScraper) identifyColumns(headers []string) columnMap {
-	cm := columnMap{modelCol: -1, inputCol: -1, outputCol: -1}
-
-	for i, h := range headers {
-		h = strings.ToLower(h)
-		switch {
-		case strings.Contains(h, "模型") || strings.Contains(h, "model"):
-			if cm.modelCol < 0 {
-				cm.modelCol = i
-			}
-		case strings.Contains(h, "输入") || strings.Contains(h, "input"):
-			if cm.inputCol < 0 {
-				cm.inputCol = i
-			}
-		case strings.Contains(h, "输出") || strings.Contains(h, "output"):
-			if cm.outputCol < 0 {
-				cm.outputCol = i
-			}
-		case strings.Contains(h, "价格") || strings.Contains(h, "price") || strings.Contains(h, "token"):
-			// 通用价格列，可能是阶梯
-			cm.tierCols = append(cm.tierCols, i)
-		}
-	}
-
-	// 默认取第一列为模型列
-	if cm.modelCol < 0 && len(headers) > 0 {
-		cm.modelCol = 0
-	}
-
-	return cm
-}
-
-// extractTierPrices 从表格行中提取阶梯价格
-func (s *VolcengineScraper) extractTierPrices(cells *goquery.Selection, colMap columnMap) []model.PriceTier {
-	var tiers []model.PriceTier
-
-	for idx, col := range colMap.tierCols {
-		if col >= cells.Length() {
-			continue
-		}
-
-		priceText := cleanText(cells.Eq(col).Text())
-		price, unit := parsePrice(priceText)
-		if price <= 0 {
-			continue
-		}
-
-		pricePerM := convertToPerMillion(price, unit)
-
-		// 构建阶梯名称（根据列索引）
-		tierName := fmt.Sprintf("tier_%d", idx+1)
-		tier := model.PriceTier{
-			Name:       tierName,
-			MinTokens:  int64(idx) * 1000000, // 假设每阶梯 100 万 token
-			InputPrice: pricePerM,
-		}
-		if idx < len(colMap.tierCols)-1 {
-			maxT := int64(idx+1) * 1000000
-			tier.MaxTokens = &maxT
-		}
-
-		tiers = append(tiers, tier)
-	}
-
-	return tiers
-}
-
-// =====================================================
-// 辅助函数：文本清洗和价格解析
-// =====================================================
-
-// priceRegex 匹配数字（含小数点）
-var priceRegex = regexp.MustCompile(`[\d]+\.?[\d]*`)
-
-// cleanText 清洗文本：去除空白字符和特殊字符
-func cleanText(s string) string {
-	s = strings.TrimSpace(s)
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.ReplaceAll(s, "\t", " ")
-	s = strings.ReplaceAll(s, "\u00a0", " ") // non-breaking space
-	// 压缩连续空格
-	for strings.Contains(s, "  ") {
-		s = strings.ReplaceAll(s, "  ", " ")
-	}
-	return s
-}
-
-// parsePrice 从文本中提取价格数值和单位
-// 返回：价格数值，单位标识（"per_k"=每千token, "per_m"=每百万token, "unknown"）
-func parsePrice(text string) (float64, string) {
-	if text == "" {
-		return 0, "unknown"
-	}
-
-	// 提取数字部分
-	matches := priceRegex.FindString(text)
-	if matches == "" {
-		return 0, "unknown"
-	}
-
-	price, err := strconv.ParseFloat(matches, 64)
-	if err != nil {
-		return 0, "unknown"
-	}
-
-	// 判断单位
-	textLower := strings.ToLower(text)
-	unit := "unknown"
-	switch {
-	case strings.Contains(textLower, "百万") || strings.Contains(textLower, "million") || strings.Contains(textLower, "/m "):
-		unit = "per_m" // 每百万 token
-	case strings.Contains(textLower, "千") || strings.Contains(textLower, "1k") || strings.Contains(textLower, "/k"):
-		unit = "per_k" // 每千 token
-	default:
-		// 火山引擎常用"元/千tokens"格式
-		if strings.Contains(textLower, "tokens") || strings.Contains(textLower, "token") {
-			if price < 1 {
-				// 价格较小，可能是每千 token
-				unit = "per_k"
-			} else {
-				unit = "per_m"
-			}
-		} else {
-			// 无法判断单位，默认按每百万 token 处理
-			unit = "per_m"
-		}
-	}
-
-	return price, unit
-}
-
-// convertToPerMillion 将价格统一转换为 RMB/百万token
-func convertToPerMillion(price float64, unit string) float64 {
-	switch unit {
-	case "per_k":
-		// 每千 token → 每百万 token: ×1000
-		return price * 1000
-	case "per_m":
-		return price
-	default:
-		return price // 默认当作每百万 token
+	return &ScrapedPriceData{
+		SupplierName: volcengineSupplierName,
+		FetchedAt:    time.Now(),
+		Models:       models,
+		SourceURL:    volcengineAPIURL,
 	}
 }

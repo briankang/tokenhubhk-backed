@@ -16,8 +16,8 @@ import (
 
 const (
 	defaultBaseURL    = "http://localhost:8090"
-	defaultAdminEmail = "admin@tokenhub.ai"
-	defaultAdminPass  = "Admin@123456"
+	defaultAdminEmail = "admin@tokenhubhk.com"
+	defaultAdminPass  = "admin123456"
 )
 
 var (

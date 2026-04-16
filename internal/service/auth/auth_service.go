@@ -152,28 +152,22 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest) (*mode
 		}
 	}
 
-	// 处理推荐码 — 绑定推荐关系
+	// 处理推荐码 — v3.1: 调用 ProcessReferralOnRegister 统一建立 ReferralAttribution + User.ReferredBy
 	refCode := req.ReferralCode
 	if refCode == "" {
 		refCode = req.InviteCode // fallback: also check invite_code field
 	}
 	if refCode != "" {
-		// 通过推荐码查找推荐链接
-		var link model.ReferralLink
-		if err := s.db.WithContext(ctx).Where("code = ?", refCode).First(&link).Error; err == nil {
-			if link.UserID != user.ID { // prevent self-referral
-				s.db.WithContext(ctx).Model(user).Update("referred_by", link.UserID)
-				s.db.WithContext(ctx).Model(&model.ReferralLink{}).Where("id = ?", link.ID).
-					UpdateColumn("register_count", gorm.Expr("register_count + 1"))
-			}
-		}
-		// 也尝试直接匹配用户的推荐码字段
-		if refCode != "" {
+		// 优先走 v3.1 归因流程(ReferralLink 路径)
+		if err := referral.ProcessReferralOnRegister(s.db, ctx, user, refCode); err != nil {
+			// ReferralLink 查找失败时,尝试通过 User.ReferralCode 字段匹配(兼容旧数据)
 			var referrer model.User
-			if err := s.db.WithContext(ctx).Where("referral_code = ? AND id != ?", refCode, user.ID).First(&referrer).Error; err == nil {
+			if err2 := s.db.WithContext(ctx).Where("referral_code = ? AND id != ?", refCode, user.ID).First(&referrer).Error; err2 == nil {
 				if user.ReferredBy == nil {
-					s.db.WithContext(ctx).Model(user).Update("referred_by", referrer.ID)
+					s.db.WithContext(ctx).Model(&model.User{}).Where("id = ?", user.ID).Update("referred_by", referrer.ID)
 				}
+				// 为兼容路径也建立归因快照
+				_ = s.createAttributionFallback(ctx, user.ID, referrer.ID, refCode)
 			}
 		}
 	}
@@ -187,6 +181,38 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest) (*mode
 	}
 
 	return user, nil
+}
+
+// createAttributionFallback 兼容路径:用户通过 User.ReferralCode 字段(非 ReferralLink)匹配到推荐人时
+// 手动建立 ReferralAttribution 快照,保证 v3.1 归因数据完整性
+func (s *AuthService) createAttributionFallback(ctx context.Context, userID, inviterID uint, refCode string) error {
+	if userID == 0 || inviterID == 0 || userID == inviterID {
+		return nil
+	}
+	// 已存在则跳过
+	var existing model.ReferralAttribution
+	if err := s.db.WithContext(ctx).Where("user_id = ?", userID).First(&existing).Error; err == nil {
+		return nil
+	}
+	// 读取 AttributionDays 配置(兜底 90 天)
+	attributionDays := 90
+	var cfg model.ReferralConfig
+	if err := s.db.WithContext(ctx).Where("is_active = ?", true).First(&cfg).Error; err == nil {
+		if cfg.AttributionDays > 0 {
+			attributionDays = cfg.AttributionDays
+		}
+	}
+	now := time.Now()
+	attr := model.ReferralAttribution{
+		UserID:       userID,
+		InviterID:    inviterID,
+		ReferralCode: refCode,
+		AttributedAt: now,
+		ExpiresAt:    now.AddDate(0, 0, attributionDays),
+		UnlockedAt:   nil,
+		IsValid:      true,
+	}
+	return s.db.WithContext(ctx).Create(&attr).Error
 }
 
 // Login 用户登录认证，成功返回令牌对
@@ -224,7 +250,7 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest) (*TokenPair,
 
 	// 更新最后登录时间
 	now := time.Now()
-	s.db.WithContext(ctx).Model(&user).Update("last_login_at", now)
+	s.db.WithContext(ctx).Model(&model.User{}).Where("id = ?", user.ID).Update("last_login_at", now)
 
 	// 将令牌存入 Redis
 	if s.redis != nil {

@@ -85,7 +85,7 @@ func (s *SupplierService) List(ctx context.Context, page, pageSize int, accessTy
 	}
 	var suppliers []model.Supplier
 	offset := (page - 1) * pageSize
-	if err := query.Offset(offset).Limit(pageSize).Order("sort_order ASC, id DESC").Find(&suppliers).Error; err != nil {
+	if err := query.Offset(offset).Limit(pageSize).Order("CASE WHEN status = 'active' THEN 0 ELSE 1 END ASC, sort_order ASC, id DESC").Find(&suppliers).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to list suppliers: %w", err)
 	}
 	return suppliers, total, nil

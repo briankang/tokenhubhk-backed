@@ -118,6 +118,8 @@ var supplierDefs = []supplierDef{
 	{"Moonshot", "moonshot", "https://api.moonshot.cn/v1", "bearer_token", true, "api", 1, 1, 1.0},
 	{"智谱GLM", "zhipu", "https://open.bigmodel.cn/api/paas/v4", "jwt_sign", true, "api", 5, 5, 1.0},
 	{"百度文心", "baidu_wenxin", "https://aip.baidubce.com", "oauth2_token", true, "api", 0.8, 2, 1.0},
+	// 百度千帆 V2（OpenAI 兼容，直接 Bearer bce-v3 密钥，独立于旧文心一言 OAuth2 接口）
+	{"百度千帆", "baidu_qianfan", "https://qianfan.baidubce.com/v2", "bearer_token", true, "api", 4, 16, 1.0},
 	// Coding Plan 类型供应商（代码补全接入点）
 	{"阿里云百炼 (Coding Plan)", "aliyun_dashscope", "https://dashscope.aliyuncs.com/compatible-mode/v1", "bearer_token", true, "coding_plan", 0.3, 0.6, 1.0},
 	{"火山引擎 (Coding Plan)", "volcengine", "https://ark.cn-beijing.volces.com/api/v3", "bearer_token", true, "coding_plan", 0.8, 2, 1.0},
@@ -188,8 +190,11 @@ var categoryDefs = []categoryDef{
 	{"moonshot", "通用对话", "moonshot_chat"},
 	// 智谱
 	{"zhipu", "通用对话", "zhipu_chat"},
-	// 百度
+	// 百度文心（旧接口）
 	{"baidu_wenxin", "通用对话", "ernie_chat"},
+	// 百度千帆 V2（新 OpenAI 兼容接口）
+	{"baidu_qianfan", "通用对话", "qianfan_chat"},
+	{"baidu_qianfan", "推理模型", "qianfan_reasoning"},
 }
 
 func seedCategories(tx *gorm.DB) error {
@@ -255,9 +260,34 @@ var aiModelDefs = []aiModelDef{
 	// 智谱
 	{"zhipu_chat", "zhipu", "glm-4-plus", "GLM-4 Plus", 5, 5, 4096, 128000},
 	{"zhipu_chat", "zhipu", "glm-4-flash", "GLM-4 Flash", 0, 0, 4096, 128000},
-	// 百度
+	// 百度文心（旧接口）
 	{"ernie_chat", "baidu_wenxin", "ernie-4.0-8k", "ERNIE 4.0 8K", 30, 90, 4096, 8192},
 	{"ernie_chat", "baidu_wenxin", "ernie-3.5-8k", "ERNIE 3.5 8K", 0.8, 2, 4096, 8192},
+	// 百度千帆 V2（新接口，OpenAI 兼容）
+	// ERNIE 4.5 系列（旗舰）
+	{"qianfan_chat", "baidu_qianfan", "ernie-4.5-8k", "ERNIE 4.5 8K", 4, 16, 4096, 8192},
+	{"qianfan_chat", "baidu_qianfan", "ernie-4.5-8k-preview", "ERNIE 4.5 8K Preview", 4, 16, 4096, 8192},
+	{"qianfan_chat", "baidu_qianfan", "ernie-4.5-turbo-8k", "ERNIE 4.5 Turbo 8K", 2, 8, 4096, 8192},
+	{"qianfan_chat", "baidu_qianfan", "ernie-4.5-turbo-128k", "ERNIE 4.5 Turbo 128K", 2, 8, 4096, 131072},
+	// ERNIE X1 系列（推理模型）
+	{"qianfan_reasoning", "baidu_qianfan", "ernie-x1", "ERNIE X1", 4, 16, 8192, 128000},
+	{"qianfan_reasoning", "baidu_qianfan", "ernie-x1-turbo", "ERNIE X1 Turbo", 2, 8, 8192, 128000},
+	// ERNIE 4.0 系列
+	{"qianfan_chat", "baidu_qianfan", "ernie-4.0-8k-latest", "ERNIE 4.0 8K Latest", 30, 60, 4096, 8192},
+	{"qianfan_chat", "baidu_qianfan", "ernie-4.0-8k", "ERNIE 4.0 8K", 30, 60, 4096, 8192},
+	{"qianfan_chat", "baidu_qianfan", "ernie-4.0-turbo-8k", "ERNIE 4.0 Turbo 8K", 20, 60, 4096, 8192},
+	// ERNIE 3.5 系列
+	{"qianfan_chat", "baidu_qianfan", "ernie-3.5-8k", "ERNIE 3.5 8K", 0.8, 2, 4096, 8192},
+	{"qianfan_chat", "baidu_qianfan", "ernie-3.5-128k", "ERNIE 3.5 128K", 0.8, 2, 4096, 131072},
+	// ERNIE Speed Pro（付费）
+	{"qianfan_chat", "baidu_qianfan", "ernie-speed-pro-8k", "ERNIE Speed Pro 8K", 3, 9, 4096, 8192},
+	{"qianfan_chat", "baidu_qianfan", "ernie-speed-pro-128k", "ERNIE Speed Pro 128K", 3, 9, 4096, 131072},
+	// ERNIE Speed（免费）
+	{"qianfan_chat", "baidu_qianfan", "ernie-speed-8k", "ERNIE Speed 8K", 0, 0, 4096, 8192},
+	{"qianfan_chat", "baidu_qianfan", "ernie-speed-128k", "ERNIE Speed 128K", 0, 0, 4096, 131072},
+	// ERNIE Lite / Tiny（免费）
+	{"qianfan_chat", "baidu_qianfan", "ernie-lite-8k", "ERNIE Lite 8K", 0, 0, 4096, 8192},
+	{"qianfan_chat", "baidu_qianfan", "ernie-tiny-8k", "ERNIE Tiny 8K", 0, 0, 4096, 8192},
 }
 
 func seedModels(tx *gorm.DB) error {
@@ -308,7 +338,8 @@ func seedChannels(tx *gorm.DB) error {
 		}
 
 		channelType := sd.Code
-		if sd.Code == "aliyun_dashscope" || sd.Code == "volcengine" || sd.Code == "moonshot" || sd.Code == "zhipu" || sd.Code == "baidu_wenxin" {
+		if sd.Code == "aliyun_dashscope" || sd.Code == "volcengine" || sd.Code == "moonshot" ||
+			sd.Code == "zhipu" || sd.Code == "baidu_wenxin" || sd.Code == "baidu_qianfan" {
 			channelType = "openai" // OpenAI-compatible
 		}
 		if sd.Code == "azure_openai" {
@@ -379,6 +410,28 @@ func seedChannels(tx *gorm.DB) error {
 		return fmt.Errorf("create volcengine real channel: %w", err)
 	}
 
+	// 真实渠道：百度千帆 V2
+	var qianfanSup model.Supplier
+	if err := tx.Where("code = ? AND access_type = ?", "baidu_qianfan", "api").First(&qianfanSup).Error; err != nil {
+		return fmt.Errorf("find qianfan supplier: %w", err)
+	}
+	qianfanCh := model.Channel{
+		Name:           "百度千帆-真实渠道",
+		SupplierID:     qianfanSup.ID,
+		Type:           "openai",
+		Endpoint:       "https://qianfan.baidubce.com/v2",
+		APIKey:         "bce-v3/ALTAK-sLTAcXvm2vjPcjqJmjBRK/bff65bf034b359f46cfdff7bd3b45dbf3548f7a8",
+		Models:         mustJSON([]string{"ernie-4.5-8k", "ernie-x1", "ernie-4.0-8k", "ernie-3.5-8k", "ernie-speed-8k", "ernie-lite-8k"}),
+		Weight:         10,
+		Priority:       10,
+		Status:         "active",
+		MaxConcurrency: 100,
+		QPM:            60,
+	}
+	if err := tx.Create(&qianfanCh).Error; err != nil {
+		return fmt.Errorf("create qianfan real channel: %w", err)
+	}
+
 	return nil
 }
 
@@ -386,15 +439,18 @@ func seedChannels(tx *gorm.DB) error {
 
 func seedChannelGroups(tx *gorm.DB) error {
 	// Find the real channel IDs
-	var aliyunCh, volcCh model.Channel
+	var aliyunCh, volcCh, qianfanCh model.Channel
 	if err := tx.Where("name = ?", "阿里云百炼-真实渠道").First(&aliyunCh).Error; err != nil {
 		return fmt.Errorf("find aliyun channel: %w", err)
 	}
 	if err := tx.Where("name = ?", "火山引擎-真实渠道").First(&volcCh).Error; err != nil {
 		return fmt.Errorf("find volcengine channel: %w", err)
 	}
+	if err := tx.Where("name = ?", "百度千帆-真实渠道").First(&qianfanCh).Error; err != nil {
+		return fmt.Errorf("find qianfan channel: %w", err)
+	}
 
-	channelIDs := mustJSON([]uint{aliyunCh.ID, volcCh.ID})
+	channelIDs := mustJSON([]uint{aliyunCh.ID, volcCh.ID, qianfanCh.ID})
 
 	// 通用对话组 (Priority)
 	g1 := model.ChannelGroup{

@@ -3,6 +3,7 @@ package admin
 import (
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -31,6 +32,7 @@ func (h *ReportHandler) Register(rg *gin.RouterGroup) {
 	{
 		reports.GET("/overview", h.Overview)
 		reports.GET("/usage", h.Usage)
+		reports.GET("/revenue", h.Revenue)
 		reports.GET("/profit", h.Profit)
 		reports.GET("/profit/trend", h.ProfitTrend)
 		reports.GET("/profit/top-agents", h.TopAgents)
@@ -163,6 +165,56 @@ func parseReportFilter(c *gin.Context) report.ReportFilter {
 		}
 	}
 	return filter
+}
+
+// Revenue 获取营收趋势数据 GET /api/v1/admin/reports/revenue?period=14d
+// 返回每日的 revenue/cost/profit 数据，供营收趋势图使用
+func (h *ReportHandler) Revenue(c *gin.Context) {
+	period := c.DefaultQuery("period", "14d")
+
+	// 解析天数
+	days := 14
+	if len(period) > 1 && period[len(period)-1] == 'd' {
+		if d, err := strconv.Atoi(period[:len(period)-1]); err == nil && d > 0 && d <= 365 {
+			days = d
+		}
+	}
+
+	filter := report.ProfitFilter{
+		StartDate: time.Now().AddDate(0, 0, -days).Format("2006-01-02"),
+		EndDate:   time.Now().Format("2006-01-02"),
+		GroupBy:   "day",
+	}
+
+	result, err := h.profitCalc.GetProfitTrend(c.Request.Context(), filter)
+	if err != nil {
+		// 如果 profit trend 不可用，返回空数组
+		response.Success(c, []map[string]interface{}{})
+		return
+	}
+
+	// 转换为营收格式
+	type revenueItem struct {
+		Date    string  `json:"date"`
+		Revenue float64 `json:"revenue"`
+		Cost    float64 `json:"cost"`
+		Profit  float64 `json:"profit"`
+	}
+
+	items := make([]revenueItem, 0)
+	if result != nil {
+		for _, r := range result {
+			item := revenueItem{
+				Date:    r.Period,
+				Revenue: r.TotalRevenue,
+				Cost:    r.TotalCost,
+				Profit:  r.GrossProfit,
+			}
+			items = append(items, item)
+		}
+	}
+
+	response.Success(c, items)
 }
 
 // parseProfitFilter extracts profit-specific filter params from query string.

@@ -59,6 +59,15 @@ type OverviewReport struct {
 	ErrorRate         float64 `json:"error_rate"`
 	ActiveTenants     int64   `json:"active_tenants"`
 	ActiveKeys        int64   `json:"active_keys"`
+	// 前端总览卡片所需的额外字段
+	TotalUsers         int64   `json:"total_users"`
+	TodayRevenue       float64 `json:"today_revenue"`
+	TodayRevenueChange string  `json:"today_revenue_change"`
+	TodayRequests      int64   `json:"today_requests"`
+	TodayRequestsChange string `json:"today_requests_change"`
+	TotalUsersChange   string  `json:"total_users_change"`
+	ActiveChannels     int64   `json:"active_channels"`
+	TotalChannels      int64   `json:"total_channels"`
 }
 
 // UsageReport 用量统计报表
@@ -219,6 +228,45 @@ func (s *ReportService) GetOverviewReport(ctx context.Context, tenantID uint, pe
 
 	tenantQuery.Count(&report.ActiveTenants)
 	keyQuery.Count(&report.ActiveKeys)
+
+	// ── 前端总览卡片所需数据 ──
+
+	// 总用户数
+	s.db.Model(&model.User{}).Count(&report.TotalUsers)
+
+	// 活跃渠道 / 总渠道数
+	s.db.Model(&model.Channel{}).Where("status = ?", "active").Count(&report.ActiveChannels)
+	s.db.Model(&model.Channel{}).Count(&report.TotalChannels)
+
+	// 今日请求数（从 channel_logs 统计当天）
+	today := time.Now().Format("2006-01-02")
+	s.db.Table("channel_logs").
+		Where("created_at >= ?", today).
+		Count(&report.TodayRequests)
+
+	// 今日收入（从 daily_stats 统计当天）
+	var todayRev struct{ Revenue float64 }
+	s.db.Table("daily_stats").
+		Select("COALESCE(SUM(total_revenue), 0) as revenue").
+		Where("date = ?", today).
+		Scan(&todayRev)
+	report.TodayRevenue = todayRev.Revenue
+
+	// 变化率：对比昨日
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	var yesterdayReqs int64
+	s.db.Table("channel_logs").
+		Where("created_at >= ? AND created_at < ?", yesterday, today).
+		Count(&yesterdayReqs)
+
+	if yesterdayReqs > 0 {
+		pct := float64(report.TodayRequests-yesterdayReqs) / float64(yesterdayReqs) * 100
+		if pct >= 0 {
+			report.TodayRequestsChange = fmt.Sprintf("+%.0f%%", pct)
+		} else {
+			report.TodayRequestsChange = fmt.Sprintf("%.0f%%", pct)
+		}
+	}
 
 	s.setCache(ctx, cacheKey, report, cacheTTLDay)
 	return report, nil

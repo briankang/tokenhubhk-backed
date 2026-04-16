@@ -31,6 +31,44 @@ func NewDiscoveryService(db *gorm.DB) *DiscoveryService {
 	}
 }
 
+// isModelCheckFailed 检查模型是否在最近检测中被确认不可用
+// 用于模型同步时跳过已知"硬下线"模型（避免反复上线又下线）
+//
+// 2026-04-15 起放宽规则：
+//   - 最近 1 条日志 available=true → 不跳过（最新成功覆盖历史失败）
+//   - 最近 3 条全部失败 且 (有 upstream_status=deprecated_upstream 或 达 3 次连续失败) → 跳过
+//   - 其他 → 不跳过（避免观察窗口内的临时失败永久打压）
+func (s *DiscoveryService) isModelCheckFailed(modelName string) bool {
+	const threshold = 3
+	var logs []model.ModelCheckLog
+	if err := s.db.Where("model_name = ?", modelName).
+		Order("checked_at DESC").
+		Limit(threshold).
+		Find(&logs).Error; err != nil || len(logs) == 0 {
+		return false
+	}
+	// 最近一条成功 → 不跳过
+	if logs[0].Available {
+		return false
+	}
+	// 检查是否最近 N 条全部失败 + 有官网下架标记
+	hasDeprecated := false
+	allFailed := true
+	for _, l := range logs {
+		if l.Available {
+			allFailed = false
+			break
+		}
+		if l.UpstreamStatus == "deprecated_upstream" {
+			hasDeprecated = true
+		}
+	}
+	if !allFailed {
+		return false
+	}
+	return hasDeprecated || len(logs) >= threshold
+}
+
 // SyncResult 单个渠道的同步结果
 type SyncResult struct {
 	ChannelID     uint     `json:"channel_id"`
@@ -40,6 +78,7 @@ type SyncResult struct {
 	ModelsUpdated int      `json:"models_updated"` // 更新已有模型数
 	ModelsSkipped int      `json:"models_skipped"` // 已存在跳过的模型数
 	Errors        []string `json:"errors,omitempty"`
+	NewModelIDs   []uint   `json:"new_model_ids,omitempty"` // 本次新增的模型 ID（用于增量检测）
 }
 
 // SyncAllResult 全量同步所有渠道的汇总结果
@@ -243,8 +282,12 @@ func (s *DiscoveryService) buildModelsURL(endpoint, protocol string) string {
 		return endpoint + "/v1/models"
 	default:
 		// openai_chat, openai_responses 等 OpenAI 系列协议
-		// 如果 endpoint 已经包含 /v1，不再追加
-		if strings.HasSuffix(endpoint, "/v1") {
+		// endpoint 已包含版本号后缀（/v1、/v2、/v3）时，直接追加 /models
+		// 例如：百度千帆 https://qianfan.baidubce.com/v2 → /v2/models
+		//       火山引擎 .../api/v3 → /api/v3/models
+		if strings.HasSuffix(endpoint, "/v1") ||
+			strings.HasSuffix(endpoint, "/v2") ||
+			strings.HasSuffix(endpoint, "/v3") {
 			return endpoint + "/models"
 		}
 		return endpoint + "/v1/models"
@@ -329,8 +372,9 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 				// 阿里云: 通过模型 ID 推断类型并更新（仅在当前值为默认值 LLM 时才覆盖）
 				inferredType := inferModelTypeFromID(modelName)
 				if inferredType != "LLM" {
-					// 非 LLM 类型，更新 model_type
+					// 非 LLM 类型，更新 model_type + pricing_unit
 					updates["model_type"] = inferredType
+					updates["pricing_unit"] = inferPricingUnitFromID(modelName, inferredType)
 				}
 				if m.Created > 0 {
 					updates["api_created_at"] = m.Created
@@ -359,8 +403,18 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 			continue
 		}
 
+		// 自动为默认 CustomChannel 创建路由，确保新模型可被路由和检测
+		s.autoCreateRouteForDefault(channel.ID, standardModelID, vendorModelID)
+
 		// --- 写入 AIModel（新增或更新扩展字段） ---
 		modelName := standardModelID
+
+		// 跳过被批量检测标记为不可用的模型（不自动重新上线）
+		if s.isModelCheckFailed(modelName) {
+			result.ModelsSkipped++
+			continue
+		}
+
 		if !aiModelSet[modelName] {
 			// 查找默认分类ID
 			var defaultCategoryID uint = 1
@@ -370,6 +424,14 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 			}
 
 			// 阿里云: display_name 就是完整的模型 ID
+			modelType := inferModelTypeFromID(modelName)
+			pricingUnit := inferPricingUnitFromID(modelName, modelType)
+			// 非 LLM/VLM 模型（图像/视频/语音等）默认启用（已对接相应端点 /v1/images/generations、/v1/audio/* 等）
+			// 仅带日期后缀的老旧模型禁用
+			isActive := true
+			if isOldDatedModel(modelName) {
+				isActive = false
+			}
 			aiModel := model.AIModel{
 				ModelName:      modelName,
 				DisplayName:    modelName,
@@ -377,10 +439,12 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 				SupplierID:     channel.SupplierID,
 				Status:         "offline",
 				Source:         "auto",
-				IsActive:       true,
+				IsActive:       isActive,
 				LastSyncedAt:   &now,
-				ModelType:      inferModelTypeFromID(modelName), // 根据 ID 关键词推断类型
+				ModelType:      modelType,
+				PricingUnit:    pricingUnit,
 				ApiCreatedAt:   m.Created,
+				Tags:           InferModelTags(modelName, channel.Supplier.Code),
 			}
 			if err := s.db.Create(&aiModel).Error; err != nil {
 				if strings.Contains(err.Error(), "Duplicate") || strings.Contains(err.Error(), "UNIQUE") {
@@ -390,6 +454,7 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 				}
 			} else {
 				aiModelSet[modelName] = true
+				result.NewModelIDs = append(result.NewModelIDs, aiModel.ID)
 			}
 		} else {
 			// 已存在的 AIModel: 更新同步时间 + 推断类型（仅更新默认值）
@@ -399,6 +464,7 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 			inferredType := inferModelTypeFromID(modelName)
 			if inferredType != "LLM" {
 				updates["model_type"] = inferredType
+				updates["pricing_unit"] = inferPricingUnitFromID(modelName, inferredType)
 			}
 			if m.Created > 0 {
 				updates["api_created_at"] = m.Created
@@ -491,10 +557,23 @@ func (s *DiscoveryService) syncVolcengineModels(channel model.Channel, models []
 			continue
 		}
 
+		// 自动为默认 CustomChannel 创建路由
+		routeAlias := standardModelID
+		if routeAlias == "" {
+			routeAlias = vendorModelID
+		}
+		s.autoCreateRouteForDefault(channel.ID, routeAlias, vendorModelID)
+
 		// --- 写入 AIModel ---
 		modelName := standardModelID
 		if modelName == "" {
 			modelName = vendorModelID
+		}
+
+		// 跳过被批量检测标记为不可用的模型
+		if s.isModelCheckFailed(modelName) {
+			result.ModelsSkipped++
+			continue
 		}
 
 		if !aiModelSet[modelName] {
@@ -505,6 +584,14 @@ func (s *DiscoveryService) syncVolcengineModels(channel model.Channel, models []
 			}
 
 			// 火山引擎: 直接映射丰富字段
+			// 若 Volcengine 返回的 Domain 能映射到具体类型则用之，否则按名称推断
+			inferredType := volcFields.modelType
+			if inferredType == "" || inferredType == "LLM" {
+				if guess := inferModelTypeFromID(modelName); guess != "LLM" {
+					inferredType = guess
+				}
+			}
+			pricingUnit := inferPricingUnitFromID(modelName, inferredType)
 			aiModel := model.AIModel{
 				ModelName:        modelName,
 				DisplayName:      volcFields.displayName,
@@ -514,7 +601,8 @@ func (s *DiscoveryService) syncVolcengineModels(channel model.Channel, models []
 				Source:           "auto",
 				IsActive:         true,
 				LastSyncedAt:     &now,
-				ModelType:        volcFields.modelType,
+				ModelType:        inferredType,
+				PricingUnit:      pricingUnit,
 				Version:          volcFields.version,
 				Domain:           volcFields.domain,
 				TaskTypes:        volcFields.taskTypes,
@@ -526,6 +614,7 @@ func (s *DiscoveryService) syncVolcengineModels(channel model.Channel, models []
 				Features:         volcFields.features,
 				SupplierStatus:   volcFields.supplierStatus,
 				ApiCreatedAt:     volcFields.apiCreatedAt,
+				Tags:             InferModelTags(modelName, channel.Supplier.Code),
 			}
 
 			if err := s.db.Create(&aiModel).Error; err != nil {
@@ -536,6 +625,7 @@ func (s *DiscoveryService) syncVolcengineModels(channel model.Channel, models []
 				}
 			} else {
 				aiModelSet[modelName] = true
+				result.NewModelIDs = append(result.NewModelIDs, aiModel.ID)
 			}
 		} else {
 			// 已存在: 更新扩展字段
@@ -623,6 +713,7 @@ func (s *DiscoveryService) updateExistingAIModel(modelName string, f volcengineF
 	// 仅在供应商返回了有效值时才更新
 	if f.modelType != "" && f.modelType != "LLM" {
 		updates["model_type"] = f.modelType
+		updates["pricing_unit"] = inferPricingUnitFromID(modelName, f.modelType)
 	}
 	if f.version != "" {
 		updates["version"] = f.version
@@ -661,25 +752,234 @@ func (s *DiscoveryService) updateExistingAIModel(modelName string, f volcengineF
 	s.db.Model(&model.AIModel{}).Where("model_name = ?", modelName).Updates(updates)
 }
 
+// supplierBrandMap 供应商 code → 品牌标签（用于自动注入供应商品牌）
+var supplierBrandMap = map[string]string{
+	"openai":           "OpenAI",
+	"anthropic":        "Anthropic",
+	"google_gemini":    "Google",
+	"azure_openai":     "OpenAI",
+	"deepseek":         "DeepSeek",
+	"aliyun_dashscope": "Alibaba",
+	"volcengine":       "Volcengine",
+	"moonshot":         "Moonshot",
+	"zhipu":            "智谱GLM",
+	"baidu_wenxin":     "Baidu",
+	"baidu_qianfan":    "Baidu",
+	"tencent_hunyuan":  "Tencent",
+	"xai":              "xAI",
+	"meta":             "Meta",
+	"mistral":          "Mistral",
+	"01ai":             "01.AI",
+}
+
+// brandKeywordRules 模型名称中的品牌关键词 → 标签列表
+// 按优先级排列，长关键词在前避免短关键词误匹配
+type brandRule struct {
+	keyword string
+	brands  []string
+}
+
+var brandKeywordRules = []brandRule{
+	// 精确前缀匹配（用 prefix: 标记）
+	{"prefix:o1-", []string{"OpenAI"}},
+	{"prefix:o3-", []string{"OpenAI"}},
+	{"prefix:o4-", []string{"OpenAI"}},
+	{"prefix:yi-", []string{"01.AI"}},
+	{"prefix:phi-", []string{"Microsoft"}},
+	// 包含匹配
+	{"deepseek", []string{"DeepSeek"}},
+	{"qwen", []string{"Qwen"}},
+	{"chatglm", []string{"智谱GLM"}},
+	{"glm-", []string{"智谱GLM"}},
+	{"glm4", []string{"智谱GLM"}},
+	{"codegeex", []string{"智谱GLM"}},
+	{"cogview", []string{"智谱GLM"}},
+	{"cogvideo", []string{"智谱GLM"}},
+	{"llama", []string{"Meta"}},
+	{"baichuan", []string{"Baichuan"}},
+	{"mistral", []string{"Mistral"}},
+	{"mixtral", []string{"Mistral"}},
+	{"codestral", []string{"Mistral"}},
+	{"gemma", []string{"Google"}},
+	{"gemini", []string{"Google"}},
+	{"internlm", []string{"InternLM"}},
+	{"moonshot", []string{"Moonshot"}},
+	{"kimi", []string{"Moonshot"}},
+	{"minimax", []string{"MiniMax"}},
+	{"abab", []string{"MiniMax"}},
+	{"ernie", []string{"Baidu"}},
+	{"claude", []string{"Anthropic"}},
+	{"gpt-", []string{"OpenAI"}},
+	{"gpt4", []string{"OpenAI"}},
+	{"dall-e", []string{"OpenAI"}},
+	{"whisper", []string{"OpenAI"}},
+	{"tts-", []string{"OpenAI"}},
+	{"text-embedding", []string{"OpenAI"}},
+	{"wan2", []string{"Alibaba"}},
+	{"wan-", []string{"Alibaba"}},
+	{"flux", []string{"Flux"}},
+	{"stable", []string{"StabilityAI"}},
+	{"tongyi", []string{"Alibaba"}},
+	{"gui-", []string{"Alibaba"}},
+	{"doubao", []string{"Volcengine"}},
+	{"skylark", []string{"Volcengine"}},
+	{"grok", []string{"xAI"}},
+	{"jamba", []string{"AI21"}},
+	{"command", []string{"Cohere"}},
+	{"hunyuan", []string{"Tencent"}},
+}
+
+// InferModelTags 根据模型名称和供应商 code 推断完整的搜索标签
+// 合并模型品牌标签 + 供应商品牌标签，去重后返回逗号分隔字符串
+func InferModelTags(modelName string, supplierCode string) string {
+	seen := make(map[string]bool)
+	var tags []string
+
+	addTag := func(tag string) {
+		if !seen[tag] {
+			seen[tag] = true
+			tags = append(tags, tag)
+		}
+	}
+
+	// 1. 从模型名称推断品牌标签
+	nameLower := strings.ToLower(modelName)
+	for _, rule := range brandKeywordRules {
+		keyword := rule.keyword
+		if strings.HasPrefix(keyword, "prefix:") {
+			prefix := strings.TrimPrefix(keyword, "prefix:")
+			if strings.HasPrefix(nameLower, prefix) {
+				for _, brand := range rule.brands {
+					addTag(brand)
+				}
+			}
+		} else {
+			if strings.Contains(nameLower, keyword) {
+				for _, brand := range rule.brands {
+					addTag(brand)
+				}
+			}
+		}
+	}
+
+	// 2. 注入供应商品牌标签
+	if supplierCode != "" {
+		if brand, ok := supplierBrandMap[supplierCode]; ok {
+			addTag(brand)
+		}
+	}
+
+	if len(tags) == 0 {
+		return ""
+	}
+	return strings.Join(tags, ",")
+}
+
+// inferTagsFromModelName 根据模型名称推断搜索标签（无供应商信息时使用）
+func inferTagsFromModelName(modelName string) string {
+	return InferModelTags(modelName, "")
+}
+
+// autoCreateRouteForDefault 为新增的 ChannelModel 自动创建默认 CustomChannel 路由
+// 确保新同步的模型能立即通过 custom_channel_routes 被检测和使用
+func (s *DiscoveryService) autoCreateRouteForDefault(channelID uint, standardModelID, vendorModelID string) {
+	// 查找默认 CustomChannel
+	var defaultCC model.CustomChannel
+	if err := s.db.Where("is_default = ? AND is_active = ?", true, true).First(&defaultCC).Error; err != nil {
+		return // 无默认渠道，跳过
+	}
+
+	// 使用 FirstOrCreate 避免重复创建
+	route := model.CustomChannelRoute{
+		CustomChannelID: defaultCC.ID,
+		AliasModel:      standardModelID,
+		ChannelID:       channelID,
+		ActualModel:     vendorModelID,
+		Weight:          100,
+		Priority:        0,
+		IsActive:        true,
+	}
+	s.db.Where("custom_channel_id = ? AND alias_model = ? AND channel_id = ?",
+		defaultCC.ID, standardModelID, channelID).
+		FirstOrCreate(&route)
+}
+
+// isOldDatedModel 检测模型名称是否带日期后缀，表示老旧版本
+// 例如 qwen-max-1201, qwen-max-0428, qwen-plus-0806 等
+func isOldDatedModel(modelName string) bool {
+	name := strings.ToLower(modelName)
+	// 匹配末尾 4 位数字（MMDD 格式日期后缀）
+	if len(name) < 5 {
+		return false
+	}
+	suffix := name[len(name)-4:]
+	sep := name[len(name)-5]
+	if sep != '-' {
+		return false
+	}
+	for _, c := range suffix {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // inferModelTypeFromID 根据模型 ID 关键词推断模型类型
 // 阿里云仅返回 4 字段，需要通过模型 ID 名称推断类型
 func inferModelTypeFromID(modelID string) string {
 	id := strings.ToLower(modelID)
 	switch {
-	case containsAny(id, "image", "wan"):
+	case containsAny(id, "image", "wan", "seedream", "cogview", "dall-e", "gpt-image", "imagen", "hunyuan-image", "stable-diffusion"):
 		return "ImageGeneration"
-	case containsAny(id, "video", "seaweed"):
+	case containsAny(id, "video", "seaweed", "seedance", "wanx-video", "cogvideo", "veo", "hunyuan-video"):
 		return "VideoGeneration"
-	case containsAny(id, "embedding", "text-embedding"):
+	case containsAny(id, "embedding", "text-embedding", "bge-large", "bge-small", "tao-8k"):
 		return "Embedding"
-	case containsAny(id, "tts", "cosyvoice", "speech-synthesis"):
-		return "SpeechSynthesis"
-	case containsAny(id, "asr", "paraformer", "sensevoice"):
-		return "SpeechRecognition"
+	case containsAny(id, "tts", "cosyvoice", "speech-synthesis", "speech-02"):
+		return "TTS"
+	case containsAny(id, "asr", "paraformer", "sensevoice", "whisper", "recording"):
+		return "ASR"
+	case containsAny(id, "rerank"):
+		return "Rerank"
 	case containsAny(id, "vl", "omni", "-mm"):
 		return "VLM"
 	default:
 		return "LLM"
+	}
+}
+
+// inferPricingUnitFromID 根据模型 ID 和类型推断计费单位
+// 返回值为 model.UnitPer* 常量，供 syncStandardModels/syncVolcengineModels 在创建/更新时写入
+func inferPricingUnitFromID(modelID, modelType string) string {
+	id := strings.ToLower(modelID)
+	switch modelType {
+	case "ImageGeneration":
+		// 图像生成默认按张计费（Seedance 等特殊视频/图像混合模型由种子数据覆盖）
+		return "per_image"
+	case "VideoGeneration":
+		// 部分视频模型按 token 计费（如 Seedance），其他按秒
+		if containsAny(id, "seedance") {
+			return "per_million_tokens"
+		}
+		return "per_second"
+	case "TTS", "SpeechSynthesis", "TextToSpeech":
+		// OpenAI/Qwen 系按百万字符；豆包按万字符
+		if containsAny(id, "qwen", "openai", "tts-1", "speech-02", "minimax-speech") {
+			return "per_million_characters"
+		}
+		return "per_10k_characters"
+	case "ASR", "SpeechRecognition", "SpeechToText":
+		// whisper 按分钟；paraformer/doubao 按小时
+		if containsAny(id, "whisper") {
+			return "per_minute"
+		}
+		return "per_hour"
+	case "Rerank":
+		return "per_call"
+	default:
+		// LLM / VLM / Embedding 默认按百万 token 计费
+		return "per_million_tokens"
 	}
 }
 
@@ -691,4 +991,143 @@ func containsAny(s string, substrs ...string) bool {
 		}
 	}
 	return false
+}
+
+// FetchProviderModelNames 拉取指定供应商 API 当前返回的所有模型名称
+// 用于与数据库模型对比，发现可能已下线的模型
+// 逻辑：查找该供应商下第一个活跃渠道，调用其 /v1/models 接口
+func (s *DiscoveryService) FetchProviderModelNames(supplierID uint) ([]string, error) {
+	// 查找该供应商下活跃且非 custom 协议的渠道
+	var channel model.Channel
+	if err := s.db.Where("supplier_id = ? AND status IN ? AND api_protocol != ?",
+		supplierID,
+		[]string{"active", "unverified"},
+		"custom",
+	).First(&channel).Error; err != nil {
+		return nil, fmt.Errorf("未找到该供应商的可用渠道: %w", err)
+	}
+
+	// 构建请求 URL
+	modelsURL := s.buildModelsURL(channel.Endpoint, channel.ApiProtocol)
+	req, err := http.NewRequest("GET", modelsURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("构建请求失败: %w", err)
+	}
+	s.setAuthHeaders(req, channel)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("请求供应商API失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("供应商API返回 %d: %s", resp.StatusCode, string(body))
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应体失败: %w", err)
+	}
+
+	// 解析标准 OpenAI 兼容格式
+	var modelsResp openAIModelResponse
+	if err := json.Unmarshal(bodyBytes, &modelsResp); err != nil {
+		return nil, fmt.Errorf("解析模型列表失败: %w", err)
+	}
+
+	// 提取模型名称（兼容标准格式和火山引擎格式）
+	var names []string
+	if s.isVolcengineChannel(channel) {
+		var volcModels []VolcengineModel
+		if err := json.Unmarshal(modelsResp.Data, &volcModels); err == nil {
+			for _, m := range volcModels {
+				if m.ID != "" {
+					names = append(names, m.ID)
+				}
+			}
+		}
+	} else {
+		var standardModels []openAIModelID
+		if err := json.Unmarshal(modelsResp.Data, &standardModels); err == nil {
+			for _, m := range standardModels {
+				if m.ID != "" {
+					names = append(names, m.ID)
+				}
+			}
+		}
+	}
+	return names, nil
+}
+
+// ModelNameWithStatus 模型名称及其上游状态
+type ModelNameWithStatus struct {
+	Name     string
+	Shutdown bool // true = 火山引擎 Shutdown/Deprecated，其他供应商不设此字段
+}
+
+// FetchProviderModelNamesWithStatus 与 FetchProviderModelNames 相同，但额外返回每个模型的下架状态
+// 目前仅火山引擎会填充 Shutdown 字段（status=Shutdown/Deprecated）
+func (s *DiscoveryService) FetchProviderModelNamesWithStatus(supplierID uint) ([]ModelNameWithStatus, error) {
+	var channel model.Channel
+	if err := s.db.Where("supplier_id = ? AND status IN ? AND api_protocol != ?",
+		supplierID, []string{"active", "unverified"}, "custom",
+	).First(&channel).Error; err != nil {
+		return nil, fmt.Errorf("未找到该供应商的可用渠道: %w", err)
+	}
+
+	modelsURL := s.buildModelsURL(channel.Endpoint, channel.ApiProtocol)
+	req, err := http.NewRequest("GET", modelsURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("构建请求失败: %w", err)
+	}
+	s.setAuthHeaders(req, channel)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("请求供应商API失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("供应商API返回 %d: %s", resp.StatusCode, string(body))
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应体失败: %w", err)
+	}
+
+	var modelsResp openAIModelResponse
+	if err := json.Unmarshal(bodyBytes, &modelsResp); err != nil {
+		return nil, fmt.Errorf("解析模型列表失败: %w", err)
+	}
+
+	var result []ModelNameWithStatus
+	if s.isVolcengineChannel(channel) {
+		var volcModels []VolcengineModel
+		if err := json.Unmarshal(modelsResp.Data, &volcModels); err == nil {
+			for _, m := range volcModels {
+				if m.ID != "" {
+					st := strings.ToLower(m.Status)
+					result = append(result, ModelNameWithStatus{
+						Name:     m.ID,
+						Shutdown: st == "shutdown" || st == "deprecated",
+					})
+				}
+			}
+		}
+	} else {
+		var standardModels []openAIModelID
+		if err := json.Unmarshal(modelsResp.Data, &standardModels); err == nil {
+			for _, m := range standardModels {
+				if m.ID != "" {
+					result = append(result, ModelNameWithStatus{Name: m.ID})
+				}
+			}
+		}
+	}
+	return result, nil
 }

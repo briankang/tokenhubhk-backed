@@ -2,6 +2,7 @@ package pricing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -17,6 +18,10 @@ const (
 	priceCacheTTL    = 5 * time.Minute
 	priceCachePrefix = "pricing"
 )
+
+// ErrModelNotPriced 模型未配置 ModelPricing 售价，禁止计费调用。
+// 上游 handler 应据此返回 503/402 并提示用户该模型不可用。
+var ErrModelNotPriced = errors.New("model has no published sale price (model_pricings missing)")
 
 // PriceResult 模型计算价格结果（积分为主，RMB 为辅助展示）
 type PriceResult struct {
@@ -37,6 +42,25 @@ type CostResult struct {
 	TotalCostRMB float64 `json:"total_cost_rmb"` // 总成本（人民币）
 	PlatformCost int64   `json:"platform_cost"` // 平台基础成本（积分），用于利润计算
 	PriceDetail  PriceResult `json:"price_detail"`
+}
+
+// UsageInput 多计费单位的用量输入
+// 根据 AIModel.PricingUnit 选择对应字段：
+//   - per_million_tokens:     InputTokens / OutputTokens
+//   - per_image:              ImageCount（生成的图片张数）
+//   - per_second:             DurationSec（视频/音频秒数）
+//   - per_minute:             DurationSec（按分钟折算，如 whisper）
+//   - per_10k_characters:     CharCount（按万字符折算，豆包 TTS）
+//   - per_million_characters: CharCount（按百万字符折算，qwen-tts / openai-tts）
+//   - per_call:               CallCount（请求次数，Rerank 等）
+//   - per_hour:               DurationSec（按小时折算，ASR）
+type UsageInput struct {
+	InputTokens  int     `json:"input_tokens,omitempty"`
+	OutputTokens int     `json:"output_tokens,omitempty"`
+	ImageCount   int     `json:"image_count,omitempty"`
+	CharCount    int     `json:"char_count,omitempty"`
+	DurationSec  float64 `json:"duration_sec,omitempty"`
+	CallCount    int     `json:"call_count,omitempty"`
 }
 
 // PriceMatrixItem 价格矩阵中的单行数据
@@ -154,11 +178,16 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, modelID uint, ten
 
 	// 计算费用：价格单位是"每百万token的积分"，需要乘以 token 数再除以 1,000,000
 	// 为避免浮点运算，使用整数运算：cost = price * tokens / 1_000_000
+	// 最小1积分保底：有token消耗时至少扣1积分，防止小请求因整数截断免费
 	inputCost := priceResult.InputPricePerMillion * int64(inputTokens) / 1_000_000
 	outputCost := priceResult.OutputPricePerMillion * int64(outputTokens) / 1_000_000
 	platformCost := (platformPrice.InputPricePerToken*int64(inputTokens) + platformPrice.OutputPricePerToken*int64(outputTokens)) / 1_000_000
 
 	totalCost := inputCost + outputCost
+	// 有实际token消耗但计算结果为0时（整数截断），保底收取1积分
+	if totalCost == 0 && (inputTokens > 0 || outputTokens > 0) {
+		totalCost = 1
+	}
 	totalCostRMB := credits.CreditsToRMB(totalCost)
 
 	return &CostResult{
@@ -169,6 +198,198 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, modelID uint, ten
 		PlatformCost: platformCost,
 		PriceDetail:  *priceResult,
 	}, nil
+}
+
+// CalculateCostByUnit 根据模型的 PricingUnit 使用对应的用量字段计算费用
+//
+// 单位分支（8 种 + per_k_chars 兼容）：
+//   - per_million_tokens:     复用 CalculateCost（InputTokens + OutputTokens）
+//   - per_image:              input_cost_rmb * image_count
+//   - per_second:             input_cost_rmb * duration_sec
+//   - per_minute:             input_cost_rmb * duration_sec / 60
+//   - per_10k_characters:     input_cost_rmb * char_count / 10000（别名 per_k_chars）
+//   - per_million_characters: input_cost_rmb * char_count / 1_000_000
+//   - per_call:               input_cost_rmb * call_count
+//   - per_hour:               input_cost_rmb * duration_sec / 3600
+//
+// 对于非 Token 单位，以模型的平台基础价 InputCostRMB 计算。
+// 三级折扣（DISCOUNT）仍生效（通过 DiscountResolver 解析后乘折扣率）。
+// MARKUP/FIXED 在非 Token 类单位下暂不支持，按平台基础价收取。
+func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, modelID uint, tenantID uint, agentLevel int, usage UsageInput) (*CostResult, error) {
+	var m model.AIModel
+	if err := c.db.WithContext(ctx).First(&m, modelID).Error; err != nil {
+		return nil, fmt.Errorf("model %d not found: %w", modelID, err)
+	}
+
+	// per_million_tokens 走原有路径，保证 FIXED/MARKUP/DISCOUNT 三层定价完全兼容
+	if m.PricingUnit == "" || m.PricingUnit == model.UnitPerMillionTokens {
+		return c.CalculateCost(ctx, modelID, tenantID, agentLevel, usage.InputTokens, usage.OutputTokens)
+	}
+
+	// 非 token 单位：以模型 InputCostRMB 为基础价
+	basePriceRMB := m.InputCostRMB
+	if basePriceRMB <= 0 {
+		// 价格未配置，返回 0 费用（不阻塞请求）
+		return &CostResult{TotalCost: 0, TotalCostRMB: 0}, nil
+	}
+
+	// 尝试解析折扣（仅应用 DISCOUNT 类型，其他类型回退为平台价）
+	discount, derr := c.resolver.ResolveDiscount(ctx, tenantID, modelID, agentLevel)
+	discountRate := 1.0
+	source := "platform"
+	if derr == nil && discount != nil && discount.PricingType == "DISCOUNT" && discount.InputDiscount > 0 {
+		discountRate = discount.InputDiscount
+		if discount.Type == "agent_custom" {
+			source = "agent_custom"
+		} else {
+			source = "level_discount"
+		}
+	}
+
+	var quantity float64
+	switch m.PricingUnit {
+	case model.UnitPerImage:
+		quantity = float64(usage.ImageCount)
+	case model.UnitPerSecond:
+		quantity = usage.DurationSec
+	case model.UnitPerMinute:
+		quantity = usage.DurationSec / 60.0
+	case model.UnitPer10kCharacters, model.UnitPerKChars:
+		// "元/万字符"：10000 字符为 1 单位
+		quantity = float64(usage.CharCount) / 10000.0
+	case model.UnitPerMillionCharacters:
+		quantity = float64(usage.CharCount) / 1_000_000.0
+	case model.UnitPerCall:
+		quantity = float64(usage.CallCount)
+	case model.UnitPerHour:
+		quantity = usage.DurationSec / 3600.0
+	default:
+		// 未知单位，回退到 token 路径避免漏扣
+		return c.CalculateCost(ctx, modelID, tenantID, agentLevel, usage.InputTokens, usage.OutputTokens)
+	}
+
+	if quantity <= 0 {
+		return &CostResult{TotalCost: 0, TotalCostRMB: 0, PriceDetail: PriceResult{Currency: "CREDIT", Source: source}}, nil
+	}
+
+	costRMB := basePriceRMB * quantity * discountRate
+	totalCost := credits.RMBToCredits(costRMB)
+
+	// 有实际消耗但因四舍五入取整为 0，保底 1 积分
+	if totalCost == 0 && quantity > 0 && costRMB > 0 {
+		totalCost = 1
+	}
+	totalCostRMB := credits.CreditsToRMB(totalCost)
+
+	// 平台成本（用于利润分析）使用同一基础价
+	platformCost := credits.RMBToCredits(basePriceRMB * quantity)
+
+	return &CostResult{
+		InputCost:    totalCost,
+		OutputCost:   0,
+		TotalCost:    totalCost,
+		TotalCostRMB: totalCostRMB,
+		PlatformCost: platformCost,
+		PriceDetail: PriceResult{
+			Currency: "CREDIT",
+			Source:   source,
+		},
+	}, nil
+}
+
+// CacheUsageInput 含缓存信息的用量输入
+type CacheUsageInput struct {
+	InputTokens      int // 总输入Token（含缓存命中+写入+普通）
+	OutputTokens     int // 输出Token
+	CacheReadTokens  int // 缓存命中Token（来自供应商响应）
+	CacheWriteTokens int // 缓存写入Token（Anthropic cache_creation_input_tokens）
+}
+
+// CalculateWithCache 计算含缓存的总成本（用户付费侧不变，额外返回平台侧节省金额）
+//
+// 计费逻辑（使用 AIModel 中的成本价字段）：
+//   - auto/explicit 缓存命中：cache_input_price_rmb（节省80%-90%）
+//   - explicit 缓存写入（Anthropic/阿里云显式）：cache_write_price_rmb（+25%溢价）
+//   - both 机制（阿里云）：CacheWriteTokens>0 走显式价格，否则走隐式价格
+//   - 普通输入Token（未命中缓存）：正常 input_cost_rmb
+//
+// savingsRMB 表示平台从供应商侧节省的成本（不影响用户计费）。
+func (c *PricingCalculator) CalculateWithCache(
+	ctx context.Context,
+	aiModel *model.AIModel,
+	tenantID uint,
+	agentLevel int,
+	cacheUsage CacheUsageInput,
+) (costResult *CostResult, savingsRMB float64, err error) {
+	// 不支持缓存、或无缓存命中/写入，直接走普通计费路径
+	if !aiModel.SupportsCache || aiModel.CacheMechanism == "none" ||
+		(cacheUsage.CacheReadTokens == 0 && cacheUsage.CacheWriteTokens == 0) {
+		costResult, err = c.CalculateCost(ctx, aiModel.ID, tenantID, agentLevel,
+			cacheUsage.InputTokens, cacheUsage.OutputTokens)
+		return costResult, 0, err
+	}
+
+	// 先按普通价格计算用户侧费用（保持计费一致性）
+	costResult, err = c.CalculateCost(ctx, aiModel.ID, tenantID, agentLevel,
+		cacheUsage.InputTokens, cacheUsage.OutputTokens)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// 计算平台侧（供应商）成本节省
+	// 基础输入成本价（元/百万Token）
+	baseInputCostRMB := aiModel.InputCostRMB
+
+	// 根据缓存机制选择命中价格
+	var cacheReadPriceRMB, cacheWritePriceRMB float64
+	switch aiModel.CacheMechanism {
+	case "both":
+		// 阿里云：有写入Token则认为是显式缓存，否则是隐式
+		if cacheUsage.CacheWriteTokens > 0 {
+			cacheReadPriceRMB = aiModel.CacheExplicitInputPriceRMB
+			if cacheReadPriceRMB <= 0 && baseInputCostRMB > 0 {
+				cacheReadPriceRMB = baseInputCostRMB * 0.10 // fallback: 显式命中=10%
+			}
+		} else {
+			cacheReadPriceRMB = aiModel.CacheInputPriceRMB
+			if cacheReadPriceRMB <= 0 && baseInputCostRMB > 0 {
+				cacheReadPriceRMB = baseInputCostRMB * 0.20 // fallback: 隐式命中=20%
+			}
+		}
+		cacheWritePriceRMB = aiModel.CacheWritePriceRMB
+		if cacheWritePriceRMB <= 0 && baseInputCostRMB > 0 {
+			cacheWritePriceRMB = baseInputCostRMB * 1.25 // fallback: 写入=125%
+		}
+	case "explicit":
+		// Anthropic：cache_control 触发
+		cacheReadPriceRMB = aiModel.CacheInputPriceRMB
+		if cacheReadPriceRMB <= 0 && baseInputCostRMB > 0 {
+			cacheReadPriceRMB = baseInputCostRMB * 0.10
+		}
+		cacheWritePriceRMB = aiModel.CacheWritePriceRMB
+		if cacheWritePriceRMB <= 0 && baseInputCostRMB > 0 {
+			cacheWritePriceRMB = baseInputCostRMB * 1.25
+		}
+	default: // auto
+		// OpenAI/DeepSeek/Moonshot/智谱/火山引擎：自动缓存
+		cacheReadPriceRMB = aiModel.CacheInputPriceRMB
+		if cacheReadPriceRMB <= 0 && baseInputCostRMB > 0 {
+			cacheReadPriceRMB = baseInputCostRMB * 0.50 // fallback: 50%（OpenAI默认）
+		}
+		cacheWritePriceRMB = 0 // 自动缓存无写入溢价
+	}
+
+	// 节省计算：
+	//   缓存命中节省 = CacheReadTokens × (baseInputCost - cacheReadPrice) / 1e6
+	//   缓存写入额外成本 = CacheWriteTokens × (cacheWritePrice - baseInputCost) / 1e6
+	//   净节省 = 命中节省 - 写入额外成本
+	if baseInputCostRMB > 0 && cacheReadPriceRMB > 0 {
+		readSavings := float64(cacheUsage.CacheReadTokens) * (baseInputCostRMB - cacheReadPriceRMB) / 1_000_000.0
+		writeExtra := float64(cacheUsage.CacheWriteTokens) * (cacheWritePriceRMB - baseInputCostRMB) / 1_000_000.0
+		savingsRMB = readSavings - writeExtra
+	}
+
+	return costResult, savingsRMB, nil
 }
 
 // GetPriceMatrix 获取指定租户/层级下所有活跃模型的价格矩阵
@@ -236,6 +457,9 @@ func (c *PricingCalculator) InvalidateCache(ctx context.Context, modelID uint, t
 }
 
 // getPlatformPrice 获取模型的平台定价（积分/百万token）
+// 严格模式：ModelPricing 不存在时返回 ErrModelNotPriced，禁止用成本价兜底扣费。
+// 历史上此处曾用 ai_models.input_cost_rmb 做 fallback，导致未维护售价的模型按成本价扣费，
+// 平台利润为 0 甚至为负。已改为强校验，请通过 /admin/models/repair-pricing 一次性补齐。
 func (c *PricingCalculator) getPlatformPrice(ctx context.Context, modelID uint) (*model.ModelPricing, error) {
 	var mp model.ModelPricing
 	err := c.db.WithContext(ctx).
@@ -244,19 +468,7 @@ func (c *PricingCalculator) getPlatformPrice(ctx context.Context, modelID uint) 
 		First(&mp).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
-			// Fallback: use AIModel cost price as platform price
-			var m model.AIModel
-			if err2 := c.db.WithContext(ctx).First(&m, modelID).Error; err2 != nil {
-				return nil, fmt.Errorf("model %d not found: %w", modelID, err2)
-			}
-			return &model.ModelPricing{
-				ModelID:             modelID,
-				InputPricePerToken:  m.InputPricePerToken,
-				InputPriceRMB:       m.InputCostRMB,
-				OutputPricePerToken: m.OutputPricePerToken,
-				OutputPriceRMB:      m.OutputCostRMB,
-				Currency:            m.Currency,
-			}, nil
+			return nil, fmt.Errorf("model %d: %w", modelID, ErrModelNotPriced)
 		}
 		return nil, fmt.Errorf("query model pricing: %w", err)
 	}

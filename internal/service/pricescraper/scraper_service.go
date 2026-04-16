@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 	"time"
 
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
+	"tokenhub-server/internal/middleware"
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/logger"
 )
@@ -35,15 +37,42 @@ type ScrapedPriceData struct {
 	SourceURL    string         `json:"source_url"`
 }
 
+// 计费单位常量（与 model.Unit* 保持对齐）
+const (
+	PricingUnitPerMillionTokens     = "per_million_tokens"     // 元/百万token（默认，LLM/VLM/Embedding/Seedance 视频）
+	PricingUnitPerImage             = "per_image"              // 元/张（图片生成 Seedream/wanx/cogview/dall-e）
+	PricingUnitPerSecond            = "per_second"             // 元/秒（视频 wanx-video / cogvideo）
+	PricingUnitPerMinute            = "per_minute"             // 元/分钟（whisper）
+	PricingUnitPer10kCharacters     = "per_10k_characters"     // 元/万字符（豆包 TTS 2.0）
+	PricingUnitPerMillionCharacters = "per_million_characters" // 元/百万字符（qwen-tts / openai tts-1）
+	PricingUnitPerCall              = "per_call"               // 元/次（Rerank / 意图识别）
+	PricingUnitPerHour              = "per_hour"               // 元/小时（ASR 豆包/paraformer）
+
+	// 历史遗留别名，等价于 PricingUnitPer10kCharacters
+	PricingUnitPerKChars = "per_k_chars"
+)
+
 // ScrapedModel 单个模型的价格数据
 type ScrapedModel struct {
-	ModelName   string            `json:"model_name"`   // 模型标识名
-	DisplayName string           `json:"display_name"`  // 展示名称
-	InputPrice  float64          `json:"input_price"`   // 基础输入价格（RMB/百万token）
-	OutputPrice float64          `json:"output_price"`  // 基础输出价格（RMB/百万token）
-	PriceTiers  []model.PriceTier `json:"price_tiers"`  // 阶梯价格
-	Currency    string           `json:"currency"`      // 币种
-	Warnings    []string         `json:"warnings"`      // 验证警告
+	ModelName   string            `json:"model_name"`    // 模型标识名
+	DisplayName string           `json:"display_name"`   // 展示名称
+	InputPrice  float64          `json:"input_price"`    // 基础输入价格（单位由 PricingUnit 决定）
+	OutputPrice float64          `json:"output_price"`   // 基础输出价格（单位由 PricingUnit 决定）
+	PriceTiers  []model.PriceTier `json:"price_tiers"`   // 阶梯价格
+	Currency    string           `json:"currency"`       // 币种
+	PricingUnit string           `json:"pricing_unit"`   // 计费单位: per_million_tokens(默认)/per_image/per_second/per_minute/per_10k_characters/per_million_characters/per_call/per_hour
+	ModelType   string           `json:"model_type"`     // 模型类型: LLM/Vision/Embedding/ImageGeneration/VideoGeneration/TTS/ASR/Rerank
+	Variant     string           `json:"variant,omitempty"` // 变体/质量档（如 "1024x1024"/"hd"/"low-latency"）
+	Warnings    []string         `json:"warnings"`       // 验证警告
+
+	// 缓存定价字段（未支持时留零值）
+	SupportsCache              bool    `json:"supports_cache"`               // 是否支持缓存定价
+	CacheMechanism             string  `json:"cache_mechanism"`              // auto/explicit/both/none
+	CacheMinTokens             int     `json:"cache_min_tokens"`             // 触发缓存的最小Token门槛
+	CacheInputPrice            float64 `json:"cache_input_price"`            // 缓存命中(隐式)输入价，元/百万Token
+	CacheExplicitInputPrice    float64 `json:"cache_explicit_input_price"`   // 显式缓存命中价（both模式专用）
+	CacheWritePrice            float64 `json:"cache_write_price"`            // 缓存写入价，元/百万Token
+	CacheStoragePrice          float64 `json:"cache_storage_price"`          // 缓存存储价，元/百万Token/小时
 }
 
 // PriceDiffItem 价格差异项
@@ -59,8 +88,19 @@ type PriceDiffItem struct {
 	InputChangeRatio  float64           `json:"input_change_ratio"`  // 百分比变动
 	OutputChangeRatio float64           `json:"output_change_ratio"` // 百分比变动
 	PriceTiers        []model.PriceTier `json:"price_tiers,omitempty"`
+	PricingUnit       string            `json:"pricing_unit"`        // 计费单位
+	ModelType         string            `json:"model_type"`          // 模型类型
 	Warnings          []string          `json:"warnings"`
 	HasChanges        bool              `json:"has_changes"`
+
+	// 缓存定价（从 ScrapedModel 直传，供前端构建 PriceUpdateRequest 使用）
+	SupportsCache              bool    `json:"supports_cache"`
+	CacheMechanism             string  `json:"cache_mechanism,omitempty"`
+	CacheMinTokens             int     `json:"cache_min_tokens,omitempty"`
+	CacheInputPriceRMB         float64 `json:"cache_input_price_rmb,omitempty"`
+	CacheExplicitInputPriceRMB float64 `json:"cache_explicit_input_price_rmb,omitempty"`
+	CacheWritePriceRMB         float64 `json:"cache_write_price_rmb,omitempty"`
+	CacheStoragePriceRMB       float64 `json:"cache_storage_price_rmb,omitempty"`
 }
 
 // PriceDiffResult 完整差异结果
@@ -76,38 +116,76 @@ type PriceDiffResult struct {
 }
 
 // PriceUpdateRequest 价格更新请求（单个模型）
+// ModelID == 0 时代表新模型，将根据 ModelName + SupplierID 执行 INSERT
 type PriceUpdateRequest struct {
 	ModelID      uint              `json:"model_id"`
+	ModelName    string            `json:"model_name,omitempty"`    // 模型名称（INSERT 场景必填）
+	DisplayName  string            `json:"display_name,omitempty"`  // 展示名称（可选，默认等于 ModelName）
 	InputCostRMB  float64          `json:"input_cost_rmb"`
 	OutputCostRMB float64          `json:"output_cost_rmb"`
 	PriceTiers   []model.PriceTier `json:"price_tiers,omitempty"`
+	PricingUnit  string            `json:"pricing_unit,omitempty"`  // 计费单位
+	ModelType    string            `json:"model_type,omitempty"`    // 模型类型
+	Variant      string            `json:"variant,omitempty"`       // 变体/质量档（非 Token 单位使用）
+
+	// 缓存定价（从 ScrapedModel 传入）
+	SupportsCache              bool    `json:"supports_cache"`
+	CacheMechanism             string  `json:"cache_mechanism,omitempty"`
+	CacheMinTokens             int     `json:"cache_min_tokens,omitempty"`
+	CacheInputPriceRMB         float64 `json:"cache_input_price_rmb,omitempty"`
+	CacheExplicitInputPriceRMB float64 `json:"cache_explicit_input_price_rmb,omitempty"`
+	CacheWritePriceRMB         float64 `json:"cache_write_price_rmb,omitempty"`
+	CacheStoragePriceRMB       float64 `json:"cache_storage_price_rmb,omitempty"`
 }
 
 // ApplyResult 应用价格更新的结果
 type ApplyResult struct {
-	UpdatedCount int      `json:"updated_count"`
-	SkippedCount int      `json:"skipped_count"`
-	Errors       []string `json:"errors,omitempty"`
+	UpdatedCount  int      `json:"updated_count"`  // 已更新的存量模型数
+	InsertedCount int      `json:"inserted_count"` // 新入库的模型数
+	SkippedCount  int      `json:"skipped_count"`
+	Errors        []string `json:"errors,omitempty"`
 }
 
 // PriceScraperService 价格爬虫服务
 type PriceScraperService struct {
-	db       *gorm.DB
-	scrapers map[string]Scraper // key: 供应商名称关键字
+	db         *gorm.DB
+	scrapers   map[string]Scraper // key: 供应商名称关键字
+	browserMgr *BrowserManager    // headless 浏览器管理器（火山引擎仍需使用）
 }
 
 // NewPriceScraperService 创建价格爬虫服务实例
 // 初始化时注册所有已实现的供应商爬虫
+// API Key 通过环境变量传入: VOLCENGINE_API_KEY, ALIBABA_API_KEY
 func NewPriceScraperService(db *gorm.DB) *PriceScraperService {
+	browserMgr := NewBrowserManager()
 	s := &PriceScraperService{
-		db:       db,
-		scrapers: make(map[string]Scraper),
+		db:         db,
+		scrapers:   make(map[string]Scraper),
+		browserMgr: browserMgr,
 	}
-	// 注册火山引擎爬虫
-	s.scrapers["volcengine"] = NewVolcengineScraper()
-	// 注册阿里云爬虫
-	s.scrapers["alibaba"] = NewAlibabaScraper()
+
+	volcKey := os.Getenv("VOLCENGINE_API_KEY")
+	aliKey := os.Getenv("ALIBABA_API_KEY")
+	qianfanKey := os.Getenv("QIANFAN_API_KEY")
+	hunyuanKey := os.Getenv("TENCENT_HUNYUAN_API_KEY")
+
+	// 注册火山引擎爬虫（API 模型列表 + 浏览器价格）
+	s.scrapers["volcengine"] = NewVolcengineScraper(volcKey, browserMgr)
+	// 注册阿里云爬虫（纯 API，无需浏览器）
+	s.scrapers["alibaba"] = NewAlibabaScraper(aliKey)
+	// 注册百度千帆爬虫（OpenAI 兼容 API + 硬编码价格）
+	s.scrapers["qianfan"] = NewQianfanScraper(qianfanKey)
+	// 注册腾讯混元爬虫（OpenAI 兼容 API + 硬编码价格）
+	s.scrapers["hunyuan"] = NewHunyuanScraper(hunyuanKey)
 	return s
+}
+
+// Close 关闭浏览器管理器，释放 Chromium 进程
+// 应在服务关闭时调用（如 main.go 的优雅退出逻辑中）
+func (s *PriceScraperService) Close() {
+	if s.browserMgr != nil {
+		s.browserMgr.Close()
+	}
 }
 
 // ScrapeAndPreview 爬取并预览价格差异（不写 DB）
@@ -188,9 +266,52 @@ func (s *PriceScraperService) ApplyPrices(ctx context.Context, supplierID uint, 
 	result := &ApplyResult{}
 	var changes []map[string]interface{} // 记录变更详情
 
+	// 预加载默认分类 ID（INSERT 新模型时使用）
+	var defaultCategoryID uint = 1
+	var firstCat model.ModelCategory
+	if err := s.db.First(&firstCat).Error; err == nil {
+		defaultCategoryID = firstCat.ID
+	}
+
 	// 事务写入
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		for _, u := range updates {
+			// ModelID == 0 → 新模型路径：先尝试按 (supplier_id, model_name) 查找，找不到则 INSERT
+			if u.ModelID == 0 {
+				if strings.TrimSpace(u.ModelName) == "" {
+					result.Errors = append(result.Errors, "新模型缺少 model_name，已跳过")
+					result.SkippedCount++
+					continue
+				}
+
+				// 先查是否已存在（避免并发/重试场景下的重复插入）
+				var existing model.AIModel
+				if err := tx.Where("supplier_id = ? AND model_name = ?", supplierID, u.ModelName).
+					First(&existing).Error; err == nil {
+					// 已存在 → 退化为 update 路径
+					u.ModelID = existing.ID
+				} else {
+					// 执行 INSERT
+					newModel, insertErr := s.insertNewModel(tx, supplierID, supplier.Code, defaultCategoryID, u)
+					if insertErr != nil {
+						result.Errors = append(result.Errors, fmt.Sprintf("新增模型 [%s] 失败: %v", u.ModelName, insertErr))
+						result.SkippedCount++
+						continue
+					}
+					changes = append(changes, map[string]interface{}{
+						"action":         "insert",
+						"model_id":       newModel.ID,
+						"model_name":     newModel.ModelName,
+						"new_input_rmb":  newModel.InputCostRMB,
+						"new_output_rmb": newModel.OutputCostRMB,
+						"pricing_unit":   newModel.PricingUnit,
+						"model_type":     newModel.ModelType,
+					})
+					result.InsertedCount++
+					continue
+				}
+			}
+
 			var aiModel model.AIModel
 			if err := tx.First(&aiModel, u.ModelID).Error; err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("模型 %d 不存在: %v", u.ModelID, err))
@@ -215,7 +336,41 @@ func (s *PriceScraperService) ApplyPrices(ctx context.Context, supplierID uint, 
 				"last_synced_at":  time.Now(),
 			}
 
-			// 更新阶梯价格（如果有）
+			// 更新计费单位、模型类型、变体（如果有）
+				if u.PricingUnit != "" {
+					updateFields["pricing_unit"] = u.PricingUnit
+				}
+				if u.ModelType != "" {
+					updateFields["model_type"] = u.ModelType
+				}
+				if u.Variant != "" {
+					updateFields["variant"] = u.Variant
+				}
+
+				// 更新缓存定价字段（如果有）
+				if u.SupportsCache {
+					updateFields["supports_cache"] = true
+				}
+				if u.CacheMechanism != "" {
+					updateFields["cache_mechanism"] = u.CacheMechanism
+				}
+				if u.CacheMinTokens > 0 {
+					updateFields["cache_min_tokens"] = u.CacheMinTokens
+				}
+				if u.CacheInputPriceRMB > 0 {
+					updateFields["cache_input_price_rmb"] = u.CacheInputPriceRMB
+				}
+				if u.CacheExplicitInputPriceRMB > 0 {
+					updateFields["cache_explicit_input_price_rmb"] = u.CacheExplicitInputPriceRMB
+				}
+				if u.CacheWritePriceRMB > 0 {
+					updateFields["cache_write_price_rmb"] = u.CacheWritePriceRMB
+				}
+				if u.CacheStoragePriceRMB > 0 {
+					updateFields["cache_storage_price_rmb"] = u.CacheStoragePriceRMB
+				}
+
+				// 更新阶梯价格（如果有）
 			if len(u.PriceTiers) > 0 {
 				tiersData := model.PriceTiersData{
 					Tiers:     u.PriceTiers,
@@ -228,7 +383,8 @@ func (s *PriceScraperService) ApplyPrices(ctx context.Context, supplierID uint, 
 				}
 			}
 
-			if err := tx.Model(&aiModel).Updates(updateFields).Error; err != nil {
+			// 显式 Where，避免 GORM v2 在 map Updates 时误判无 WHERE 条件
+			if err := tx.Model(&model.AIModel{}).Where("id = ?", aiModel.ID).Updates(updateFields).Error; err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("更新模型 %s 价格失败: %v", aiModel.ModelName, err))
 				result.SkippedCount++
 				continue
@@ -242,10 +398,11 @@ func (s *PriceScraperService) ApplyPrices(ctx context.Context, supplierID uint, 
 		changesJSON, _ := json.Marshal(changes)
 		errorsJSON, _ := json.Marshal(result.Errors)
 
+		affected := result.UpdatedCount + result.InsertedCount
 		status := "success"
-		if len(result.Errors) > 0 && result.UpdatedCount > 0 {
+		if len(result.Errors) > 0 && affected > 0 {
 			status = "partial_success"
-		} else if result.UpdatedCount == 0 {
+		} else if affected == 0 {
 			status = "failed"
 		}
 
@@ -256,7 +413,7 @@ func (s *PriceScraperService) ApplyPrices(ctx context.Context, supplierID uint, 
 			Status:        status,
 			FetchStatus:   "applied",
 			ModelsChecked: len(updates),
-			ModelsUpdated: result.UpdatedCount,
+			ModelsUpdated: affected, // 同步日志统计包含更新 + 新增
 			ModelsSkipped: result.SkippedCount,
 			Changes:       changesJSON,
 			Errors:        errorsJSON,
@@ -273,9 +430,15 @@ func (s *PriceScraperService) ApplyPrices(ctx context.Context, supplierID uint, 
 		return nil, fmt.Errorf("事务写入失败: %w", err)
 	}
 
+	// 清除公开模型列表缓存，使价格更新/新增立即生效
+	if result.UpdatedCount > 0 || result.InsertedCount > 0 {
+		middleware.CacheInvalidate("cache:/api/v1/public/models*")
+	}
+
 	log.Info("价格应用完成",
 		zap.Uint("supplier_id", supplierID),
 		zap.Int("updated", result.UpdatedCount),
+		zap.Int("inserted", result.InsertedCount),
 		zap.Int("skipped", result.SkippedCount))
 
 	return result, nil
@@ -332,6 +495,20 @@ func (s *PriceScraperService) matchScraper(name, code string) (Scraper, string) 
 		return s.scrapers["alibaba"], "alibaba"
 	}
 
+	// 百度千帆匹配
+	if strings.Contains(nameLower, "千帆") || strings.Contains(nameLower, "qianfan") ||
+		strings.Contains(codeLower, "qianfan") || strings.Contains(nameLower, "ernie") ||
+		strings.Contains(codeLower, "baidu_qianfan") {
+		return s.scrapers["qianfan"], "qianfan"
+	}
+
+	// 腾讯混元匹配
+	if strings.Contains(nameLower, "腾讯") || strings.Contains(nameLower, "混元") ||
+		strings.Contains(codeLower, "hunyuan") || strings.Contains(codeLower, "tencent") ||
+		strings.Contains(nameLower, "hunyuan") {
+		return s.scrapers["hunyuan"], "hunyuan"
+	}
+
 	return nil, ""
 }
 
@@ -369,19 +546,35 @@ func (s *PriceScraperService) buildDiffResult(supplier model.Supplier, scraped *
 
 	for _, sm := range scraped.Models {
 		item := PriceDiffItem{
-			ModelName:   sm.ModelName,
-			NewInputRMB: sm.InputPrice,
+			ModelName:    sm.ModelName,
+			NewInputRMB:  sm.InputPrice,
 			NewOutputRMB: sm.OutputPrice,
-			PriceTiers:  sm.PriceTiers,
-			Warnings:    sm.Warnings,
+			PriceTiers:   sm.PriceTiers,
+			PricingUnit:  sm.PricingUnit,
+			ModelType:    sm.ModelType,
+			Warnings:     sm.Warnings,
+			// 透传缓存定价字段，供前端构建 PriceUpdateRequest 时使用
+			SupportsCache:              sm.SupportsCache,
+			CacheMechanism:             sm.CacheMechanism,
+			CacheMinTokens:             sm.CacheMinTokens,
+			CacheInputPriceRMB:         sm.CacheInputPrice,
+			CacheExplicitInputPriceRMB: sm.CacheExplicitInputPrice,
+			CacheWritePriceRMB:         sm.CacheWritePrice,
+			CacheStoragePriceRMB:       sm.CacheStoragePrice,
+		}
+
+		// 默认计费单位
+		if item.PricingUnit == "" {
+			item.PricingUnit = PricingUnitPerMillionTokens
 		}
 
 		// 计算折扣后实际价格
 		item.ActualInputRMB = roundFloat(sm.InputPrice*discount, 4)
 		item.ActualOutputRMB = roundFloat(sm.OutputPrice*discount, 4)
 
-		// 查找匹配的现有模型
-		if existing, ok := modelMap[strings.ToLower(sm.ModelName)]; ok {
+		// 查找匹配的现有模型（精确匹配 + 前缀匹配）
+		existing, ok := findMatchingModel(sm.ModelName, modelMap)
+		if ok {
 			item.ModelID = existing.ID
 			item.CurrentInputRMB = existing.InputCostRMB
 			item.CurrentOutputRMB = existing.OutputCostRMB
@@ -431,4 +624,271 @@ func (s *PriceScraperService) buildDiffResult(supplier model.Supplier, scraped *
 func roundFloat(val float64, precision int) float64 {
 	ratio := math.Pow(10, float64(precision))
 	return math.Round(val*ratio) / ratio
+}
+
+// findMatchingModel 在 modelMap 中查找匹配的模型
+// 策略：1. 精确匹配  2. 前缀匹配（爬取名称为 DB 模型名的前缀）
+// 例如：爬取 "doubao-embedding-large-text"，DB 中有 "doubao-embedding-large-text-240915"
+func findMatchingModel(scrapedName string, modelMap map[string]model.AIModel) (model.AIModel, bool) {
+	scrapedLower := strings.ToLower(scrapedName)
+
+	// 1. 精确匹配
+	if m, ok := modelMap[scrapedLower]; ok {
+		return m, true
+	}
+
+	// 2. 前缀匹配：选择名称最新（版本号最大）的模型
+	var bestMatch model.AIModel
+	bestKey := ""
+	for key, m := range modelMap {
+		if strings.HasPrefix(key, scrapedLower+"-") {
+			// 选择 key 字典序最大的（通常版本日期越大 = 越新）
+			if bestKey == "" || key > bestKey {
+				bestMatch = m
+				bestKey = key
+			}
+		}
+	}
+	if bestKey != "" {
+		return bestMatch, true
+	}
+
+	return model.AIModel{}, false
+}
+
+// insertNewModel 为价格爬取到但数据库尚无记录的新模型执行 INSERT
+// - CategoryID 使用默认分类（或第一个可用分类）
+// - SupplierID 从 Apply 入参传入
+// - 计费单位 / 模型类型：请求体提供则使用；否则按模型名推断，最终 fallback 为 LLM+per_million_tokens
+// - Status 保持默认 "offline"，等待后续一键检测激活
+// - IsActive 对带日期后缀的旧版本模型置为 false，其余默认 true
+func (s *PriceScraperService) insertNewModel(tx *gorm.DB, supplierID uint, supplierCode string, defaultCategoryID uint, u PriceUpdateRequest) (*model.AIModel, error) {
+	modelName := strings.TrimSpace(u.ModelName)
+	if !isValidModelName(modelName) {
+		return nil, fmt.Errorf("模型名称非法或包含乱码: %q", modelName)
+	}
+	displayName := u.DisplayName
+	if displayName == "" {
+		displayName = modelName
+	}
+
+	// 模型类型与计费单位：优先采用前端/爬虫推断值，否则按名称回退
+	modelType := u.ModelType
+	if modelType == "" {
+		modelType = inferModelTypeFromName(modelName)
+	}
+	pricingUnit := u.PricingUnit
+	if pricingUnit == "" {
+		pricingUnit = inferPricingUnitFromName(modelName, modelType)
+	}
+	// 矫正：非 LLM 类模型不应使用 per_million_tokens（爬虫可能对所有模型一律打 token 标签）
+	// VideoGeneration 除外（Seedance 等视频模型确实按 token 计费）
+	if pricingUnit == PricingUnitPerMillionTokens &&
+		(modelType == "ImageGeneration" || modelType == "TTS" || modelType == "ASR" || modelType == "Rerank") {
+		pricingUnit = inferPricingUnitFromName(modelName, modelType)
+	}
+
+	// 带日期后缀（如 qwen-max-1201）默认停用
+	isActive := !hasDatedSuffix(modelName)
+
+	now := time.Now()
+	newModel := &model.AIModel{
+		CategoryID:    defaultCategoryID,
+		SupplierID:    supplierID,
+		ModelName:     modelName,
+		DisplayName:   displayName,
+		Status:        "offline",
+		Source:        "auto",
+		IsActive:      isActive,
+		ModelType:     modelType,
+		PricingUnit:   pricingUnit,
+		Variant:       u.Variant,
+		InputCostRMB:  u.InputCostRMB,
+		OutputCostRMB: u.OutputCostRMB,
+		Currency:      "CREDIT", // 与现有模型默认值保持一致
+		LastSyncedAt:  &now,
+		Tags:          inferTagsForScraper(modelName, supplierCode),
+	}
+
+	// 缓存定价字段
+	if u.SupportsCache {
+		newModel.SupportsCache = true
+	}
+	if u.CacheMechanism != "" {
+		newModel.CacheMechanism = u.CacheMechanism
+	}
+	if u.CacheMinTokens > 0 {
+		newModel.CacheMinTokens = u.CacheMinTokens
+	}
+	if u.CacheInputPriceRMB > 0 {
+		newModel.CacheInputPriceRMB = u.CacheInputPriceRMB
+	}
+	if u.CacheExplicitInputPriceRMB > 0 {
+		newModel.CacheExplicitInputPriceRMB = u.CacheExplicitInputPriceRMB
+	}
+	if u.CacheWritePriceRMB > 0 {
+		newModel.CacheWritePriceRMB = u.CacheWritePriceRMB
+	}
+	if u.CacheStoragePriceRMB > 0 {
+		newModel.CacheStoragePriceRMB = u.CacheStoragePriceRMB
+	}
+
+	// 阶梯价格
+	if len(u.PriceTiers) > 0 {
+		tiersData := model.PriceTiersData{
+			Tiers:     u.PriceTiers,
+			Currency:  "CNY",
+			UpdatedAt: now,
+		}
+		if tiersJSON, err := json.Marshal(tiersData); err == nil {
+			newModel.PriceTiers = tiersJSON
+		}
+	}
+
+	if err := tx.Create(newModel).Error; err != nil {
+		return nil, err
+	}
+	return newModel, nil
+}
+
+// inferModelTypeFromName 按模型名关键词推断模型类型
+// 与 modeldiscovery.inferModelTypeFromID 保持同义，独立实现避免 cross-package 依赖
+func inferModelTypeFromName(id string) string {
+	s := strings.ToLower(id)
+	switch {
+	case containsAnyStr(s, "image", "wan", "seedream", "cogview", "dall-e", "gpt-image", "imagen", "hunyuan-image"):
+		return "ImageGeneration"
+	case containsAnyStr(s, "video", "seaweed", "seedance", "wanx-video", "cogvideo", "veo", "hunyuan-video"):
+		return "VideoGeneration"
+	case containsAnyStr(s, "embedding", "text-embedding"):
+		return "Embedding"
+	case containsAnyStr(s, "tts", "cosyvoice", "speech-synthesis", "speech-02"):
+		return "TTS"
+	case containsAnyStr(s, "asr", "paraformer", "sensevoice", "whisper", "recording"):
+		return "ASR"
+	case containsAnyStr(s, "rerank"):
+		return "Rerank"
+	case containsAnyStr(s, "vl", "omni", "-mm"):
+		return "VLM"
+	default:
+		return "LLM"
+	}
+}
+
+// inferPricingUnitFromName 按模型名 + 类型推断计费单位
+func inferPricingUnitFromName(id, modelType string) string {
+	s := strings.ToLower(id)
+	switch modelType {
+	case "ImageGeneration":
+		return PricingUnitPerImage
+	case "VideoGeneration":
+		if containsAnyStr(s, "seedance") {
+			return PricingUnitPerMillionTokens
+		}
+		return PricingUnitPerSecond
+	case "TTS", "SpeechSynthesis", "TextToSpeech":
+		if containsAnyStr(s, "qwen", "openai", "tts-1", "speech-02", "minimax-speech") {
+			return PricingUnitPerMillionCharacters
+		}
+		return PricingUnitPer10kCharacters
+	case "ASR", "SpeechRecognition", "SpeechToText":
+		if containsAnyStr(s, "whisper") {
+			return PricingUnitPerMinute
+		}
+		return PricingUnitPerHour
+	case "Rerank":
+		return PricingUnitPerCall
+	default:
+		return PricingUnitPerMillionTokens
+	}
+}
+
+// hasDatedSuffix 检测形如 qwen-max-1201 的 MMDD 日期后缀
+func hasDatedSuffix(modelName string) bool {
+	name := strings.ToLower(modelName)
+	if len(name) < 5 {
+		return false
+	}
+	if name[len(name)-5] != '-' {
+		return false
+	}
+	for _, c := range name[len(name)-4:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// inferTagsForScraper 基于供应商 code + 模型名的一层简化标签推断
+// 仅注入供应商品牌 + 按关键词命中的主流品牌，确保价格流程独立可运行
+func inferTagsForScraper(modelName, supplierCode string) string {
+	name := strings.ToLower(modelName)
+	seen := map[string]bool{}
+	var tags []string
+	add := func(t string) {
+		if t != "" && !seen[t] {
+			seen[t] = true
+			tags = append(tags, t)
+		}
+	}
+	// 按名称关键词
+	switch {
+	case strings.Contains(name, "qwen"), strings.Contains(name, "wanx"):
+		add("Qwen")
+	case strings.Contains(name, "doubao"), strings.Contains(name, "seedream"), strings.Contains(name, "seedance"):
+		add("Doubao")
+	case strings.Contains(name, "deepseek"):
+		add("DeepSeek")
+	case strings.Contains(name, "glm"), strings.Contains(name, "cogview"), strings.Contains(name, "cogvideo"):
+		add("ChatGLM")
+	case strings.Contains(name, "moonshot"), strings.Contains(name, "kimi"):
+		add("Moonshot")
+	case strings.Contains(name, "gpt"), strings.Contains(name, "dall-e"), strings.Contains(name, "whisper"):
+		add("OpenAI")
+	case strings.Contains(name, "claude"):
+		add("Claude")
+	case strings.Contains(name, "gemini"):
+		add("Gemini")
+	}
+	// 按供应商 code
+	switch strings.ToLower(supplierCode) {
+	case "alibaba", "aliyun", "dashscope":
+		add("阿里云")
+		add("百炼")
+	case "volcengine", "volc":
+		add("火山引擎")
+		add("豆包")
+	}
+	return strings.Join(tags, ",")
+}
+
+func containsAnyStr(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// isValidModelName 校验模型名称是否为合法的模型 ID
+// - 仅允许 a-z A-Z 0-9 - _ . : / 字符
+// - 长度 2-128
+// - 拦截爬虫编码错误导致的 mojibake（如 "ģ��"、含替换字符 U+FFFD 的串）
+func isValidModelName(name string) bool {
+	if len(name) < 2 || len(name) > 128 {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == '.' || r == ':' || r == '/':
+		default:
+			return false
+		}
+	}
+	return true
 }

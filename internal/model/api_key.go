@@ -11,6 +11,7 @@ type ApiKey struct {
 	Name            string     `gorm:"type:varchar(100);not null" json:"name"`              // 密钥名称
 	KeyHash         string     `gorm:"type:varchar(255);index;not null" json:"-"`           // SHA256 哈希（不输出）
 	KeyPrefix       string     `gorm:"type:varchar(8);not null" json:"key_prefix"`          // 前 8 位用于展示
+	KeyEncrypted    string     `gorm:"type:text" json:"-"`                                 // AES-GCM 加密存储的完整密钥（可解密恢复）
 	IsActive        bool       `gorm:"default:true" json:"is_active"`                       // 是否启用
 	ExpiresAt       *time.Time `json:"expires_at,omitempty"`                                // 过期时间
 	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`                              // 最后使用时间

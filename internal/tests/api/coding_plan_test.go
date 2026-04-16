@@ -403,10 +403,4 @@ func TestV1CompletionsBadRequest(t *testing.T) {
 	}
 }
 
-// min 返回两个整数中较小的那个
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
+// Go 1.21+ 内置 min 函数，不再需要自定义

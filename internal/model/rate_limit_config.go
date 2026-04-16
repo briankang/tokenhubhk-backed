@@ -27,6 +27,7 @@ type UserQuotaConfig struct {
 	MaxTokensPerReq  int     `gorm:"default:32768" json:"maxTokensPerReq"`             // 单次请求最大Token数
 	MaxConcurrent    int     `gorm:"default:5" json:"maxConcurrent"`                   // 最大并发请求数
 	CustomRPM        int     `gorm:"default:0" json:"customRpm"`                       // 自定义每分钟请求数，0=使用全局默认
+	CustomTPM        int     `gorm:"default:0" json:"customTpm"`                       // 自定义每分钟Token数，0=使用全局默认
 }
 
 // TableName 指定用户限额配置表名

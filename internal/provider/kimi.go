@@ -59,7 +59,7 @@ func (p *KimiProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespons
 	}
 
 	oaiReq := convertToOpenAIFormat(req, false)
-	body, err := json.Marshal(oaiReq)
+	body, err := MarshalWithExtra(oaiReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider kimi: marshal request: %w", err)
 	}
@@ -95,7 +95,7 @@ func (p *KimiProvider) StreamChat(ctx context.Context, req *ChatRequest) (Stream
 	}
 
 	oaiReq := convertToOpenAIFormat(req, true)
-	body, err := json.Marshal(oaiReq)
+	body, err := MarshalWithExtra(oaiReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider kimi: marshal request: %w", err)
 	}

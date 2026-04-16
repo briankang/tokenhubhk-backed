@@ -163,7 +163,7 @@ func (p *WenxinProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespo
 	}
 
 	wReq := p.convertRequest(req, false)
-	body, err := json.Marshal(wReq)
+	body, err := MarshalWithExtra(wReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider wenxin: marshal request: %w", err)
 	}
@@ -211,7 +211,7 @@ func (p *WenxinProvider) StreamChat(ctx context.Context, req *ChatRequest) (Stre
 	}
 
 	wReq := p.convertRequest(req, true)
-	body, err := json.Marshal(wReq)
+	body, err := MarshalWithExtra(wReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider wenxin: marshal request: %w", err)
 	}

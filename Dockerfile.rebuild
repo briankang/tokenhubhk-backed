@@ -1,0 +1,19 @@
+# 使用 BuildKit 缓存的 builder 阶段编译
+FROM golang:1.23-alpine AS builder
+RUN apk update && apk add --no-cache git ca-certificates tzdata
+ENV GOPROXY=https://goproxy.cn,https://goproxy.io,https://proxy.golang.org,direct
+ENV GONOSUMCHECK=*
+ENV GONOSUMDB=*
+ENV GOFLAGS=-insecure
+WORKDIR /build
+COPY go.mod go.sum* ./
+RUN for i in 1 2 3 4 5; do echo "=== Attempt $i ===" && go mod download && break || sleep 3; done
+COPY . .
+RUN for i in 1 2 3 4 5; do echo "=== go mod tidy attempt $i ===" && go mod tidy && break || sleep 5; done
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o server ./cmd/server/
+
+# 使用已有的运行时镜像作为基础，避免重新下载 chromium
+FROM token-go-server:latest
+COPY --from=builder /build/server /app/server
+COPY --from=builder /build/configs /app/configs
+COPY --from=builder /build/internal/pkg/i18n/locales /app/internal/pkg/i18n/locales

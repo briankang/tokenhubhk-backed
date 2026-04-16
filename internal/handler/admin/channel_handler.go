@@ -36,35 +36,41 @@ func (h *ChannelHandler) Register(rg *gin.RouterGroup) {
 
 // createChannelReq is the request body for creating a channel.
 type createChannelReq struct {
-	Name           string `json:"name" binding:"required"`
-	SupplierID     uint   `json:"supplier_id" binding:"required"`
-	Type           string `json:"type" binding:"required"`
-	Endpoint       string `json:"endpoint" binding:"required"`
-	APIKey         string `json:"api_key" binding:"required"`
-	Models         []byte `json:"models,omitempty"`
-	Weight         int    `json:"weight"`
-	Priority       int    `json:"priority"`
-	Status         string `json:"status"`
-	MaxConcurrency int    `json:"max_concurrency"`
-	QPM            int    `json:"qpm"`
-	PreferenceTag  string `json:"preference_tag"` // 偏好标签: availability/cost/speed
+	Name                  string `json:"name" binding:"required"`
+	SupplierID            uint   `json:"supplier_id" binding:"required"`
+	Type                  string `json:"type" binding:"required"`
+	Endpoint              string `json:"endpoint" binding:"required"`
+	APIKey                string `json:"api_key" binding:"required"`
+	Models                []byte `json:"models,omitempty"`
+	Weight                int    `json:"weight"`
+	Priority              int    `json:"priority"`
+	Status                string `json:"status"`
+	MaxConcurrency        int    `json:"max_concurrency"`
+	QPM                   int    `json:"qpm"`
+	PreferenceTag         string `json:"preference_tag"`         // 偏好标签: availability/cost/speed
+	SupportedCapabilities string `json:"supported_capabilities"` // 支持能力，逗号分隔: chat,image,video,tts,asr,embedding
 }
 
 // channelFromCreateReq converts a create request to a model.Channel.
 func channelFromCreateReq(req *createChannelReq) *model.Channel {
+	caps := req.SupportedCapabilities
+	if caps == "" {
+		caps = "chat"
+	}
 	return &model.Channel{
-		Name:           req.Name,
-		SupplierID:     req.SupplierID,
-		Type:           req.Type,
-		Endpoint:       req.Endpoint,
-		APIKey:         req.APIKey,
-		Models:         req.Models,
-		Weight:         req.Weight,
-		Priority:       req.Priority,
-		Status:         req.Status,
-		MaxConcurrency: req.MaxConcurrency,
-		QPM:            req.QPM,
-		PreferenceTag:  req.PreferenceTag,
+		Name:                  req.Name,
+		SupplierID:            req.SupplierID,
+		Type:                  req.Type,
+		Endpoint:              req.Endpoint,
+		APIKey:                req.APIKey,
+		Models:                req.Models,
+		Weight:                req.Weight,
+		Priority:              req.Priority,
+		Status:                req.Status,
+		MaxConcurrency:        req.MaxConcurrency,
+		QPM:                   req.QPM,
+		PreferenceTag:         req.PreferenceTag,
+		SupportedCapabilities: caps,
 	}
 }
 

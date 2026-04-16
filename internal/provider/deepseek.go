@@ -57,7 +57,7 @@ func (p *DeepSeekProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRes
 	}
 
 	oaiReq := convertToOpenAIFormat(req, false)
-	body, err := json.Marshal(oaiReq)
+	body, err := MarshalWithExtra(oaiReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider deepseek: marshal request: %w", err)
 	}
@@ -93,7 +93,7 @@ func (p *DeepSeekProvider) StreamChat(ctx context.Context, req *ChatRequest) (St
 	}
 
 	oaiReq := convertToOpenAIFormat(req, true)
-	body, err := json.Marshal(oaiReq)
+	body, err := MarshalWithExtra(oaiReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider deepseek: marshal request: %w", err)
 	}

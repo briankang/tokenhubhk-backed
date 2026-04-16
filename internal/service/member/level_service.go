@@ -3,6 +3,7 @@ package member
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -23,28 +24,44 @@ const (
 	memberProfileCachePrefix = "member:profile:"
 	// memberProfileCacheTTL 用户档案缓存时长（5分钟）
 	memberProfileCacheTTL = 5 * time.Minute
+	// memberRateLimitsCachePrefix 用户限流配置缓存前缀
+	memberRateLimitsCachePrefix = "member:rate_limits:"
+	// memberRateLimitsCacheTTL 用户限流配置缓存时长（5分钟）
+	memberRateLimitsCacheTTL = 5 * time.Minute
 )
 
 // MemberProfileResponse 会员档案响应结构
+// 字段名与前端 MemberProfile 接口对齐
 type MemberProfileResponse struct {
-	UserID       uint               `json:"user_id"`
-	Level        model.MemberLevel  `json:"level"`
-	TotalConsume float64            `json:"total_consume"`
-	NextLevel    *model.MemberLevel `json:"next_level,omitempty"` // 下一级信息（V4则为nil）
-	GapToNext    float64            `json:"gap_to_next"`          // 距下一级差额
-	Benefits     map[string]interface{} `json:"benefits"`         // 当前权益
+	ID              uint              `json:"id"`
+	UserID          uint              `json:"user_id"`
+	MemberLevelID   uint              `json:"member_level_id"`
+	MemberLevel     model.MemberLevel `json:"member_level"`
+	TotalConsume    float64           `json:"total_consume"`
+	MonthConsume1   float64           `json:"month_consume_1"`
+	MonthConsume2   float64           `json:"month_consume_2"`
+	MonthConsume3   float64           `json:"month_consume_3"`
+	DegradeWarnings int               `json:"degrade_warnings"`
 }
 
 // UpgradeProgressResponse 升级进度响应结构
+// 字段名与前端 MemberProgress 接口对齐
 type UpgradeProgressResponse struct {
-	CurrentLevel  string  `json:"current_level"`
-	NextLevel     string  `json:"next_level"`
-	CurrentValue  float64 `json:"current_value"`  // 当前累计消费
-	RequiredValue float64 `json:"required_value"` // 下一级门槛
-	Progress      float64 `json:"progress"`       // 进度百分比 0-100
+	CurrentLevel    *model.MemberLevel `json:"current_level"`
+	NextLevel       *model.MemberLevel `json:"next_level"`
+	CurrentSpend    float64            `json:"current_spend"`
+	NextThreshold   float64            `json:"next_threshold"`
+	ProgressPercent float64            `json:"progress_percent"` // 进度百分比 0-100
+	RemainingSpend  float64            `json:"remaining_spend"`
 }
 
-// MemberLevelService 会员等级服务，管理用户会员等级的初始化、升降级、赠送额度等
+// UserRateLimits 用户限流配置（RPM/TPM）
+type UserRateLimits struct {
+	RPM int `json:"rpm"` // 每分钟请求数
+	TPM int `json:"tpm"` // 每分钟最大Token数
+}
+
+// MemberLevelService 会员等级服务，管理用户会员等级的初始化、升降级等
 type MemberLevelService struct {
 	db    *gorm.DB
 	redis *goredis.Client
@@ -108,16 +125,16 @@ func (s *MemberLevelService) CheckAndUpgrade(ctx context.Context, userID uint) e
 		return nil // 无余额记录，跳过
 	}
 	totalConsumeCredits := ub.TotalConsumed
-	
+
 	// 更新档案中的累计消费字段（转换为人民币用于展示）
 	profile.TotalConsume = credits.CreditsToRMB(totalConsumeCredits)
-	
+
 	// 查询所有可用等级，按 rank 降序排列（从最高等级开始匹配）
 	levels, err := s.getAllLevelsFromDB(ctx)
 	if err != nil {
 		return err
 	}
-	
+
 	// 从最高等级开始匹配，找到第一个满足门槛的等级
 	// MinTotalConsume 为积分单位
 	var targetLevel *model.MemberLevel
@@ -141,6 +158,7 @@ func (s *MemberLevelService) CheckAndUpgrade(ctx context.Context, userID uint) e
 		}
 		// 清除缓存
 		s.invalidateProfileCache(ctx, userID)
+		s.invalidateRateLimitsCache(ctx, userID)
 	} else {
 		// 仅更新累计消费字段（转换为人民币）
 		s.db.WithContext(ctx).Model(&profile).UpdateColumn("total_consume", credits.CreditsToRMB(totalConsumeCredits))
@@ -203,82 +221,7 @@ func (s *MemberLevelService) CheckAndDegradeAll(ctx context.Context) error {
 		profile.LastDegradeCheck = &now
 		s.db.WithContext(ctx).Save(&profile)
 		s.invalidateProfileCache(ctx, profile.UserID)
-	}
-
-	return nil
-}
-
-// GrantMonthlyGifts 定时任务：每月1号为所有V1+会员发放赠送额度
-// 逻辑：查询所有V1-V4会员 → 按等级发放 MonthlyGift → 写余额记录
-func (s *MemberLevelService) GrantMonthlyGifts(ctx context.Context) error {
-	// 查询所有 V1 及以上且 MonthlyGift > 0 的会员档案
-	var profiles []model.UserMemberProfile
-	if err := s.db.WithContext(ctx).
-		Preload("MemberLevel").
-		Joins("JOIN member_levels ON member_levels.id = user_member_profiles.member_level_id").
-		Where("member_levels.rank > 0 AND member_levels.monthly_gift > 0").
-		Find(&profiles).Error; err != nil {
-		return fmt.Errorf("查询会员档案失败: %w", err)
-	}
-
-	now := time.Now()
-	currentMonth := now.Format("2006-01")
-
-	for _, profile := range profiles {
-		// 检查本月是否已发放（防止重复发放）
-		if profile.LastGiftAt != nil && profile.LastGiftAt.Format("2006-01") == currentMonth {
-			continue
-		}
-
-		// MonthlyGift 为积分单位，转换为人民币用于记录
-		giftAmountRMB := credits.CreditsToRMB(profile.MemberLevel.MonthlyGift)
-		if giftAmountRMB <= 0 {
-			continue
-		}
-		
-		// 在事务中发放赠送额度
-		err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			// 查询用户余额
-			var ub model.UserBalance
-			if err := tx.Where("user_id = ?", profile.UserID).First(&ub).Error; err != nil {
-				if err == gorm.ErrRecordNotFound {
-					return nil // 无余额记录，跳过
-				}
-				return err
-			}
-		
-			// 增加免费额度（积分为单位）
-			before := ub.FreeQuota
-			ub.FreeQuota += profile.MemberLevel.MonthlyGift
-			ub.FreeQuotaRMB = credits.CreditsToRMB(ub.FreeQuota)
-			if err := tx.Save(&ub).Error; err != nil {
-				return fmt.Errorf("更新赠送额度失败: %w", err)
-			}
-		
-			// 写入余额变动记录
-			record := &model.BalanceRecord{
-				UserID:        profile.UserID,
-				TenantID:      ub.TenantID,
-				Type:          "GIFT",
-				Amount:        profile.MemberLevel.MonthlyGift,
-				AmountRMB:     giftAmountRMB,
-				BeforeBalance: before,
-				AfterBalance:  ub.FreeQuota,
-				Remark:        fmt.Sprintf("会员%s月度赠送额度", profile.MemberLevel.LevelName),
-			}
-			if err := tx.Create(record).Error; err != nil {
-				return fmt.Errorf("创建赠送记录失败: %w", err)
-			}
-
-			// 更新最后发放时间
-			return tx.Model(&model.UserMemberProfile{}).
-				Where("id = ?", profile.ID).
-				Update("last_gift_at", now).Error
-		})
-
-		if err != nil {
-			continue // 单个用户失败不影响其他用户
-		}
+		s.invalidateRateLimitsCache(ctx, profile.UserID)
 	}
 
 	return nil
@@ -297,30 +240,16 @@ func (s *MemberLevelService) GetProfile(ctx context.Context, userID uint) (*Memb
 		return nil, fmt.Errorf("查询会员档案失败: %w", err)
 	}
 
-	// 获取所有等级
-	levels, err := s.getAllLevelsFromDB(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	resp := &MemberProfileResponse{
-		UserID:       userID,
-		Level:        profile.MemberLevel,
-		TotalConsume: profile.TotalConsume,
-		Benefits:     s.buildBenefits(&profile.MemberLevel),
-	}
-
-	// 查找下一级
-	for i := range levels {
-		if levels[i].Rank == profile.MemberLevel.Rank+1 {
-			resp.NextLevel = &levels[i]
-			// GapToNext 为人民币值
-			resp.GapToNext = roundTo6(credits.CreditsToRMB(levels[i].MinTotalConsume) - profile.TotalConsume)
-			if resp.GapToNext < 0 {
-				resp.GapToNext = 0
-			}
-			break
-		}
+		ID:              profile.ID,
+		UserID:          userID,
+		MemberLevelID:   profile.MemberLevelID,
+		MemberLevel:     profile.MemberLevel,
+		TotalConsume:    profile.TotalConsume,
+		MonthConsume1:   profile.MonthConsume1,
+		MonthConsume2:   profile.MonthConsume2,
+		MonthConsume3:   profile.MonthConsume3,
+		DegradeWarnings: profile.DegradeWarnings,
 	}
 
 	return resp, nil
@@ -369,21 +298,27 @@ func (s *MemberLevelService) GetUpgradeProgress(ctx context.Context, userID uint
 		return nil, err
 	}
 
+	currentLevel := profile.MemberLevel
 	resp := &UpgradeProgressResponse{
-		CurrentLevel: profile.MemberLevel.LevelCode,
-		CurrentValue: profile.TotalConsume,
+		CurrentLevel: &currentLevel,
+		CurrentSpend: profile.TotalConsume,
 	}
 
 	// 查找下一级
 	for i := range levels {
 		if levels[i].Rank == profile.MemberLevel.Rank+1 {
-			resp.NextLevel = levels[i].LevelCode
-			resp.RequiredValue = credits.CreditsToRMB(levels[i].MinTotalConsume)
+			nextLevel := levels[i]
+			resp.NextLevel = &nextLevel
+			resp.NextThreshold = credits.CreditsToRMB(nextLevel.MinTotalConsume)
+			resp.RemainingSpend = roundTo6(resp.NextThreshold - resp.CurrentSpend)
+			if resp.RemainingSpend < 0 {
+				resp.RemainingSpend = 0
+			}
 			// 计算进度百分比
-			if resp.RequiredValue > 0 {
-				resp.Progress = roundTo6(resp.CurrentValue / resp.RequiredValue * 100)
-				if resp.Progress > 100 {
-					resp.Progress = 100
+			if resp.NextThreshold > 0 {
+				resp.ProgressPercent = roundTo6(resp.CurrentSpend / resp.NextThreshold * 100)
+				if resp.ProgressPercent > 100 {
+					resp.ProgressPercent = 100
 				}
 			}
 			break
@@ -391,9 +326,8 @@ func (s *MemberLevelService) GetUpgradeProgress(ctx context.Context, userID uint
 	}
 
 	// 已达最高等级
-	if resp.NextLevel == "" {
-		resp.NextLevel = "MAX"
-		resp.Progress = 100
+	if resp.NextLevel == nil {
+		resp.ProgressPercent = 100
 	}
 
 	return resp, nil
@@ -422,6 +356,102 @@ func (s *MemberLevelService) GetEffectiveDiscount(ctx context.Context, userID ui
 	return discount, nil
 }
 
+// GetUserRateLimits 获取用户的限流配置（RPM/TPM），基于会员等级
+// 优先使用 UserQuotaConfig.CustomRPM 覆盖，否则使用会员等级默认值
+// Redis 缓存 5 分钟
+func (s *MemberLevelService) GetUserRateLimits(ctx context.Context, userID uint) (*UserRateLimits, error) {
+	// 尝试从 Redis 缓存读取
+	if s.redis != nil {
+		cacheKey := fmt.Sprintf("%s%d", memberRateLimitsCachePrefix, userID)
+		val, err := s.redis.Get(ctx, cacheKey).Bytes()
+		if err == nil {
+			var limits UserRateLimits
+			if json.Unmarshal(val, &limits) == nil {
+				return &limits, nil
+			}
+		}
+	}
+
+	// 查询用户会员等级
+	var profile model.UserMemberProfile
+	if err := s.db.WithContext(ctx).
+		Preload("MemberLevel").
+		Where("user_id = ?", userID).
+		First(&profile).Error; err != nil {
+		// 无档案，返回默认值
+		return &UserRateLimits{RPM: 60, TPM: 100000}, nil
+	}
+
+	limits := &UserRateLimits{
+		RPM: profile.MemberLevel.DefaultRPM,
+		TPM: profile.MemberLevel.DefaultTPM,
+	}
+
+	// 检查用户级覆盖（UserQuotaConfig.CustomRPM / CustomTPM）
+	var quotaCfg model.UserQuotaConfig
+	if err := s.db.WithContext(ctx).Where("user_id = ?", userID).First(&quotaCfg).Error; err == nil {
+		if quotaCfg.CustomRPM > 0 {
+			limits.RPM = quotaCfg.CustomRPM
+		}
+		if quotaCfg.CustomTPM > 0 {
+			limits.TPM = quotaCfg.CustomTPM
+		}
+	}
+
+	// 写入缓存
+	if s.redis != nil {
+		cacheKey := fmt.Sprintf("%s%d", memberRateLimitsCachePrefix, userID)
+		if data, err := json.Marshal(limits); err == nil {
+			_ = s.redis.Set(ctx, cacheKey, data, memberRateLimitsCacheTTL).Err()
+		}
+	}
+
+	return limits, nil
+}
+
+// BatchSetUserRateLimits 批量为指定用户设置自定义 RPM / TPM 覆盖
+// rpm/tpm 传 0 表示不修改该字段；当至少一项 > 0 时 upsert UserQuotaConfig
+// 完成后清理 Redis 缓存 member:rate_limits:{userId}
+func (s *MemberLevelService) BatchSetUserRateLimits(ctx context.Context, userIDs []uint, rpm int, tpm int) (int, error) {
+	if len(userIDs) == 0 {
+		return 0, nil
+	}
+	if rpm <= 0 && tpm <= 0 {
+		return 0, fmt.Errorf("at least one of rpm/tpm must be > 0")
+	}
+
+	updated := 0
+	for _, uid := range userIDs {
+		if uid == 0 {
+			continue
+		}
+		var cfg model.UserQuotaConfig
+		err := s.db.WithContext(ctx).Where("user_id = ?", uid).First(&cfg).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			cfg = model.UserQuotaConfig{UserID: uid}
+		} else if err != nil {
+			return updated, fmt.Errorf("query quota config user=%d: %w", uid, err)
+		}
+		if rpm > 0 {
+			cfg.CustomRPM = rpm
+		}
+		if tpm > 0 {
+			cfg.CustomTPM = tpm
+		}
+		if err := s.db.WithContext(ctx).Save(&cfg).Error; err != nil {
+			return updated, fmt.Errorf("save quota config user=%d: %w", uid, err)
+		}
+		updated++
+
+		// 清理该用户 Redis 限流缓存
+		if s.redis != nil {
+			cacheKey := fmt.Sprintf("%s%d", memberRateLimitsCachePrefix, uid)
+			_ = s.redis.Del(ctx, cacheKey).Err()
+		}
+	}
+	return updated, nil
+}
+
 // RotateMonthConsume 月末轮转月消费数据（定时任务调用）
 // 将 MonthConsume1→MonthConsume2, MonthConsume2→MonthConsume3
 // 然后将 MonthConsume1 设为当月实际消费
@@ -448,20 +478,7 @@ func (s *MemberLevelService) getAllLevelsFromDB(ctx context.Context) ([]model.Me
 	return levels, nil
 }
 
-// buildBenefits 构建会员权益描述 map
-// 金额相关字段转换为人民币用于展示
-func (s *MemberLevelService) buildBenefits(level *model.MemberLevel) map[string]interface{} {
-	benefits := map[string]interface{}{
-		"model_discount":     level.ModelDiscount,
-		"monthly_gift":       credits.CreditsToRMB(level.MonthlyGift),
-		"max_tokens_per_req": level.MaxTokensPerReq,
-		"daily_limit":        credits.CreditsToRMB(level.DailyLimit),
-	}
-	return benefits
-}
-
 // UpdateLevel 管理员更新会员等级配置（部分更新）
-// 自动处理 RMB → 积分换算：前端传 RMB 字段时同步更新对应积分字段
 func (s *MemberLevelService) UpdateLevel(ctx context.Context, levelID uint, updates map[string]interface{}) (*model.MemberLevel, error) {
 	var level model.MemberLevel
 	if err := s.db.WithContext(ctx).First(&level, levelID).Error; err != nil {
@@ -474,18 +491,8 @@ func (s *MemberLevelService) UpdateLevel(ctx context.Context, levelID uint, upda
 			updates["min_total_consume"] = int64(rmb * 10000)
 		}
 	}
-	if rmbVal, ok := updates["monthly_gift_rmb"]; ok {
-		if rmb, ok := rmbVal.(float64); ok {
-			updates["monthly_gift"] = int64(rmb * 10000)
-		}
-	}
-	if rmbVal, ok := updates["daily_limit_rmb"]; ok {
-		if rmb, ok := rmbVal.(float64); ok {
-			updates["daily_limit"] = int64(rmb * 10000)
-		}
-	}
 
-	if err := s.db.WithContext(ctx).Model(&level).Updates(updates).Error; err != nil {
+	if err := s.db.WithContext(ctx).Model(&model.MemberLevel{}).Where("id = ?", level.ID).Updates(updates).Error; err != nil {
 		return nil, fmt.Errorf("更新会员等级失败: %w", err)
 	}
 
@@ -501,12 +508,6 @@ func (s *MemberLevelService) CreateLevel(level *model.MemberLevel) error {
 	// 自动换算: RMB -> 积分（前端传入 RMB 字段，后端同步写入积分字段）
 	if level.MinTotalConsumeRMB > 0 && level.MinTotalConsume == 0 {
 		level.MinTotalConsume = int64(level.MinTotalConsumeRMB * 10000)
-	}
-	if level.MonthlyGiftRMB > 0 && level.MonthlyGift == 0 {
-		level.MonthlyGift = int64(level.MonthlyGiftRMB * 10000)
-	}
-	if level.DailyLimitRMB > 0 && level.DailyLimit == 0 {
-		level.DailyLimit = int64(level.DailyLimitRMB * 10000)
 	}
 	result := s.db.Create(level)
 	if result.Error != nil {
@@ -540,6 +541,14 @@ func (s *MemberLevelService) clearCache() {
 func (s *MemberLevelService) invalidateProfileCache(ctx context.Context, userID uint) {
 	if s.redis != nil {
 		key := fmt.Sprintf("%s%d", memberProfileCachePrefix, userID)
+		_ = s.redis.Del(ctx, key).Err()
+	}
+}
+
+// invalidateRateLimitsCache 清除用户限流配置缓存
+func (s *MemberLevelService) invalidateRateLimitsCache(ctx context.Context, userID uint) {
+	if s.redis != nil {
+		key := fmt.Sprintf("%s%d", memberRateLimitsCachePrefix, userID)
 		_ = s.redis.Del(ctx, key).Err()
 	}
 }

@@ -4,7 +4,9 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -24,6 +26,9 @@ type ChatRequest struct {
 	Stream      bool                   `json:"stream"`
 	Stop        []string               `json:"stop,omitempty"`
 	Extra       map[string]interface{} `json:"extra,omitempty"`
+	// InjectCacheControl 指示 Provider 层自动注入缓存断点（handler 内部标志，不序列化到上游请求）
+	// 仅对支持显式缓存的供应商（Anthropic）生效；true 时自动将 system 或首条 user 消息转换为 content-block 格式
+	InjectCacheControl bool `json:"-"`
 }
 
 // Validate 对聊天请求进行基本参数校验
@@ -50,8 +55,9 @@ func (r *ChatRequest) Validate() error {
 
 // Message 单条聊天消息结构体
 type Message struct {
-	Role    string `json:"role"`    // system/user/assistant
-	Content string `json:"content"`
+	Role             string `json:"role"`              // system/user/assistant
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content,omitempty"` // 深度思考内容（豆包/Qwen3/DeepSeek-R1等）
 }
 
 // ChatResponse 统一响应格式
@@ -74,6 +80,9 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// 缓存相关字段（不支持缓存的供应商保持零值）
+	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`  // 缓存命中Token数（OpenAI cached_tokens / Anthropic cache_read_input_tokens）
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"` // 缓存写入Token数（Anthropic cache_creation_input_tokens）
 }
 
 // StreamChunk 单个流式响应分片
@@ -93,8 +102,9 @@ type StreamChoice struct {
 
 // DeltaContent 流式响应中的增量内容
 type DeltaContent struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"` // 深度思考内容（Qwen3/DeepSeek-R1等）
 }
 
 // Provider 统一的LLM提供商适配器接口，所有提供商必须实现此接口
@@ -222,9 +232,11 @@ func InitAllProviders(cfg map[string]ProviderConfig) *Registry {
 		"deepseek":  func(c ProviderConfig) Provider { return NewDeepSeekProvider(c) },
 		"qwen":      func(c ProviderConfig) Provider { return NewQwenProvider(c) },
 		"wenxin":    func(c ProviderConfig) Provider { return NewWenxinProvider(c) },
+		"qianfan":   func(c ProviderConfig) Provider { return NewQianfanProvider(c) },
 		"doubao":    func(c ProviderConfig) Provider { return NewDoubaoProvider(c) },
 		"kimi":      func(c ProviderConfig) Provider { return NewKimiProvider(c) },
 		"zhipu":     func(c ProviderConfig) Provider { return NewZhipuProvider(c) },
+		"hunyuan":   func(c ProviderConfig) Provider { return NewHunyuanProvider(c) },
 	}
 
 	for name, providerCfg := range cfg {
@@ -248,9 +260,57 @@ func InitAllProviders(cfg map[string]ProviderConfig) *Registry {
 	return registry
 }
 
-// newHTTPClient 创建带指定超时时间的标准HTTP客户端
+// newHTTPClient 创建用于上游LLM调用的HTTP客户端
+//
+// 关键设计：将 timeout 作为 ResponseHeaderTimeout 而非 Client.Timeout
+//   - Client.Timeout 包含整个 body 读取期，对长流式响应（思考型模型可达数分钟）会被强制掐断，
+//     表现为前端"network error"或不完整流。
+//   - ResponseHeaderTimeout 仅约束"建立连接 + 收到响应头"的耗时，body 读取由调用方的
+//     context（c.Request.Context()）控制，符合流式语义。
+//
+// 同时显式设置：
+//   - DialContext 30s 连接超时 + 30s keep-alive
+//   - TLSHandshakeTimeout 10s
+//   - IdleConnTimeout 90s（连接池复用）
+//   - ExpectContinueTimeout 1s
 func newHTTPClient(timeout time.Duration) *http.Client {
-	return &http.Client{
-		Timeout: timeout,
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: timeout, // 仅约束响应头返回时间
 	}
+	return &http.Client{
+		Transport: transport,
+		// 不再设置全局 Timeout，避免长流式响应被掐断；取消由请求 context 控制
+	}
+}
+
+// MarshalWithExtra 将请求体序列化为 JSON，并合并 Extra 参数到顶层
+// 用于将自定义参数（如 enable_thinking）透传给上游供应商
+func MarshalWithExtra(reqBody interface{}, extra map[string]interface{}) ([]byte, error) {
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+	if len(extra) == 0 {
+		return body, nil
+	}
+	// 解析原始 JSON 为 map
+	var merged map[string]interface{}
+	if err := json.Unmarshal(body, &merged); err != nil {
+		return nil, err
+	}
+	// 合并 Extra 参数（Extra 优先，覆盖同名字段）
+	for k, v := range extra {
+		merged[k] = v
+	}
+	return json.Marshal(merged)
 }

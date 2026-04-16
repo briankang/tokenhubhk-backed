@@ -340,11 +340,13 @@ func (s *CodingService) CreateProviderForChannel(ch *model.Channel) provider.Pro
 	}
 
 	// 根据渠道端点特征自动识别提供商类型
+	// 注意：DashScope / Volcengine 路由到全能力 Provider（含 Chat + Image + Video + TTS + ASR），
+	// 旧的 CodingAlibabaProvider / CodingVolcengineProvider 仅支持 Chat 已弃用
 	switch {
 	case containsStr(ch.Endpoint, "dashscope.aliyuncs.com"):
-		return provider.NewCodingAlibabaProvider(cfg)
+		return provider.NewQwenProvider(cfg)
 	case containsStr(ch.Endpoint, "volces.com") || containsStr(ch.Endpoint, "volcengine"):
-		return provider.NewCodingVolcengineProvider(cfg)
+		return provider.NewDoubaoProvider(cfg)
 	case containsStr(ch.Endpoint, "deepseek.com"):
 		return provider.NewCodingDeepSeekProvider(cfg)
 	default:

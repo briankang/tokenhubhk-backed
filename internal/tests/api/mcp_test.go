@@ -542,11 +542,4 @@ func TestMCP_Ping(t *testing.T) {
 	t.Log("Ping: success")
 }
 
-// ─── 辅助函数 ───────────────────────────────────────────────
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
+// Go 1.21+ 内置 min 函数，不再需要自定义

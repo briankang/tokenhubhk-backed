@@ -81,8 +81,9 @@ type oaiStreamOption struct {
 }
 
 type openAIMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role             string `json:"role"`
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content,omitempty"` // 深度思考内容（豆包/Qwen3/DeepSeek-R1等）
 }
 
 // openAIResponse is the native OpenAI response format.
@@ -100,9 +101,19 @@ type openAIChoice struct {
 }
 
 type openAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                  `json:"prompt_tokens"`
+	CompletionTokens    int                  `json:"completion_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
+	PromptTokensDetails *openAIPromptDetails `json:"prompt_tokens_details,omitempty"`
+	// DeepSeek 顶层缓存字段（与 OpenAI 的 prompt_tokens_details.cached_tokens 互补）
+	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens,omitempty"`
+}
+
+// openAIPromptDetails OpenAI 响应中的输入 Token 明细
+type openAIPromptDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+	AudioTokens  int `json:"audio_tokens,omitempty"`
 }
 
 // Chat 执行非流式聊天补全请求
@@ -112,7 +123,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespo
 	}
 
 	oaiReq := p.convertRequest(req, false)
-	body, err := json.Marshal(oaiReq)
+	body, err := MarshalWithExtra(oaiReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider openai: marshal request: %w", err)
 	}
@@ -149,7 +160,7 @@ func (p *OpenAIProvider) StreamChat(ctx context.Context, req *ChatRequest) (Stre
 	}
 
 	oaiReq := p.convertRequest(req, true)
-	body, err := json.Marshal(oaiReq)
+	body, err := MarshalWithExtra(oaiReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider openai: marshal request: %w", err)
 	}
@@ -220,11 +231,19 @@ func (p *OpenAIProvider) convertResponse(oaiResp *openAIResponse) *ChatResponse 
 		Choices: choices,
 	}
 	if oaiResp.Usage != nil {
-		resp.Usage = Usage{
+		u := Usage{
 			PromptTokens:     oaiResp.Usage.PromptTokens,
 			CompletionTokens: oaiResp.Usage.CompletionTokens,
 			TotalTokens:      oaiResp.Usage.TotalTokens,
 		}
+		// 提取缓存命中Token：优先从 prompt_tokens_details.cached_tokens（OpenAI），
+		// 其次从顶层 prompt_cache_hit_tokens（DeepSeek）
+		if oaiResp.Usage.PromptTokensDetails != nil && oaiResp.Usage.PromptTokensDetails.CachedTokens > 0 {
+			u.CacheReadTokens = oaiResp.Usage.PromptTokensDetails.CachedTokens
+		} else if oaiResp.Usage.PromptCacheHitTokens > 0 {
+			u.CacheReadTokens = oaiResp.Usage.PromptCacheHitTokens
+		}
+		resp.Usage = u
 	}
 	return resp
 }
@@ -289,8 +308,9 @@ type openAIStreamDelta struct {
 }
 
 type openAIDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"` // 深度思考内容
 }
 
 func convertOpenAIStreamChunk(chunk *openAIStreamChunk) *StreamChunk {
@@ -298,7 +318,7 @@ func convertOpenAIStreamChunk(chunk *openAIStreamChunk) *StreamChunk {
 	for i, c := range chunk.Choices {
 		choices[i] = StreamChoice{
 			Index:        c.Index,
-			Delta:        DeltaContent{Role: c.Delta.Role, Content: c.Delta.Content},
+			Delta:        DeltaContent{Role: c.Delta.Role, Content: c.Delta.Content, ReasoningContent: c.Delta.ReasoningContent},
 			FinishReason: c.FinishReason,
 		}
 	}
@@ -308,11 +328,17 @@ func convertOpenAIStreamChunk(chunk *openAIStreamChunk) *StreamChunk {
 		Choices: choices,
 	}
 	if chunk.Usage != nil {
-		sc.Usage = &Usage{
+		u := &Usage{
 			PromptTokens:     chunk.Usage.PromptTokens,
 			CompletionTokens: chunk.Usage.CompletionTokens,
 			TotalTokens:      chunk.Usage.TotalTokens,
 		}
+		if chunk.Usage.PromptTokensDetails != nil && chunk.Usage.PromptTokensDetails.CachedTokens > 0 {
+			u.CacheReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+		} else if chunk.Usage.PromptCacheHitTokens > 0 {
+			u.CacheReadTokens = chunk.Usage.PromptCacheHitTokens
+		}
+		sc.Usage = u
 	}
 	return sc
 }

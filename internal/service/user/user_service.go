@@ -136,7 +136,7 @@ func (s *UserService) ChangePassword(ctx context.Context, id uint, oldPwd, newPw
 		return fmt.Errorf("failed to hash new password: %w", err)
 	}
 
-	if err := s.db.WithContext(ctx).Model(&user).Update("password_hash", string(hash)).Error; err != nil {
+	if err := s.db.WithContext(ctx).Model(&model.User{}).Where("id = ?", user.ID).Update("password_hash", string(hash)).Error; err != nil {
 		return fmt.Errorf("failed to update password: %w", err)
 	}
 	return nil

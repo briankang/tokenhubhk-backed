@@ -105,7 +105,7 @@ func (p *GoogleProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespo
 	}
 
 	gReq := p.convertRequest(req)
-	body, err := json.Marshal(gReq)
+	body, err := MarshalWithExtra(gReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider google: marshal request: %w", err)
 	}
@@ -142,7 +142,7 @@ func (p *GoogleProvider) StreamChat(ctx context.Context, req *ChatRequest) (Stre
 	}
 
 	gReq := p.convertRequest(req)
-	body, err := json.Marshal(gReq)
+	body, err := MarshalWithExtra(gReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider google: marshal request: %w", err)
 	}

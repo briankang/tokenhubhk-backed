@@ -79,7 +79,7 @@ type DatabaseConfig struct {
 
 // DSN 返回MySQL数据源名称连接字符串
 func (d *DatabaseConfig) DSN() string {
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&collation=utf8mb4_unicode_ci&parseTime=True&loc=Local",
 		d.User, d.Password, d.Host, d.Port, d.DBName)
 }
 

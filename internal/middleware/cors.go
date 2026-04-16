@@ -49,7 +49,7 @@ func CORS() gin.HandlerFunc {
 		AllowOrigins:     allowOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Request-ID", "Idempotency-Key", "Accept-Language"},
-		ExposeHeaders:    []string{"Content-Length", "X-Request-ID"},
+		ExposeHeaders:    []string{"Content-Length", "X-Request-ID", "X-Actual-Model", "X-Channel-ID", "X-Upstream-Latency-Ms", "X-Poll-Count"},
 		AllowCredentials: true, // 允许携带凭证
 		MaxAge:           12 * time.Hour,
 		// AllowOriginFunc 允许动态判断 Origin

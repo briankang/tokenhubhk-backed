@@ -114,7 +114,7 @@ func (s *ModelCategoryService) Update(ctx context.Context, id uint, category *mo
 		}
 		return fmt.Errorf("query model category: %w", err)
 	}
-	if err := s.db.WithContext(ctx).Model(&existing).Updates(map[string]interface{}{
+	if err := s.db.WithContext(ctx).Model(&model.ModelCategory{}).Where("id = ?", existing.ID).Updates(map[string]interface{}{
 		"supplier_id": category.SupplierID,
 		"name":        category.Name,
 		"code":        category.Code,

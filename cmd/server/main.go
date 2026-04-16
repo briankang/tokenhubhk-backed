@@ -15,13 +15,15 @@ import (
 	"tokenhub-server/internal/config"
 	"tokenhub-server/internal/cron"
 	"tokenhub-server/internal/database"
+	adminHandler "tokenhub-server/internal/handler/admin"
 	pkgi18n "tokenhub-server/internal/pkg/i18n"
 	"tokenhub-server/internal/pkg/logger"
 	pkgredis "tokenhub-server/internal/pkg/redis"
 	"tokenhub-server/internal/router"
-	agentSvc "tokenhub-server/internal/service/agent"
 	"tokenhub-server/internal/service/balance"
 	memberSvc "tokenhub-server/internal/service/member"
+	"tokenhub-server/internal/service/modeldiscovery"
+	"tokenhub-server/internal/service/pricescraper"
 )
 
 func main() {
@@ -69,13 +71,35 @@ func main() {
 	// 3.3 填充会员等级和代理等级种子数据
 	database.RunSeedLevels(database.DB)
 
-	// 3.4 数据迁移：将现有 AGENT_L1/L2/L3 用户迁移到 UserAgentProfile 体系
-	if err := database.MigrateAgentData(database.DB); err != nil {
-		logger.L.Warn("agent data migration failed", zap.Error(err))
+	// 3.4 填充平台标准参数和供应商参数映射
+	database.RunSeedParams()
+
+	// 3.5 数据迁移：为历史模型回填缓存定价字段（幂等，仅处理 supports_cache=false 的行）
+	database.RunCachePriceMigration(database.DB)
+
+	// 3.6 数据迁移：回填渠道 supported_capabilities 字段（按供应商推断默认能力）
+	if err := database.MigrateChannelCapabilities(database.DB); err != nil {
+		logger.L.Warn("channel capabilities migration failed", zap.Error(err))
 	}
-	// 3.5 数据迁移：为所有用户创建 UserMemberProfile（按消费自动匹配等级）
-	if err := database.MigrateMemberData(database.DB); err != nil {
-		logger.L.Warn("member data migration failed", zap.Error(err))
+
+	// 3.7 数据迁移：v3.1 物理删除代理机制遗留表（幂等）
+	if err := database.DropAgentTables(database.DB); err != nil {
+		logger.L.Warn("drop agent tables migration failed", zap.Error(err))
+	}
+
+	// 3.8 种子数据：预置非 Token 计费模型（图像/视频/TTS/ASR/Rerank，幂等）
+	database.RunSeedNonTokenModels(database.DB)
+
+	// 3.10 种子数据：增量添加百度千帆 V2 供应商/模型/渠道（幂等，已存在则跳过）
+	database.RunSeedQianfan(database.DB)
+
+	// 3.11 种子数据：增量添加腾讯混元供应商/模型/渠道（幂等，已存在则跳过）
+	database.RunSeedHunyuan(database.DB)
+
+	// 3.9 数据迁移：火山引擎第八批下线模型标记为 offline（EOS: 2026-05-11）
+	// 来源：https://www.volcengine.com/docs/82379/1350667
+	if err := database.MigrateVolcengineBatch8Deprecation(database.DB); err != nil {
+		logger.L.Warn("volcengine batch8 deprecation migration failed", zap.Error(err))
 	}
 
 	// 4. Initialize Redis
@@ -115,19 +139,31 @@ func main() {
 
 	// 6.2 初始化定时任务调度器
 	memberLevelSvc := memberSvc.NewMemberLevelService(database.DB, pkgredis.Client)
-	agentLevelSvc := agentSvc.NewAgentLevelService(database.DB, pkgredis.Client)
 	balanceSvc := balance.NewBalanceService(database.DB, pkgredis.Client)
-	scheduler := cron.NewScheduler(database.DB, pkgredis.Client, memberLevelSvc, agentLevelSvc, balanceSvc)
+	discoverySvc := modeldiscovery.NewDiscoveryService(database.DB)
+	scraperSvc := pricescraper.NewPriceScraperService(database.DB)
+	scheduler := cron.NewScheduler(database.DB, pkgredis.Client, memberLevelSvc, balanceSvc,
+		cron.WithDiscoveryService(discoverySvc),
+		cron.WithPriceScraperService(scraperSvc),
+	)
 	scheduler.Start()
 	defer scheduler.Stop()
 
+	// 6.3 注册定时任务管理路由（需要 Scheduler 实例，在 router.Setup 之后注册）
+	cronHandler := adminHandler.NewCronTaskHandler(scheduler)
+	adminGroup := engine.Group("/api/v1/admin")
+	cronHandler.Register(adminGroup)
+
 	// 7. Start HTTP server
+	// WriteTimeout 设为 30 分钟以支持长任务（如一键扫描预览检测全部模型 + 调用上游 /v1/models，
+	// 380 个模型并发 3、限流 500ms 时最坏情况约 30 分钟）
+	// 对于普通 API 仍受 ReadTimeout 30s 保护
 	addr := fmt.Sprintf(":%d", config.Global.Server.Port)
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      engine,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		WriteTimeout: 1800 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 

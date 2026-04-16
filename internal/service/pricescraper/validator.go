@@ -26,6 +26,49 @@ const (
 	maxPriceRMB = 500.0  // 最高价格上限（部分多模态模型较贵）
 )
 
+// 不同计费单位的价格合理范围
+var pricingUnitRanges = map[string][2]float64{
+	PricingUnitPerMillionTokens:     {0.0001, 500.0}, // 元/百万tokens：0.0001 ~ 500
+	PricingUnitPerImage:             {0.01, 50.0},    // 元/张：0.01 ~ 50
+	PricingUnitPerSecond:            {0.001, 10.0},   // 元/秒：0.001 ~ 10（视频）
+	PricingUnitPerMinute:            {0.01, 50.0},    // 元/分钟：0.01 ~ 50（whisper 约 0.036）
+	PricingUnitPer10kCharacters:     {0.1, 100.0},    // 元/万字符：0.1 ~ 100
+	PricingUnitPerKChars:            {0.1, 100.0},    // 历史别名，等价于 per_10k_characters
+	PricingUnitPerMillionCharacters: {1.0, 2000.0},   // 元/百万字符：1 ~ 2000
+	PricingUnitPerCall:              {0.0001, 10.0},  // 元/次：0.0001 ~ 10
+	PricingUnitPerHour:              {0.1, 100.0},    // 元/小时：0.1 ~ 100
+}
+
+// getPriceRange 根据计费单位获取价格合理范围
+func getPriceRange(pricingUnit string) (float64, float64) {
+	if r, ok := pricingUnitRanges[pricingUnit]; ok {
+		return r[0], r[1]
+	}
+	return minPriceRMB, maxPriceRMB // 默认使用 token 范围
+}
+
+// pricingUnitLabel 获取计费单位的中文标签（用于日志）
+func pricingUnitLabel(unit string) string {
+	switch unit {
+	case PricingUnitPerImage:
+		return "元/张"
+	case PricingUnitPerSecond:
+		return "元/秒"
+	case PricingUnitPerMinute:
+		return "元/分钟"
+	case PricingUnitPer10kCharacters, PricingUnitPerKChars:
+		return "元/万字符"
+	case PricingUnitPerMillionCharacters:
+		return "元/百万字符"
+	case PricingUnitPerCall:
+		return "元/次"
+	case PricingUnitPerHour:
+		return "元/小时"
+	default:
+		return "元/百万token"
+	}
+}
+
 // ValidateScrapedData 验证爬取的价格数据
 // 对整个爬取结果执行以下验证：
 // 1. 空值检查：模型名称非空，至少有输入或输出价格
@@ -96,23 +139,26 @@ func validateSingleModel(m ScrapedModel, index int) []ValidationError {
 		})
 	}
 
-	// 3. 价格范围检查
+	// 3. 价格范围检查（根据计费单位选择合理范围）
+	minP, maxP := getPriceRange(m.PricingUnit)
+	unitLabel := pricingUnitLabel(m.PricingUnit)
+
 	if m.InputPrice != 0 {
-		if m.InputPrice < minPriceRMB || m.InputPrice > maxPriceRMB {
+		if m.InputPrice < minP || m.InputPrice > maxP {
 			errors = append(errors, ValidationError{
 				ModelName: nameForLog,
 				Field:     "input_price",
-				Message:   fmt.Sprintf("输入价格 %.4f 超出合理范围 [%.4f, %.1f] RMB/百万token", m.InputPrice, minPriceRMB, maxPriceRMB),
+				Message:   fmt.Sprintf("输入价格 %.4f 超出合理范围 [%.4f, %.1f] %s", m.InputPrice, minP, maxP, unitLabel),
 				Severity:  "warning",
 			})
 		}
 	}
 	if m.OutputPrice != 0 {
-		if m.OutputPrice < minPriceRMB || m.OutputPrice > maxPriceRMB {
+		if m.OutputPrice < minP || m.OutputPrice > maxP {
 			errors = append(errors, ValidationError{
 				ModelName: nameForLog,
 				Field:     "output_price",
-				Message:   fmt.Sprintf("输出价格 %.4f 超出合理范围 [%.4f, %.1f] RMB/百万token", m.OutputPrice, minPriceRMB, maxPriceRMB),
+				Message:   fmt.Sprintf("输出价格 %.4f 超出合理范围 [%.4f, %.1f] %s", m.OutputPrice, minP, maxP, unitLabel),
 				Severity:  "warning",
 			})
 		}

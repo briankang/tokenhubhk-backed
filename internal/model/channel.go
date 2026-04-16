@@ -13,9 +13,13 @@ type Channel struct {
 	SupplierID     uint         `gorm:"index;not null" json:"supplier_id"`                                       // 关联供应商 ID
 	Type           string       `gorm:"type:varchar(30);not null" json:"type"`                                   // 类型: openai / azure / anthropic / ...
 	ChannelType    string       `gorm:"type:varchar(20);default:'CHAT';index" json:"channel_type"`               // 渠道用途: CHAT(对话) / CODING(代码补全) / MIXED(混合)
+	// SupportedCapabilities 渠道支持的能力列表，逗号分隔
+	// 可选值: chat, image, video, tts, asr, embedding
+	// 空值或 "chat" 兼容旧数据（老渠道默认仅支持对话）
+	SupportedCapabilities string       `gorm:"type:varchar(255);default:'chat'" json:"supported_capabilities"`
 	Endpoint       string       `gorm:"type:varchar(500);not null" json:"endpoint"`                               // API 端点 URL
 	APIKey         string       `gorm:"type:varchar(500);not null" json:"-"`                                     // API Key（不输出）
-	Models         JSON         `gorm:"type:json" json:"models,omitempty"`                                       // 支持的模型列表 (JSON)
+	Models         JSON         `gorm:"type:json" json:"models,omitempty"`                                       // Deprecated: 使用 CustomChannelRoute + ChannelModel 替代。保留兼容旧数据
 	Weight         int          `gorm:"default:1" json:"weight"`                                                 // 路由权重
 	Priority       int          `gorm:"default:0" json:"priority"`                                               // 路由优先级
 	Status         string       `gorm:"type:varchar(20);default:'unverified';index" json:"status"`                // 状态: unverified(默认) / active / disabled / error
@@ -45,4 +49,74 @@ type Channel struct {
 // TableName 指定渠道表名
 func (Channel) TableName() string {
 	return "channels"
+}
+
+// 渠道能力常量
+const (
+	CapabilityChat      = "chat"
+	CapabilityImage     = "image"
+	CapabilityVideo     = "video"
+	CapabilityTTS       = "tts"
+	CapabilityASR       = "asr"
+	CapabilityEmbedding = "embedding"
+)
+
+// ModelTypeToCapability 将 ai_models.model_type 映射为渠道能力标签
+// 空或未知类型返回 "chat"（兼容旧 LLM 模型）
+func ModelTypeToCapability(modelType string) string {
+	switch modelType {
+	case "ImageGeneration":
+		return CapabilityImage
+	case "VideoGeneration":
+		return CapabilityVideo
+	case "SpeechSynthesis":
+		return CapabilityTTS
+	case "SpeechRecognition":
+		return CapabilityASR
+	case "Embedding":
+		return CapabilityEmbedding
+	case "LLM", "VLM", "":
+		return CapabilityChat
+	default:
+		return CapabilityChat
+	}
+}
+
+// HasCapability 判断渠道是否声明支持指定能力
+// 空 SupportedCapabilities 兼容旧数据（视为支持 chat）
+func (c *Channel) HasCapability(cap string) bool {
+	if c.SupportedCapabilities == "" {
+		return cap == CapabilityChat
+	}
+	for _, part := range splitAndTrim(c.SupportedCapabilities, ",") {
+		if part == cap {
+			return true
+		}
+	}
+	return false
+}
+
+// splitAndTrim 简易切分 + 去空白
+func splitAndTrim(s, sep string) []string {
+	var out []string
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i == len(s) || string(s[i]) == sep {
+			if i > start {
+				seg := s[start:i]
+				// 去首尾空白
+				for len(seg) > 0 && (seg[0] == ' ' || seg[0] == '\t') {
+					seg = seg[1:]
+				}
+				for len(seg) > 0 && (seg[len(seg)-1] == ' ' || seg[len(seg)-1] == '\t') {
+					seg = seg[:len(seg)-1]
+				}
+				if seg != "" {
+					out = append(out, seg)
+				}
+			}
+			start = i + 1
+		}
+	}
+	return out
 }

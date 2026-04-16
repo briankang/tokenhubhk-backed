@@ -67,7 +67,7 @@ func (p *ZhipuProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespon
 	}
 
 	oaiReq := convertToOpenAIFormat(req, false)
-	body, err := json.Marshal(oaiReq)
+	body, err := MarshalWithExtra(oaiReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider zhipu: marshal request: %w", err)
 	}
@@ -103,7 +103,7 @@ func (p *ZhipuProvider) StreamChat(ctx context.Context, req *ChatRequest) (Strea
 	}
 
 	oaiReq := convertToOpenAIFormat(req, true)
-	body, err := json.Marshal(oaiReq)
+	body, err := MarshalWithExtra(oaiReq, req.Extra)
 	if err != nil {
 		return nil, fmt.Errorf("provider zhipu: marshal request: %w", err)
 	}

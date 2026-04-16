@@ -85,8 +85,19 @@ type RouteCandidate struct {
 //  5. 按 Strategy 选择最终 Channel + ActualModel
 //  6. 返回选中的 Channel + ActualModel
 func (r *ChannelRouter) SelectChannel(ctx context.Context, modelName string, customChannelID *uint, userID uint) (*SelectChannelResult, error) {
+	return r.SelectChannelWithExcludes(ctx, modelName, customChannelID, userID, nil)
+}
+
+// SelectChannelWithExcludes 带排除列表的渠道选择，用于 Failover 重试时排除已失败的渠道
+func (r *ChannelRouter) SelectChannelWithExcludes(ctx context.Context, modelName string, customChannelID *uint, userID uint, excludeChannelIDs []uint) (*SelectChannelResult, error) {
 	if modelName == "" {
 		return nil, fmt.Errorf("model name is required")
+	}
+
+	// 构建排除集合
+	excludeSet := make(map[uint]bool, len(excludeChannelIDs))
+	for _, id := range excludeChannelIDs {
+		excludeSet[id] = true
 	}
 
 	// ========== 步骤1: 加载 CustomChannel ==========
@@ -107,7 +118,7 @@ func (r *ChannelRouter) SelectChannel(ctx context.Context, modelName string, cus
 	routes, err := r.selectFromCustomChannel(ctx, cc, modelName)
 	if err == nil && len(routes) > 0 {
 		// 将显式路由转换为统一候选列表
-		candidates := r.routesToCandidates(ctx, routes)
+		candidates := r.filterExcluded(r.routesToCandidates(ctx, routes), excludeSet)
 		if len(candidates) > 0 {
 			result, err := r.applyStrategy(cc.Strategy, candidates, cc.ID)
 			if err == nil {
@@ -126,7 +137,7 @@ func (r *ChannelRouter) SelectChannel(ctx context.Context, modelName string, cus
 		channelModels, err := r.autoDiscoverByCost(ctx, modelName)
 		if err == nil && len(channelModels) > 0 {
 			// 将自动发现结果转换为统一候选列表
-			candidates := r.channelModelsToCandidates(channelModels)
+			candidates := r.filterExcluded(r.channelModelsToCandidates(channelModels), excludeSet)
 			if len(candidates) > 0 {
 				result, err := r.applyStrategy(cc.Strategy, candidates, cc.ID)
 				if err == nil {
@@ -145,9 +156,71 @@ func (r *ChannelRouter) SelectChannel(ctx context.Context, modelName string, cus
 	return r.fallbackToChannelGroup(ctx, modelName)
 }
 
-// loadCustomChannel 加载自定义渠道配置
+// filterExcluded 从候选列表中过滤掉被排除的渠道ID
+func (r *ChannelRouter) filterExcluded(candidates []RouteCandidate, excludeSet map[uint]bool) []RouteCandidate {
+	if len(excludeSet) == 0 {
+		return candidates
+	}
+	var filtered []RouteCandidate
+	for _, c := range candidates {
+		if !excludeSet[c.Channel.ID] {
+			filtered = append(filtered, c)
+		}
+	}
+	return filtered
+}
+
+// filterByCapability 过滤掉不支持指定能力的渠道
+// requiredCap 为空时不做过滤（兼容调用方未传类型的场景）
+func (r *ChannelRouter) filterByCapability(candidates []RouteCandidate, requiredCap string) []RouteCandidate {
+	if requiredCap == "" {
+		return candidates
+	}
+	var filtered []RouteCandidate
+	for _, c := range candidates {
+		if c.Channel != nil && c.Channel.HasCapability(requiredCap) {
+			filtered = append(filtered, c)
+		}
+	}
+	return filtered
+}
+
+// SelectChannelForCapability 带能力校验的渠道选择
+// requiredCap: 模型所需能力（chat/image/video/tts/asr/embedding），空字符串兼容旧调用
+func (r *ChannelRouter) SelectChannelForCapability(ctx context.Context, modelName string, customChannelID *uint, userID uint, requiredCap string, excludeChannelIDs []uint) (*SelectChannelResult, error) {
+	// 先走原路由流程取候选，然后按能力过滤
+	result, err := r.SelectChannelWithExcludes(ctx, modelName, customChannelID, userID, excludeChannelIDs)
+	if err != nil {
+		return nil, err
+	}
+	if requiredCap == "" || result == nil || result.Channel == nil {
+		return result, nil
+	}
+	if !result.Channel.HasCapability(requiredCap) {
+		return nil, fmt.Errorf("渠道 %s 不支持能力 %s（当前支持: %s）",
+			result.Channel.Name, requiredCap, result.Channel.SupportedCapabilities)
+	}
+	return result, nil
+}
+
+// loadCustomChannel 加载自定义渠道配置（带 Redis 缓存，5min TTL）
 // 如果指定了 customChannelID 则按 ID 查找，否则查找 is_default=true 的默认渠道
 func (r *ChannelRouter) loadCustomChannel(ctx context.Context, customChannelID *uint) (*model.CustomChannel, error) {
+	// 尝试从 Redis 缓存读取
+	var cacheKey string
+	if customChannelID != nil && *customChannelID > 0 {
+		cacheKey = fmt.Sprintf("custom_channel:id:%d", *customChannelID)
+	} else {
+		cacheKey = "custom_channel:default"
+	}
+
+	if r.redis != nil {
+		var cached model.CustomChannel
+		if err := pkgredis.GetJSON(ctx, cacheKey, &cached); err == nil {
+			return &cached, nil
+		}
+	}
+
 	var cc model.CustomChannel
 
 	if customChannelID != nil && *customChannelID > 0 {
@@ -158,16 +231,21 @@ func (r *ChannelRouter) loadCustomChannel(ctx context.Context, customChannelID *
 		if err != nil {
 			return nil, fmt.Errorf("自定义渠道 %d 不存在或未激活: %w", *customChannelID, err)
 		}
-		return &cc, nil
+	} else {
+		// 查找默认自定义渠道
+		err := r.db.WithContext(ctx).
+			Where("is_default = ? AND is_active = ?", true, true).
+			First(&cc).Error
+		if err != nil {
+			return nil, fmt.Errorf("未找到默认自定义渠道: %w", err)
+		}
 	}
 
-	// 查找默认自定义渠道
-	err := r.db.WithContext(ctx).
-		Where("is_default = ? AND is_active = ?", true, true).
-		First(&cc).Error
-	if err != nil {
-		return nil, fmt.Errorf("未找到默认自定义渠道: %w", err)
+	// 写入 Redis 缓存
+	if r.redis != nil {
+		_ = pkgredis.SetJSON(ctx, cacheKey, &cc, 5*time.Minute)
 	}
+
 	return &cc, nil
 }
 
@@ -193,10 +271,24 @@ func (r *ChannelRouter) checkAccess(ctx context.Context, cc *model.CustomChannel
 	return false
 }
 
-// selectFromCustomChannel 从自定义渠道的显式路由中查找匹配
+// selectFromCustomChannel 从自定义渠道的显式路由中查找匹配（带 Redis 缓存，5min TTL）
 // 查找 CustomChannelRoute WHERE custom_channel_id=? AND alias_model=? AND is_active=true
 // 返回匹配的路由列表（可能有多条，对应不同渠道的同一模型）
 func (r *ChannelRouter) selectFromCustomChannel(ctx context.Context, cc *model.CustomChannel, requestModel string) ([]model.CustomChannelRoute, error) {
+	// 尝试从 Redis 缓存读取
+	cacheKey := fmt.Sprintf("custom_channel_routes:%d:%s", cc.ID, requestModel)
+	if r.redis != nil {
+		var cached []model.CustomChannelRoute
+		if err := pkgredis.GetJSON(ctx, cacheKey, &cached); err == nil && len(cached) > 0 {
+			// Channel.APIKey 带 json:"-" 标签，缓存反序列化后会丢失
+			// 重置 Channel 让 routesToCandidates() 从 DB 重新加载完整渠道信息
+			for i := range cached {
+				cached[i].Channel = model.Channel{}
+			}
+			return cached, nil
+		}
+	}
+
 	var routes []model.CustomChannelRoute
 	err := r.db.WithContext(ctx).
 		Where("custom_channel_id = ? AND alias_model = ? AND is_active = ?", cc.ID, requestModel, true).
@@ -208,6 +300,12 @@ func (r *ChannelRouter) selectFromCustomChannel(ctx context.Context, cc *model.C
 	if len(routes) == 0 {
 		return nil, fmt.Errorf("自定义渠道 %s 中没有模型 %s 的路由", cc.Name, requestModel)
 	}
+
+	// 写入 Redis 缓存
+	if r.redis != nil {
+		_ = pkgredis.SetJSON(ctx, cacheKey, &routes, 5*time.Minute)
+	}
+
 	return routes, nil
 }
 

@@ -12,6 +12,7 @@ import (
 
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/credits"
+	"tokenhub-server/internal/service/referral"
 )
 
 // PaymentService 支付业务服务，管理订单创建、回调处理、查询和退款
@@ -131,14 +132,14 @@ func (s *PaymentService) CreatePayment(ctx context.Context, userID, tenantID uin
 	result, err := gw.CreateOrder(ctx, order)
 	if err != nil {
 		// 更新支付状态为失败
-		s.db.WithContext(ctx).Model(payment).Update("status", "failed")
+		s.db.WithContext(ctx).Model(&model.Payment{}).Where("id = ?", payment.ID).Update("status", "failed")
 		s.logger.Error("gateway create order failed", zap.String("gateway", gateway), zap.Error(err))
 		return nil, fmt.Errorf("gateway create order: %w", err)
 	}
 
 	// 更新网关交易号
 	if result.GatewayTxnID != "" {
-		s.db.WithContext(ctx).Model(payment).Update("gateway_txn_id", result.GatewayTxnID)
+		s.db.WithContext(ctx).Model(&model.Payment{}).Where("id = ?", payment.ID).Update("gateway_txn_id", result.GatewayTxnID)
 	}
 
 	// 缓存订单号到支付 ID 的映射（用于回调查找）
@@ -221,7 +222,7 @@ func (s *PaymentService) HandleCallback(ctx context.Context, gateway string, dat
 		"gateway_txn_id": result.GatewayTxnID,
 	}
 
-	if err := s.db.WithContext(ctx).Model(&payment).Updates(updates).Error; err != nil {
+	if err := s.db.WithContext(ctx).Model(&model.Payment{}).Where("id = ?", payment.ID).Updates(updates).Error; err != nil {
 		return fmt.Errorf("update payment: %w", err)
 	}
 
@@ -248,6 +249,9 @@ func (s *PaymentService) HandleCallback(ctx context.Context, gateway string, dat
 			"paid_at":       result.PaidAt,
 		})
 		s.redis.Publish(ctx, "payment:success", string(eventData))
+
+		// v3.1: 付费回调后尝试发放邀请人一次性奖励(首次付费达门槛)
+		referral.TryGrantInviterBonus(ctx, s.db, payment.UserID)
 	}
 
 	// Record audit log
@@ -304,7 +308,7 @@ func (s *PaymentService) RefundPayment(ctx context.Context, orderNo string, amou
 
 	// 更新支付状态为已退款
 	if refundResult.Status == "success" {
-		s.db.WithContext(ctx).Model(payment).Update("status", "refunded")
+		s.db.WithContext(ctx).Model(&model.Payment{}).Where("id = ?", payment.ID).Update("status", "refunded")
 	}
 
 	// Record audit log

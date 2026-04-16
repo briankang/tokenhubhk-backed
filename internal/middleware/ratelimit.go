@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,12 +18,22 @@ import (
 
 // RateLimit 基于 IP 的滑动窗口限流中间件，使用 Redis ZSET 实现
 // 配置从 config.Global.RateLimit 读取，支持开关控制
+// 特殊头 X-Test-Skip-RateLimit: 1 可在测试环境跳过限流（需 SERVER_MODE=debug）
 func RateLimit() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		cfg := config.Global.RateLimit
 		if !cfg.Enabled {
 			c.Next()
 			return
+		}
+
+		// 测试跳过：若配置了 RATE_LIMIT_BYPASS_TOKEN，且请求头匹配，则放行
+		// 仅在测试环境中通过 docker-compose 注入此变量，生产环境留空
+		if bypassToken := os.Getenv("RATE_LIMIT_BYPASS_TOKEN"); bypassToken != "" {
+			if c.GetHeader("X-Test-Skip-RateLimit") == bypassToken {
+				c.Next()
+				return
+			}
 		}
 
 		ip := c.ClientIP()

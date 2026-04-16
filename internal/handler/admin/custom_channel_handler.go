@@ -1,26 +1,74 @@
 package admin
 
 import (
-	"math"
+	"context"
+	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
+	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
+	goredis "github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
+	channelsvc "tokenhub-server/internal/service/channel"
 )
+
+// ==================== 默认渠道路由刷新：异步任务存储 ====================
+
+// routeRefreshMu 防重入锁：同一时刻只允许一个刷新任务执行
+var routeRefreshMu sync.Mutex
+
+// currentRefreshJob 保存最近一次（正在运行 或 已完成）的刷新任务
+// 使用 atomic.Value 读写 *channelsvc.RouteRefreshJob，避免读写竞争
+var currentRefreshJob atomic.Value // stores *channelsvc.RouteRefreshJob
+
+// loadCurrentRefreshJob 读取最近一次任务（可能为 nil）
+func loadCurrentRefreshJob() *channelsvc.RouteRefreshJob {
+	v := currentRefreshJob.Load()
+	if v == nil {
+		return nil
+	}
+	job, _ := v.(*channelsvc.RouteRefreshJob)
+	return job
+}
 
 // CustomChannelHandler 自定义渠道管理接口处理器
 type CustomChannelHandler struct {
-	db *gorm.DB
+	db    *gorm.DB
+	redis *goredis.Client
 }
 
 // NewCustomChannelHandler 创建自定义渠道管理Handler实例
-func NewCustomChannelHandler(db *gorm.DB) *CustomChannelHandler {
-	return &CustomChannelHandler{db: db}
+func NewCustomChannelHandler(db *gorm.DB, redis ...*goredis.Client) *CustomChannelHandler {
+	h := &CustomChannelHandler{db: db}
+	if len(redis) > 0 {
+		h.redis = redis[0]
+	}
+	return h
+}
+
+// invalidateCustomChannelCache 清除自定义渠道相关的 Redis 缓存
+func (h *CustomChannelHandler) invalidateCustomChannelCache(ccID uint) {
+	if h.redis == nil {
+		return
+	}
+	ctx := context.Background()
+	// 清除指定渠道缓存
+	_ = h.redis.Del(ctx, fmt.Sprintf("custom_channel:id:%d", ccID)).Err()
+	// 清除默认渠道缓存
+	_ = h.redis.Del(ctx, "custom_channel:default").Err()
+	// 清除该渠道下的路由缓存（使用通配符扫描并删除）
+	pattern := fmt.Sprintf("custom_channel_routes:%d:*", ccID)
+	iter := h.redis.Scan(ctx, 0, pattern, 100).Iterator()
+	for iter.Next(ctx) {
+		_ = h.redis.Del(ctx, iter.Val()).Err()
+	}
 }
 
 // -------- 请求体结构 --------
@@ -177,6 +225,7 @@ func (h *CustomChannelHandler) Create(c *gin.Context) {
 	h.db.Preload("Routes").Preload("Routes.Channel").Preload("Routes.Channel.Supplier").
 		Preload("AccessList").First(&cc, cc.ID)
 
+	h.invalidateCustomChannelCache(cc.ID)
 	response.Success(c, cc)
 }
 
@@ -234,7 +283,7 @@ func (h *CustomChannelHandler) Update(c *gin.Context) {
 		}
 
 		if len(updates) > 0 {
-			return tx.Model(&cc).Updates(updates).Error
+			return tx.Model(&model.CustomChannel{}).Where("id = ?", cc.ID).Updates(updates).Error
 		}
 		return nil
 	})
@@ -248,6 +297,7 @@ func (h *CustomChannelHandler) Update(c *gin.Context) {
 	h.db.Preload("Routes").Preload("Routes.Channel").Preload("Routes.Channel.Supplier").
 		Preload("AccessList").First(&cc, cc.ID)
 
+	h.invalidateCustomChannelCache(cc.ID)
 	response.Success(c, cc)
 }
 
@@ -291,6 +341,7 @@ func (h *CustomChannelHandler) Delete(c *gin.Context) {
 		return
 	}
 
+	h.invalidateCustomChannelCache(cc.ID)
 	response.Success(c, nil)
 }
 
@@ -311,12 +362,13 @@ func (h *CustomChannelHandler) Toggle(c *gin.Context) {
 
 	// 切换 is_active 状态
 	newActive := !cc.IsActive
-	if err := h.db.Model(&cc).Update("is_active", newActive).Error; err != nil {
+	if err := h.db.Model(&model.CustomChannel{}).Where("id = ?", cc.ID).Update("is_active", newActive).Error; err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return
 	}
 
 	response.Success(c, gin.H{"id": cc.ID, "is_active": newActive})
+	h.invalidateCustomChannelCache(cc.ID)
 }
 
 // SetDefault 设置为默认渠道
@@ -344,7 +396,7 @@ func (h *CustomChannelHandler) SetDefault(c *gin.Context) {
 			return err
 		}
 		// 将目标渠道设为默认
-		return tx.Model(&cc).Update("is_default", true).Error
+		return tx.Model(&model.CustomChannel{}).Where("id = ?", cc.ID).Update("is_default", true).Error
 	})
 
 	if txErr != nil {
@@ -353,6 +405,7 @@ func (h *CustomChannelHandler) SetDefault(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{"id": cc.ID, "is_default": true})
+	h.invalidateCustomChannelCache(cc.ID)
 }
 
 // UpdateAccess 更新访问控制列表
@@ -470,6 +523,7 @@ func (h *CustomChannelHandler) BatchRoutes(c *gin.Context) {
 		return db.Order("priority DESC, weight DESC")
 	}).Preload("Routes.Channel").Preload("Routes.Channel.Supplier").First(&cc, cc.ID)
 
+	h.invalidateCustomChannelCache(cc.ID)
 	response.Success(c, cc)
 }
 
@@ -535,6 +589,7 @@ func (h *CustomChannelHandler) ImportRoutes(c *gin.Context) {
 		return db.Order("priority DESC, weight DESC")
 	}).Preload("Routes.Channel").Preload("Routes.Channel.Supplier").First(&cc, cc.ID)
 
+	h.invalidateCustomChannelCache(cc.ID)
 	response.Success(c, gin.H{
 		"imported":       imported,
 		"total_mappings": len(channelModels),
@@ -544,135 +599,50 @@ func (h *CustomChannelHandler) ImportRoutes(c *gin.Context) {
 
 // RefreshDefault 刷新默认渠道路由（按成本优先）
 // POST /api/v1/admin/custom-channels/default/refresh
-// 逻辑:
-//  1. 查找 is_default=true 的渠道
-//  2. 查询所有 active Channel + Supplier + ChannelModel
-//  3. 按 standard_model_id 汇总，计算综合成本 = (InputPricePerM + OutputPricePerM) * Discount
-//  4. 成本最低的 weight=100, priority=10；其余按成本倒数比例分配 weight
-//  5. 全量替换默认渠道的 Routes
+// 异步模式：接收请求后立即返回 job_id，后台 goroutine 执行实际刷新
+// 前端通过 GetRefreshStatus 轮询进度。
+// 同一时刻只允许一个刷新任务运行（routeRefreshMu 保护）。
 func (h *CustomChannelHandler) RefreshDefault(c *gin.Context) {
-	// 1. 查找默认渠道
-	var defaultCC model.CustomChannel
-	if err := h.db.Where("is_default = ?", true).First(&defaultCC).Error; err != nil {
-		response.ErrorMsg(c, http.StatusNotFound, errcode.ErrNotFound.Code, "未找到默认渠道")
+	// 防重入：已有任务在跑直接拒绝
+	if !routeRefreshMu.TryLock() {
+		response.ErrorMsg(c, http.StatusConflict, errcode.ErrIdempotentRepeat.Code, "已有刷新任务运行中，请稍后再试")
 		return
 	}
 
-	// 2. 查询所有已激活的接入点及其供应商信息和模型映射
-	var channelModels []model.ChannelModel
-	if err := h.db.
-		Joins("JOIN channels ON channels.id = channel_models.channel_id").
-		Joins("JOIN suppliers ON suppliers.id = channels.supplier_id").
-		Where("channels.status = ? AND channel_models.is_active = ?", "active", true).
-		Preload("Channel").
-		Preload("Channel.Supplier").
-		Find(&channelModels).Error; err != nil {
-		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
-		return
-	}
+	job := channelsvc.NewRouteRefreshJob("manual")
+	currentRefreshJob.Store(job)
 
-	if len(channelModels) == 0 {
-		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "没有可用的接入点模型映射")
-		return
-	}
-
-	// 3. 按 standard_model_id 汇总，选出每个模型成本最优的接入点
-	// costEntry 保存每个候选路由的成本信息
-	type costEntry struct {
-		ChannelModel model.ChannelModel
-		Cost         float64 // 综合成本 = (InputPricePerM + OutputPricePerM) * Discount
-	}
-
-	// modelCandidates: key=标准模型名, value=该模型的所有候选接入点（按成本排序）
-	modelCandidates := make(map[string][]costEntry)
-	for _, cm := range channelModels {
-		supplier := cm.Channel.Supplier
-		// 计算综合成本: (输入价格 + 输出价格) * 折扣
-		cost := (supplier.InputPricePerM + supplier.OutputPricePerM) * supplier.Discount
-		modelCandidates[cm.StandardModelID] = append(modelCandidates[cm.StandardModelID], costEntry{
-			ChannelModel: cm,
-			Cost:         cost,
-		})
-	}
-
-	// 4. 生成路由规则：每个标准模型名选出所有候选接入点，按成本分配 weight
-	var newRoutes []model.CustomChannelRoute
-	for aliasModel, candidates := range modelCandidates {
-		if len(candidates) == 0 {
-			continue
-		}
-
-		// 找出最低成本
-		minCost := math.MaxFloat64
-		for _, ce := range candidates {
-			if ce.Cost > 0 && ce.Cost < minCost {
-				minCost = ce.Cost
+	// 后台执行
+	go func() {
+		defer routeRefreshMu.Unlock()
+		defer func() {
+			if r := recover(); r != nil {
+				zap.L().Error("路由刷新 panic", zap.Any("panic", r))
+				job.Fail(fmt.Errorf("panic: %v", r))
 			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*60*1000*1000*1000) // 10 分钟
+		defer cancel()
+		if err := channelsvc.RefreshDefaultRoutes(ctx, h.db, h.redis, job); err != nil {
+			job.Fail(err)
 		}
-		// 如果所有成本都为0，给一个默认值避免除0
-		if minCost <= 0 || minCost == math.MaxFloat64 {
-			minCost = 1.0
-		}
+	}()
 
-		for _, ce := range candidates {
-			weight := 100
-			priority := 0
-
-			if ce.Cost > 0 {
-				// 成本最低的 weight=100, priority=10
-				// 其余按成本倒数比例分配 weight: weight = int(minCost/cost * 100)
-				ratio := minCost / ce.Cost
-				weight = int(math.Round(ratio * 100))
-				if weight < 1 {
-					weight = 1
-				}
-				if weight >= 100 {
-					priority = 10 // 成本最优的给最高优先级
-				}
-			}
-
-			newRoutes = append(newRoutes, model.CustomChannelRoute{
-				CustomChannelID: defaultCC.ID,
-				AliasModel:      aliasModel,
-				ChannelID:       ce.ChannelModel.ChannelID,
-				ActualModel:     ce.ChannelModel.VendorModelID,
-				Weight:          weight,
-				Priority:        priority,
-				IsActive:        true,
-			})
-		}
-	}
-
-	// 5. 事务：全量替换默认渠道的路由
-	txErr := h.db.Transaction(func(tx *gorm.DB) error {
-		// 删除旧路由
-		if err := tx.Where("custom_channel_id = ?", defaultCC.ID).
-			Delete(&model.CustomChannelRoute{}).Error; err != nil {
-			return err
-		}
-		// 批量写入新路由
-		for _, route := range newRoutes {
-			if err := tx.Create(&route).Error; err != nil {
-				return err
-			}
-		}
-		return nil
+	c.JSON(http.StatusAccepted, gin.H{
+		"job_id":     job.ID,
+		"status":     job.Status,
+		"started_at": job.StartedAt,
 	})
+}
 
-	if txErr != nil {
-		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, txErr.Error())
+// GetRefreshStatus 返回最近一次（正在运行 或 已完成）的路由刷新任务状态快照
+// 前端每 1-2s 轮询此接口，直到 status != "running" 表示完成
+func (h *CustomChannelHandler) GetRefreshStatus(c *gin.Context) {
+	job := loadCurrentRefreshJob()
+	if job == nil {
+		c.JSON(http.StatusOK, gin.H{"job": nil, "message": "尚未执行过路由刷新"})
 		return
 	}
-
-	// 重新加载默认渠道完整数据
-	h.db.Preload("Routes", func(db *gorm.DB) *gorm.DB {
-		return db.Order("priority DESC, weight DESC")
-	}).Preload("Routes.Channel").Preload("Routes.Channel.Supplier").
-		Preload("AccessList").First(&defaultCC, defaultCC.ID)
-
-	response.Success(c, gin.H{
-		"channel":      defaultCC,
-		"total_routes": len(newRoutes),
-		"models_count": len(modelCandidates),
-	})
+	snap := job.Snapshot()
+	c.JSON(http.StatusOK, gin.H{"job": snap})
 }

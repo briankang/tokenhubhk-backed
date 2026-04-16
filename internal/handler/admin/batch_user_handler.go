@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -145,8 +144,8 @@ func (h *BatchUserHandler) BatchCreateUsers(c *gin.Context) {
 		if role == "" {
 			role = "USER"
 		}
-		// 验证角色是否合法
-		validRoles := map[string]bool{"USER": true, "AGENT_L1": true, "AGENT_L2": true, "AGENT_L3": true, "ADMIN": true}
+		// 验证角色是否合法（v3.1：代理角色已废除，仅保留 USER/ADMIN）
+		validRoles := map[string]bool{"USER": true, "ADMIN": true}
 		if !validRoles[role] {
 			role = "USER"
 		}
@@ -188,13 +187,6 @@ func (h *BatchUserHandler) BatchCreateUsers(c *gin.Context) {
 			fmt.Printf("Generate referral code failed for user %d: %v\n", user.ID, err)
 		}
 
-		// 如果是代理商角色，创建 UserAgentProfile
-		if role != "USER" && role != "ADMIN" {
-			if err := h.createAgentProfile(user.ID, role); err != nil {
-				fmt.Printf("Create agent profile failed for user %d: %v\n", user.ID, err)
-			}
-		}
-
 		createResult.Status = "created"
 		createResult.UserID = user.ID
 		result.Created++
@@ -209,17 +201,11 @@ func (h *BatchUserHandler) BatchCreateUsers(c *gin.Context) {
 
 // UpdateRoleRequest 角色更新请求
 type UpdateRoleRequest struct {
-	Role          string `json:"role" binding:"required"`            // 角色：USER/AGENT_L1/AGENT_L2/AGENT_L3/ADMIN
-	AgentLevelCode string `json:"agent_level_code"`                  // 代理等级编码：A0/A1/A2/A3/A4
+	Role string `json:"role" binding:"required"` // 角色：USER/ADMIN
 }
 
 // UpdateUserRole 更新用户角色 PUT /api/v1/admin/users/:id/role
-// 支持的角色: USER, AGENT_L1, AGENT_L2, AGENT_L3, ADMIN
-// 逻辑：
-// 1. 更新 User.Role 字段
-// 2. 如果提升为代理商角色：检查/创建 UserAgentProfile
-// 3. 如果从代理商降为普通用户：更新 UserAgentProfile.Status = "SUSPENDED"
-// 4. 记录审计日志
+// v3.1：代理角色已废除，仅支持 USER/ADMIN 切换
 func (h *BatchUserHandler) UpdateUserRole(c *gin.Context) {
 	userIDStr := c.Param("id")
 	uid, err := strconv.ParseUint(userIDStr, 10, 64)
@@ -235,7 +221,7 @@ func (h *BatchUserHandler) UpdateUserRole(c *gin.Context) {
 	}
 
 	// 验证角色是否合法
-	validRoles := map[string]bool{"USER": true, "AGENT_L1": true, "AGENT_L2": true, "AGENT_L3": true, "ADMIN": true}
+	validRoles := map[string]bool{"USER": true, "ADMIN": true}
 	if !validRoles[req.Role] {
 		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "invalid role")
 		return
@@ -259,31 +245,9 @@ func (h *BatchUserHandler) UpdateUserRole(c *gin.Context) {
 	oldRole := user.Role
 
 	// 更新用户角色
-	if err := h.db.Model(&user).Update("role", req.Role).Error; err != nil {
+	if err := h.db.Model(&model.User{}).Where("id = ?", user.ID).Update("role", req.Role).Error; err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return
-	}
-
-	// 处理代理商档案
-	isOldAgent := (oldRole == "AGENT_L1" || oldRole == "AGENT_L2" || oldRole == "AGENT_L3")
-	isNewAgent := (req.Role == "AGENT_L1" || req.Role == "AGENT_L2" || req.Role == "AGENT_L3")
-
-	if isNewAgent && !isOldAgent {
-		// 提升为代理商：检查/创建 UserAgentProfile
-		if err := h.createAgentProfile(uint(uid), req.Role); err != nil {
-			// 记录错误但继续
-			fmt.Printf("Create agent profile failed: %v\n", err)
-		}
-	} else if !isNewAgent && isOldAgent {
-		// 从代理商降级：更新 UserAgentProfile.Status
-		h.db.Model(&model.UserAgentProfile{}).
-			Where("user_id = ?", uid).
-			Update("status", "SUSPENDED")
-	} else if isNewAgent && isOldAgent {
-		// 代理商等级变更：更新 AgentLevelID
-		if req.AgentLevelCode != "" {
-			h.updateAgentLevel(uint(uid), req.AgentLevelCode)
-		}
 	}
 
 	// 记录审计日志
@@ -388,65 +352,6 @@ func (h *BatchUserHandler) RechargeUserRMB(c *gin.Context) {
 	})
 }
 
-// createAgentProfile 创建用户代理档案
-func (h *BatchUserHandler) createAgentProfile(userID uint, role string) error {
-	// 根据角色确定等级编码
-	levelCode := "A0" // 默认推广员
-	switch role {
-	case "AGENT_L1":
-		levelCode = "A1"
-	case "AGENT_L2":
-		levelCode = "A2"
-	case "AGENT_L3":
-		levelCode = "A3"
-	}
-
-	// 查询代理等级ID
-	var agentLevel model.AgentLevel
-	if err := h.db.Where("level_code = ?", levelCode).First(&agentLevel).Error; err != nil {
-		// 如果等级不存在，使用默认等级
-		if err := h.db.Where("level_code = ?", "A0").First(&agentLevel).Error; err != nil {
-			return fmt.Errorf("agent level not found: %w", err)
-		}
-	}
-
-	// 检查是否已存在档案
-	var existing model.UserAgentProfile
-	err := h.db.Where("user_id = ?", userID).First(&existing).Error
-	if err == nil {
-		// 已存在，更新状态
-		return h.db.Model(&existing).Updates(map[string]interface{}{
-			"agent_level_id": agentLevel.ID,
-			"status":         "ACTIVE",
-			"approved_at":    time.Now(),
-		}).Error
-	}
-	if err != gorm.ErrRecordNotFound {
-		return err
-	}
-
-	// 创建新档案
-	profile := &model.UserAgentProfile{
-		UserID:       userID,
-		AgentLevelID: agentLevel.ID,
-		Status:       "ACTIVE",
-		AppliedAt:    time.Now(),
-		ApprovedAt:   ptrTime(time.Now()),
-	}
-	return h.db.Create(profile).Error
-}
-
-// updateAgentLevel 更新代理商等级
-func (h *BatchUserHandler) updateAgentLevel(userID uint, levelCode string) error {
-	var agentLevel model.AgentLevel
-	if err := h.db.Where("level_code = ?", levelCode).First(&agentLevel).Error; err != nil {
-		return err
-	}
-	return h.db.Model(&model.UserAgentProfile{}).
-		Where("user_id = ?", userID).
-		Update("agent_level_id", agentLevel.ID).Error
-}
-
 // logAudit 记录审计日志
 func (h *BatchUserHandler) logAudit(ctx context.Context, userID uint, action, resource, details string) {
 	log := &model.AuditLog{
@@ -456,11 +361,6 @@ func (h *BatchUserHandler) logAudit(ctx context.Context, userID uint, action, re
 		Details:  model.JSON(details),
 	}
 	_ = h.db.WithContext(ctx).Create(log).Error
-}
-
-// ptrTime 返回时间的指针
-func ptrTime(t time.Time) *time.Time {
-	return &t
 }
 
 // UpdateUserStatusRequest 用户状态更新请求
@@ -502,7 +402,7 @@ func (h *BatchUserHandler) UpdateUserStatus(c *gin.Context) {
 	}
 
 	// 更新用户状态
-	if err := h.db.Model(&user).Update("is_active", req.IsActive).Error; err != nil {
+	if err := h.db.Model(&model.User{}).Where("id = ?", user.ID).Update("is_active", req.IsActive).Error; err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return
 	}

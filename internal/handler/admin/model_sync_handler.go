@@ -1,6 +1,9 @@
 package admin
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -10,6 +13,8 @@ import (
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
+	"tokenhub-server/internal/service/aimodel"
+	"tokenhub-server/internal/service/audit"
 	"tokenhub-server/internal/service/modeldiscovery"
 )
 
@@ -18,6 +23,8 @@ import (
 type ModelSyncHandler struct {
 	discoveryService *modeldiscovery.DiscoveryService
 	db               *gorm.DB
+	auditService     *audit.AuditService
+	modelChecker     *aimodel.ModelChecker
 }
 
 // NewModelSyncHandler 创建模型同步处理器实例
@@ -25,12 +32,24 @@ func NewModelSyncHandler(db *gorm.DB) *ModelSyncHandler {
 	return &ModelSyncHandler{
 		discoveryService: modeldiscovery.NewDiscoveryService(db),
 		db:               db,
+		auditService:     audit.NewAuditService(db),
+		modelChecker:     aimodel.NewModelChecker(db),
 	}
+}
+
+// syncAllResponse 同步全部模型的响应（含检测结果）
+type syncAllResponse struct {
+	Results         []modeldiscovery.SyncResult `json:"results"`
+	Total           int                         `json:"total"`
+	ModelsChecked   int                         `json:"models_checked"`
+	ModelsAvailable int                         `json:"models_available"`
+	ModelsUnavailable int                       `json:"models_unavailable"`
 }
 
 // SyncAll 全量同步所有活跃接入点的模型
 // POST /api/v1/admin/models/sync
 // 遍历所有 active 状态的渠道，调用供应商 /v1/models API 拉取模型列表
+// 同步完成后自动检测新增模型可用性，并写入审计日志
 func (h *ModelSyncHandler) SyncAll(c *gin.Context) {
 	result, err := h.discoveryService.SyncAllActive()
 	if err != nil {
@@ -38,7 +57,63 @@ func (h *ModelSyncHandler) SyncAll(c *gin.Context) {
 		return
 	}
 
-	response.Success(c, result)
+	resp := syncAllResponse{
+		Results: result.Results,
+		Total:   result.Total,
+	}
+
+	// 收集所有新增模型 ID
+	var newModelIDs []uint
+	totalAdded := 0
+	totalFound := 0
+	for _, r := range result.Results {
+		newModelIDs = append(newModelIDs, r.NewModelIDs...)
+		totalAdded += r.ModelsAdded
+		totalFound += r.ModelsFound
+	}
+
+	// 对新增模型做增量可用性检测
+	if len(newModelIDs) > 0 {
+		checkResults, checkErr := h.modelChecker.CheckByIDs(context.Background(), newModelIDs, nil)
+		if checkErr == nil && len(checkResults) > 0 {
+			resp.ModelsChecked = len(checkResults)
+			for _, cr := range checkResults {
+				if cr.Available {
+					resp.ModelsAvailable++
+				} else {
+					resp.ModelsUnavailable++
+				}
+			}
+		}
+	}
+
+	// 写入审计日志
+	operatorID, _ := c.Get("userId")
+	var uid uint
+	if id, ok := operatorID.(uint); ok {
+		uid = id
+	}
+	details := map[string]interface{}{
+		"channels_synced": result.Total,
+		"models_found":    totalFound,
+		"models_added":    totalAdded,
+		"models_checked":  resp.ModelsChecked,
+		"models_available": resp.ModelsAvailable,
+	}
+	detailsJSON, _ := json.Marshal(details)
+	auditLog := &model.AuditLog{
+		UserID:     uid,
+		OperatorID: uid,
+		Action:     "SYNC",
+		Resource:   "MODEL",
+		Details:    detailsJSON,
+		IP:         c.ClientIP(),
+		RequestID:  c.GetString("requestId"),
+		Remark:     fmt.Sprintf("同步%d个渠道，发现%d个模型，新增%d个", result.Total, totalFound, totalAdded),
+	}
+	_ = h.auditService.Create(c.Request.Context(), auditLog)
+
+	response.Success(c, resp)
 }
 
 // SyncByChannel 单个渠道同步模型
@@ -76,7 +151,7 @@ func (h *ModelSyncHandler) ListChannelModels(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if pageSize < 1 || pageSize > 100 {
+	if pageSize < 1 || pageSize > 2000 {
 		pageSize = 20
 	}
 
@@ -86,6 +161,12 @@ func (h *ModelSyncHandler) ListChannelModels(c *gin.Context) {
 	// 按渠道ID筛选
 	if channelID := c.Query("channel_id"); channelID != "" {
 		query = query.Where("channel_id = ?", channelID)
+	}
+
+	// 按供应商ID筛选（通过 channels 表 join）
+	if supplierID := c.Query("supplier_id"); supplierID != "" {
+		query = query.Joins("JOIN channels ON channels.id = channel_models.channel_id AND channels.deleted_at IS NULL").
+			Where("channels.supplier_id = ?", supplierID)
 	}
 
 	// 按标准模型ID筛选
@@ -193,6 +274,7 @@ func (h *ModelSyncHandler) UpdateChannelModel(c *gin.Context) {
 	// 只允许更新指定字段，防止越权修改
 	allowedFields := map[string]bool{
 		"standard_model_id": true,
+		"vendor_model_id":   true,
 		"is_active":         true,
 	}
 	safeUpdates := make(map[string]interface{})
@@ -214,4 +296,55 @@ func (h *ModelSyncHandler) UpdateChannelModel(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{"message": "updated"})
+}
+
+// BatchUpdateSellingPrice 批量修改模型售价
+// PUT /api/v1/admin/models/batch-selling-price
+// 请求体: { "ids": [1,2,3], "discount": 0.9 }
+// discount: 基于官方成本价的折扣比例，如 0.9 表示9折，0.85 表示85折
+func (h *ModelSyncHandler) BatchUpdateSellingPrice(c *gin.Context) {
+	var req struct {
+		IDs      []uint  `json:"ids" binding:"required,min=1"`
+		Discount float64 `json:"discount" binding:"required,gt=0,lte=10"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
+		return
+	}
+
+	// 查询选中模型的成本价
+	var models []model.AIModel
+	if err := h.db.Where("id IN ?", req.IDs).Find(&models).Error; err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrDatabase.Code, err.Error())
+		return
+	}
+
+	updated := 0
+	for _, m := range models {
+		sellingInputRMB := float64(int(m.InputCostRMB*req.Discount*10000+0.5)) / 10000
+		sellingOutputRMB := float64(int(m.OutputCostRMB*req.Discount*10000+0.5)) / 10000
+
+		var pricing model.ModelPricing
+		err := h.db.Where("model_id = ?", m.ID).First(&pricing).Error
+		if err != nil {
+			pricing = model.ModelPricing{ModelID: m.ID}
+		}
+		pricing.InputPriceRMB = sellingInputRMB
+		pricing.InputPricePerToken = int64(sellingInputRMB * 10000)
+		pricing.OutputPriceRMB = sellingOutputRMB
+		pricing.OutputPricePerToken = int64(sellingOutputRMB * 10000)
+
+		if pricing.ID == 0 {
+			h.db.Create(&pricing)
+		} else {
+			h.db.Save(&pricing)
+		}
+		updated++
+	}
+
+	invalidatePublicModelsCache()
+	response.Success(c, gin.H{
+		"message": "批量售价更新成功",
+		"updated": updated,
+	})
 }

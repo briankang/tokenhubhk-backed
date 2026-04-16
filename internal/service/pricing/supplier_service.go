@@ -94,7 +94,7 @@ func (s *SupplierService) Update(ctx context.Context, id uint, supplier *model.S
 		}
 		return fmt.Errorf("query supplier: %w", err)
 	}
-	if err := s.db.WithContext(ctx).Model(&existing).Updates(map[string]interface{}{
+	if err := s.db.WithContext(ctx).Model(&model.Supplier{}).Where("id = ?", existing.ID).Updates(map[string]interface{}{
 		"name":        supplier.Name,
 		"code":        supplier.Code,
 		"base_url":    supplier.BaseURL,

@@ -375,11 +375,11 @@ func seedChannels(tx *gorm.DB) error {
 		SupplierID:     aliyunSup.ID,
 		Type:           "openai",
 		Endpoint:       "https://dashscope.aliyuncs.com/compatible-mode/v1",
-		APIKey:         "sk-2843b10e786f4d20b1d46444a8b020b1",
+		APIKey:         "", // 通过管理后台「渠道管理」配置，禁止在代码中硬编码
 		Models:         mustJSON([]string{"qwen-turbo", "qwen-plus", "qwen-max"}),
 		Weight:         10,
 		Priority:       10,
-		Status:         "active",
+		Status:         "inactive", // 无 APIKey 时保持未激活
 		MaxConcurrency: 100,
 		QPM:            60,
 	}
@@ -398,11 +398,11 @@ func seedChannels(tx *gorm.DB) error {
 		SupplierID:     volcSup.ID,
 		Type:           "openai",
 		Endpoint:       "https://ark.cn-beijing.volces.com/api/v3",
-		APIKey:         "fc1ca371-a7fc-467a-b594-27e247b09dd4",
+		APIKey:         "", // 通过管理后台「渠道管理」配置，禁止在代码中硬编码
 		Models:         mustJSON([]string{"doubao-pro-4k", "doubao-pro-32k", "doubao-pro-128k"}),
 		Weight:         10,
 		Priority:       10,
-		Status:         "active",
+		Status:         "inactive", // 无 APIKey 时保持未激活
 		MaxConcurrency: 100,
 		QPM:            60,
 	}
@@ -420,11 +420,11 @@ func seedChannels(tx *gorm.DB) error {
 		SupplierID:     qianfanSup.ID,
 		Type:           "openai",
 		Endpoint:       "https://qianfan.baidubce.com/v2",
-		APIKey:         "bce-v3/ALTAK-sLTAcXvm2vjPcjqJmjBRK/bff65bf034b359f46cfdff7bd3b45dbf3548f7a8",
+		APIKey:         "", // 通过管理后台「渠道管理」配置，禁止在代码中硬编码
 		Models:         mustJSON([]string{"ernie-4.5-8k", "ernie-x1", "ernie-4.0-8k", "ernie-3.5-8k", "ernie-speed-8k", "ernie-lite-8k"}),
 		Weight:         10,
 		Priority:       10,
-		Status:         "active",
+		Status:         "inactive", // 无 APIKey 时保持未激活
 		MaxConcurrency: 100,
 		QPM:            60,
 	}
@@ -667,11 +667,11 @@ func seedCodingPlanChannels(tx *gorm.DB) error {
 		Type:           "openai",
 		ChannelType:    "CODING",
 		Endpoint:       "https://dashscope.aliyuncs.com/compatible-mode/v1",
-		APIKey:         "sk-sp-117b06de47cb4212976d5d1e98a6f7f0",
+		APIKey:         "", // 通过管理后台「渠道管理」配置，禁止在代码中硬编码
 		Models:         mustJSON([]string{"qwen-coder-plus", "qwen-coder-turbo", "qwen-plus", "qwen-turbo"}),
 		Weight:         10,
 		Priority:       10,
-		Status:         "active",
+		Status:         "inactive", // 无 APIKey 时保持未激活
 		MaxConcurrency: 100,
 		QPM:            60,
 	}
@@ -686,11 +686,11 @@ func seedCodingPlanChannels(tx *gorm.DB) error {
 		Type:           "openai",
 		ChannelType:    "CODING",
 		Endpoint:       "https://ark.cn-beijing.volces.com/api/v3",
-		APIKey:         "583a2d35-6453-407d-a845-66965821d959",
+		APIKey:         "", // 通过管理后台「渠道管理」配置，禁止在代码中硬编码
 		Models:         mustJSON([]string{"doubao-coder", "doubao-coder-pro", "doubao-pro-32k"}),
 		Weight:         10,
 		Priority:       8,
-		Status:         "active",
+		Status:         "inactive", // 无 APIKey 时保持未激活
 		MaxConcurrency: 100,
 		QPM:            60,
 	}

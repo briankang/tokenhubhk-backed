@@ -838,6 +838,12 @@ func inferModelTypeByName(name string) string {
 		return "VideoGeneration"
 	}
 
+	// 腾讯混元视觉理解（Vision/VLM）：hunyuan-vision / hunyuan-turbo-vision
+	// 注意：必须在 ImageGeneration 块之前，避免被 "vision" 泛化匹配误伤
+	if strings.Contains(lower, "hunyuan") && strings.Contains(lower, "vision") {
+		return "Vision"
+	}
+
 	// 图像生成：seedream / seededit / -t2i / qwen-image / z-image / flux /
 	//           stable-diffusion / dall-e / midjourney / ideogram / wan*-image / cogview / hidream
 	if strings.Contains(lower, "seedream") || strings.Contains(lower, "seededit") ||
@@ -1534,8 +1540,7 @@ func (mc *ModelChecker) getWenxinAccessToken(ctx context.Context, clientID, clie
 	if err != nil {
 		return "", err
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := mc.httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}

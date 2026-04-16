@@ -236,7 +236,8 @@ func RunSeedQianfan(db *gorm.DB) {
 		}
 	}
 
-	// ---- 5. 真实渠道（已激活）----
+	// ---- 5. 真实渠道（未激活，APIKey 需在管理后台配置）----
+	// 注意：APIKey 不在代码中存储，请通过管理后台「渠道管理」填入
 	var realCh model.Channel
 	if db.Where("name = ?", "百度千帆-真实渠道").First(&realCh).Error != nil {
 		realCh = model.Channel{
@@ -244,7 +245,7 @@ func RunSeedQianfan(db *gorm.DB) {
 			SupplierID:     qianfanSup.ID,
 			Type:           "openai",
 			Endpoint:       "https://qianfan.baidubce.com/v2",
-			APIKey:         "bce-v3/ALTAK-sLTAcXvm2vjPcjqJmjBRK/bff65bf034b359f46cfdff7bd3b45dbf3548f7a8",
+			APIKey:         "", // 通过管理后台「渠道管理」配置，禁止在代码中硬编码
 			Models: mustJSONArr([]string{
 				"ernie-3.5-128k", "ernie-3.5-8k",
 				"ernie-4.0-8k", "ernie-4.0-8k-latest", "ernie-4.0-turbo-8k",
@@ -255,7 +256,7 @@ func RunSeedQianfan(db *gorm.DB) {
 			}),
 			Weight:         10,
 			Priority:       10,
-			Status:         "active",
+			Status:         "inactive", // 无 APIKey 时保持未激活
 			MaxConcurrency: 100,
 			QPM:            60,
 		}

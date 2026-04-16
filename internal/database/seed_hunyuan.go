@@ -235,11 +235,11 @@ func RunSeedHunyuan(db *gorm.DB) {
 			SupplierID:     hunyuanSup.ID,
 			Type:           "openai",
 			Endpoint:       "https://api.hunyuan.cloud.tencent.com/v1",
-			APIKey:         "sk-trpeBvvnaI1MDBwYpuil1Ah9prQmbIALvWj5qCd9fayUR0YV",
+			APIKey:         "", // 通过管理后台「渠道管理」配置，禁止在代码中硬编码
 			Models:         modelsJSON,
 			Weight:         10,
 			Priority:       10,
-			Status:         "active",
+			Status:         "inactive", // 无 APIKey 时保持未激活
 			MaxConcurrency: 100,
 			QPM:            60,
 		}

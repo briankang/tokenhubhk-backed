@@ -167,6 +167,12 @@ func MultiLevelRateLimiter() gin.HandlerFunc {
 
 		// 未认证请求：使用 IP 级限流
 		ip := c.ClientIP()
+		// 回环地址和 Docker 内网豁免：本地开发时浏览器经过 nginx 后 IP 为 172.18.0.1（Docker 网桥），
+		// 外网用户永远不会有这些 IP，豁免不会影响生产安全性
+		if ip == "::1" || ip == "127.0.0.1" || strings.HasPrefix(ip, "172.17.") || strings.HasPrefix(ip, "172.18.") {
+			c.Next()
+			return
+		}
 		key := fmt.Sprintf("rl:ip:%s", ip)
 		limit := cfg.IPRPM
 		if !slidingWindowCheck(ctx, redis, key, limit, c) {

@@ -1,0 +1,16 @@
+{
+  "_description": "微信支付账号配置样本（config_json 解密后结构，用于测试数据种子）",
+  "provider_type": "WECHAT",
+  "account_name": "微信支付主账号",
+  "is_active": true,
+  "is_sandbox": true,
+  "config": {
+    "app_id": "wx1234567890abcdef",
+    "mch_id": "1900000109",
+    "api_key": "MOCK_API_KEY_v2_32bytes_placeholder01",
+    "api_v3_key": "MOCK_APIv3_KEY_32bytes_placeholder012",
+    "cert_serial_no": "5A3F6B1C2D3E4F5A6B7C8D9E0F1A2B3C4D5E6F7",
+    "private_key": "-----BEGIN PRIVATE KEY-----\nMOCK_PRIVATE_KEY_PLACEHOLDER\n-----END PRIVATE KEY-----",
+    "notify_url": "https://api.tokenhubhk.com/api/v1/callback/wechat"
+  }
+}

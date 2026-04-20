@@ -16,6 +16,22 @@ type Supplier struct {
 	OutputPricePerM float64 `gorm:"type:decimal(10,4);default:0" json:"output_price_per_m"`   // 输出tokens官网价格（每百万tokens，人民币）
 	Discount        float64 `gorm:"type:decimal(5,4);default:1.0" json:"discount"`            // 折扣比例，如0.85表示85折，1.0表示无折扣
 	Status          string  `gorm:"type:varchar(20);default:'active'" json:"status"`          // 状态: active / inactive / maintenance
+
+	// ---- 官方定价文档 URL（v3.5 新增） ----
+	// PricingURL 单一定价页 URL，优先级最高（管理员维护）
+	// 价格爬虫运行时以此 URL 作为 SourceURL 写入 price_tiers.source_url
+	PricingURL string `gorm:"type:varchar(500)" json:"pricing_url,omitempty"`
+	// PricingURLs 多页面定价配置（JSON 数组）
+	// 格式：[{"url":"xxx","type_hint":"VideoGeneration"}, ...]
+	// 用于供应商的文本/视频/图片/语音等定价分散在多个页面的场景
+	PricingURLs JSON `gorm:"type:json" json:"pricing_urls,omitempty"`
+}
+
+// PricingURLEntry 多页面定价配置的单条记录
+// 存储在 PricingURLs JSON 数组内
+type PricingURLEntry struct {
+	URL      string `json:"url"`                 // 定价页 URL
+	TypeHint string `json:"type_hint,omitempty"` // 期望模型类型提示（用于浏览器爬取后的自动分类）
 }
 
 // TableName 指定供应商表名

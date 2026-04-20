@@ -86,6 +86,7 @@ func (h *PricingHandler) CreateModelPricing(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusInternalServerError, 50001, err.Error())
 		return
 	}
+	invalidatePublicModelsCache()
 	response.Success(c, mp)
 }
 
@@ -124,6 +125,7 @@ func (h *PricingHandler) UpdateModelPricing(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusInternalServerError, 50001, err.Error())
 		return
 	}
+	invalidatePublicModelsCache()
 	response.Success(c, nil)
 }
 

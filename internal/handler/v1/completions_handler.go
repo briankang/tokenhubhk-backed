@@ -164,6 +164,41 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// 步骤 2.2：模型元信息前置守卫
+	// 拦截 offline/非激活 模型和非 chat 类型（如 ImageGeneration/VideoGeneration/TTS 等）
+	// 的请求，避免无效请求到达上游并污染渠道健康指标。
+	// 若模型不存在（例如别名映射/聚合路由），则跳过守卫，后续 SelectChannel 会再次校验。
+	if meta, err := h.loadModelMeta(req.Model); err == nil {
+		if !meta.IsActive || strings.EqualFold(meta.Status, "offline") {
+			h.logger.Warn("v1 chat: model offline or inactive",
+				zap.String("model", req.Model),
+				zap.String("status", meta.Status),
+				zap.Bool("is_active", meta.IsActive))
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": gin.H{
+					"message": fmt.Sprintf("Model %s has been disabled, please choose another model", req.Model),
+					"type":    "model_unavailable",
+					"code":    "model_offline",
+				},
+			})
+			return
+		}
+		if !isChatCompatibleModelType(meta.ModelType) {
+			hint := endpointHintForModelType(meta.ModelType)
+			h.logger.Warn("v1 chat: non-chat model type rejected",
+				zap.String("model", req.Model),
+				zap.String("type", meta.ModelType))
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": gin.H{
+					"message": fmt.Sprintf("Model %s has type %q which is not supported on /v1/chat/completions; please use %s", req.Model, meta.ModelType, hint),
+					"type":    "invalid_request_error",
+					"code":    "unsupported_model_type",
+				},
+			})
+			return
+		}
+	}
+
 	requestID := "chatcmpl-" + uuid.New().String()
 	// 优先使用中间件生成的全局 RequestID，确保全链路可追踪
 	if globalReqID, exists := c.Get("X-Request-ID"); exists {
@@ -299,12 +334,30 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 			Stop:        req.Stop,
 		}
 		// 3.3.0 尝试自动注入缓存控制标记（仅对 Anthropic explicit 机制模型）
+		// 若用户在 extra 中显式传 cache_enabled=false，则跳过注入并从 extra 中剥离该键（不透传给上游）
+		cacheEnabledByUser := true
+		if v, ok := userExtraParams["cache_enabled"]; ok {
+			if b, isBool := v.(bool); isBool {
+				cacheEnabledByUser = b
+			}
+			delete(userExtraParams, "cache_enabled")
+		}
 		if aiModelForCache := h.loadAIModelForCache(c.Request.Context(), req.Model); aiModelForCache != nil {
-			if h.shouldInjectCacheControl(&req, aiModelForCache) {
+			if cacheEnabledByUser && h.shouldInjectCacheControl(&req, aiModelForCache) {
 				chatReq.InjectCacheControl = true
 				h.logger.Debug("v1 chat: 自动注入缓存控制标记",
 					zap.String("model", req.Model),
 					zap.String("cache_mechanism", aiModelForCache.CacheMechanism))
+			} else if !cacheEnabledByUser {
+				h.logger.Debug("v1 chat: 用户显式关闭缓存，跳过注入",
+					zap.String("model", req.Model))
+			}
+			// requires_stream：部分模型（如 MiniMax Pro）仅支持流式接口，强制转为流式
+			if !req.Stream && aiModelForCache.RequiresStream() {
+				req.Stream = true
+				chatReq.Stream = true
+				h.logger.Debug("v1 chat: 模型要求流式，自动升级请求",
+					zap.String("model", req.Model))
 			}
 		}
 
@@ -345,7 +398,8 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 				// 连接阶段失败，可以重试
 				latency := time.Since(start).Milliseconds()
 				h.recordLog(ch.ID, chatReq.Model, keyInfo, requestID, 0, 0, int(latency), 500, streamErr.Error())
-				h.channelRouter.RecordResult(ch.ID, false, int(latency), 500)
+				// 使用带错误分类的记录：client_canceled / timeout 不触发熔断
+				h.channelRouter.RecordResultWithError(ch.ID, streamErr, 0, int(latency))
 				excludeChannelIDs = append(excludeChannelIDs, ch.ID)
 				lastErr = streamErr
 				h.logger.Warn("v1 chat: 流式连接失败，尝试下一渠道",
@@ -361,7 +415,8 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 			sseResult, writeErr := provider.SSEWriter(c, reader, includeUsage)
 			latency := time.Since(start).Milliseconds()
 			if writeErr != nil {
-				h.channelRouter.RecordResult(ch.ID, false, int(latency), 500)
+				// 使用带错误分类的记录：客户端主动断开不应触发熔断
+				h.channelRouter.RecordResultWithError(ch.ID, writeErr, 0, int(latency))
 				// 流式断连补扣：若 usage 已在断连前完整聚合，仍执行扣费避免丢账
 				var partialCost int64
 				var partialCostRMB float64
@@ -389,6 +444,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 				callLog.ErrorType = "stream_write_error"
 				callLog.CostCredits = partialCost
 				callLog.CostRMB = partialCostRMB
+				applyMatchedTierFromCtx(c, callLog)
 				if sseResult != nil && sseResult.Usage != nil {
 					callLog.PromptTokens = sseResult.Usage.PromptTokens
 					callLog.CompletionTokens = sseResult.Usage.CompletionTokens
@@ -424,6 +480,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 					callLog.CostRMB = costRMB
 					callLog.CacheReadTokens = usage.CacheReadTokens
 					callLog.CacheWriteTokens = usage.CacheWriteTokens
+					applyMatchedTierFromCtx(c, callLog)
 					// 记录实际 TPM 消耗
 					if h.tpmLimiter != nil && usage.TotalTokens > 0 {
 						h.tpmLimiter.RecordTPM(c.Request.Context(), keyInfo.UserID, usage.TotalTokens)
@@ -454,7 +511,8 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 		if chatErr != nil {
 			// 请求失败，记录并重试下一个渠道
 			h.recordLog(ch.ID, chatReq.Model, keyInfo, requestID, 0, 0, int(latency), 500, chatErr.Error())
-			h.channelRouter.RecordResult(ch.ID, false, int(latency), 500)
+			// 使用带错误分类的记录：timeout / canceled / 4xx 不计入熔断
+			h.channelRouter.RecordResultWithError(ch.ID, chatErr, 0, int(latency))
 			excludeChannelIDs = append(excludeChannelIDs, ch.ID)
 			lastErr = chatErr
 			h.logger.Warn("v1 chat: 上游请求失败，尝试下一渠道",
@@ -496,6 +554,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 		callLog.RetryCount = attempt
 		callLog.CostCredits = cost
 		callLog.CostRMB = costRMB
+		applyMatchedTierFromCtx(c, callLog)
 		callLog.Status = "success"
 		h.recordApiCallLog(callLog)
 
@@ -551,7 +610,8 @@ func (h *CompletionsHandler) handleChat(
 
 	if err != nil {
 		h.recordLog(ch.ID, req.Model, keyInfo, requestID, 0, 0, int(latency), 500, err.Error())
-		h.channelRouter.RecordResult(ch.ID, false, int(latency), 500)
+		// 使用带错误分类的记录：timeout / canceled / 4xx 不计入熔断
+		h.channelRouter.RecordResultWithError(ch.ID, err, 0, int(latency))
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error": gin.H{
 				"message": "Upstream provider error",
@@ -590,7 +650,8 @@ func (h *CompletionsHandler) handleStreamChat(
 	if err != nil {
 		latency := time.Since(start).Milliseconds()
 		h.recordLog(ch.ID, req.Model, keyInfo, requestID, 0, 0, int(latency), 500, err.Error())
-		h.channelRouter.RecordResult(ch.ID, false, int(latency), 500)
+		// 使用带错误分类的记录：timeout / canceled / 4xx 不计入熔断
+		h.channelRouter.RecordResultWithError(ch.ID, err, 0, int(latency))
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error": gin.H{
 				"message": "Upstream provider error",
@@ -605,7 +666,8 @@ func (h *CompletionsHandler) handleStreamChat(
 	latency := time.Since(start).Milliseconds()
 
 	if err != nil {
-		h.channelRouter.RecordResult(ch.ID, false, int(latency), 500)
+		// 使用带错误分类的记录：客户端主动断开不应触发熔断
+		h.channelRouter.RecordResultWithError(ch.ID, err, 0, int(latency))
 		h.recordLog(ch.ID, req.Model, keyInfo, requestID, 0, 0, int(latency), 500, err.Error())
 		return
 	}
@@ -898,10 +960,19 @@ func (h *CompletionsHandler) authenticateAPIKey(c *gin.Context) (*apikey.ApiKeyI
 }
 
 // recordLog 异步保存渠道调用日志（同时写入 channel_logs 和 api_call_logs）
+// 注意：此函数不读 gin.Context，因此 MatchedPriceTier 信息不会写入 ChannelLog
+// ApiCallLog 中的 MatchedPriceTier 通过 applyMatchedTierFromCtx 辅助函数单独写入
+//
+// ErrorCategory 自动分类规则：
+//   - statusCode 2xx 且 errMsg 为空 → "success"
+//   - statusCode 2xx 但 errMsg 以 "warn:" 开头 → "success"（业务预警仍算成功）
+//   - 其他情况调用 ClassifyError(nil, statusCode) 基于 statusCode + errMsg 字符串匹配推断
 func (h *CompletionsHandler) recordLog(
 	channelID uint, modelName string, keyInfo *apikey.ApiKeyInfo,
 	requestID string, promptTokens, completionTokens, latencyMs, statusCode int, errMsg string,
 ) {
+	// 预先计算 ErrorCategory（避免在 goroutine 里重复推断）
+	category := inferErrorCategory(statusCode, errMsg)
 	go func() {
 		log := &model.ChannelLog{
 			ChannelID:      channelID,
@@ -914,12 +985,53 @@ func (h *CompletionsHandler) recordLog(
 			LatencyMs:      latencyMs,
 			StatusCode:     statusCode,
 			ErrorMessage:   errMsg,
+			ErrorCategory:  category,
 			RequestID:      requestID,
+			MatchedPriceTierIdx: -1,
 		}
 		if err := h.db.Create(log).Error; err != nil {
 			h.logger.Error("v1: 记录渠道日志失败", zap.Error(err))
 		}
 	}()
+}
+
+// inferErrorCategory 基于 status_code 与 errMsg 字符串推断错误类别
+// 调用 channelsvc.ClassifyError 使用其 HTTP status + 字符串回退分支
+func inferErrorCategory(statusCode int, errMsg string) string {
+	// warn: 前缀属于业务预警（如 thinking_only、stream_disconnect_deducted），视为成功
+	if statusCode >= 200 && statusCode < 400 {
+		return string(channelsvc.ErrCatSuccess)
+	}
+	// 用 errMsg 伪造一个 error 传入 ClassifyError 以触发其字符串 fallback 分支
+	var err error
+	if errMsg != "" {
+		err = stringError(errMsg)
+	}
+	return string(channelsvc.ClassifyError(err, statusCode))
+}
+
+// stringError 辅助类型：把字符串包装成 error 供 ClassifyError 做 errors.Is / As / 字符串匹配
+type stringError string
+
+func (s stringError) Error() string { return string(s) }
+
+// applyMatchedTierFromCtx 从 gin.Context 读取阶梯命中信息并写入 ApiCallLog
+// 由 calculateAndDeductCostWithErr 写入上下文；失败或未计费时保持默认 (-1, "")
+func applyMatchedTierFromCtx(c *gin.Context, callLog *model.ApiCallLog) {
+	if callLog == nil {
+		return
+	}
+	callLog.MatchedPriceTierIdx = -1
+	if tier, ok := c.Get("matched_price_tier"); ok {
+		if s, ok2 := tier.(string); ok2 {
+			callLog.MatchedPriceTier = s
+		}
+	}
+	if idx, ok := c.Get("matched_price_tier_idx"); ok {
+		if i, ok2 := idx.(int); ok2 {
+			callLog.MatchedPriceTierIdx = i
+		}
+	}
 }
 
 // ensureModelPriced 校验请求模型已在 model_pricings 表维护售价
@@ -973,14 +1085,26 @@ func (h *CompletionsHandler) calculateAndDeductCostWithErr(
 	if err := h.db.WithContext(ctx).Where("model_name = ? AND is_active = true", modelName).First(&aiModel).Error; err != nil {
 		return 0, 0, nil
 	}
-	costResult, err := h.pricingCalc.CalculateCost(
-		ctx,
-		aiModel.ID, keyInfo.TenantID, 0,
-		usage.PromptTokens, usage.CompletionTokens,
-	)
+	// 含缓存用量时走 CalculateCostWithCache，将 cache_read/cache_write 按缓存比率从用户售价中扣除
+	// 无缓存命中时内部自动回退到普通 CalculateCost 路径
+	var costResult *pricing.CostResult
+	var err error
+	if usage.CacheReadTokens > 0 || usage.CacheWriteTokens > 0 {
+		costResult, err = h.pricingCalc.CalculateCostWithCache(ctx, &aiModel, keyInfo.TenantID, 0, pricing.CacheUsageInput{
+			InputTokens:      usage.PromptTokens,
+			OutputTokens:     usage.CompletionTokens,
+			CacheReadTokens:  usage.CacheReadTokens,
+			CacheWriteTokens: usage.CacheWriteTokens,
+		})
+	} else {
+		costResult, err = h.pricingCalc.CalculateCost(ctx, aiModel.ID, keyInfo.TenantID, 0, usage.PromptTokens, usage.CompletionTokens)
+	}
 	if err != nil || costResult == nil {
 		return 0, 0, err
 	}
+	// 将命中阶梯信息写入 gin.Context，供 ApiCallLog 构造时提取（key: matched_price_tier / matched_price_tier_idx）
+	c.Set("matched_price_tier", costResult.MatchedTier)
+	c.Set("matched_price_tier_idx", costResult.MatchedTierIdx)
 	if h.balanceSvc != nil && costResult.TotalCost > 0 {
 		if dErr := h.balanceSvc.DeductForRequest(ctx, keyInfo.UserID, keyInfo.TenantID, costResult.TotalCost, modelName, requestID); dErr != nil {
 			h.logger.Error("扣费失败，需要人工对账",
@@ -1075,7 +1199,7 @@ func (h *CompletionsHandler) loadAIModelForCache(ctx context.Context, modelName 
 	err := h.db.WithContext(ctx).
 		Select("id, model_name, supports_cache, cache_mechanism, cache_min_tokens, "+
 			"cache_input_price_rmb, cache_explicit_input_price_rmb, cache_write_price_rmb, "+
-			"input_cost_rmb, output_cost_rmb").
+			"input_cost_rmb, output_cost_rmb, features").
 		Where("model_name = ? AND is_active = true", modelName).
 		First(&aiModel).Error
 	if err != nil {
@@ -1086,6 +1210,12 @@ func (h *CompletionsHandler) loadAIModelForCache(ctx context.Context, modelName 
 
 // mergeExtraParams 合并模型级和渠道级的自定义参数
 // 优先级：渠道 CustomParams > 模型 ExtraParams（渠道参数覆盖模型参数）
+//
+// 防御性过滤（自 2026-04-20 起）：
+// 对每个键-值对，若 key 命中 model.BogusFlagKeys 白名单 且 value 是 bool，则跳过。
+// 这类 {key: bool} 是历史脏数据（能力标记被误写入 extra_params），直接合并进请求体
+// 会触发上游 400 "cannot unmarshal bool into ... []string" 等错误。
+// 与 RunExtraParamsFeatureFlagsCleanup 迁移使用同一份白名单。
 func (h *CompletionsHandler) mergeExtraParams(modelName string, ch *model.Channel) map[string]interface{} {
 	extra := make(map[string]interface{})
 
@@ -1096,6 +1226,9 @@ func (h *CompletionsHandler) mergeExtraParams(modelName string, ch *model.Channe
 			var modelParams map[string]interface{}
 			if json.Unmarshal(aiModel.ExtraParams, &modelParams) == nil {
 				for k, v := range modelParams {
+					if skipBogusBoolFlag(modelName, "ai_models.extra_params", k, v) {
+						continue
+					}
 					extra[k] = v
 				}
 			}
@@ -1109,6 +1242,9 @@ func (h *CompletionsHandler) mergeExtraParams(modelName string, ch *model.Channe
 			// 提取 extra_body 中的参数，合并到 extra（覆盖模型参数）
 			if body, ok := channelParams["extra_body"].(map[string]interface{}); ok {
 				for k, v := range body {
+					if skipBogusBoolFlag(modelName, "channels.custom_params.extra_body", k, v) {
+						continue
+					}
 					extra[k] = v
 				}
 			}
@@ -1116,6 +1252,9 @@ func (h *CompletionsHandler) mergeExtraParams(modelName string, ch *model.Channe
 			// 保留字段：headers, extra_body
 			for k, v := range channelParams {
 				if k != "headers" && k != "extra_body" {
+					if skipBogusBoolFlag(modelName, "channels.custom_params", k, v) {
+						continue
+					}
 					extra[k] = v
 				}
 			}
@@ -1127,4 +1266,81 @@ func (h *CompletionsHandler) mergeExtraParams(modelName string, ch *model.Channe
 	}
 
 	return extra
+}
+
+// skipBogusBoolFlag 判定某个 extra_params 键值对是否应被跳过。
+// 返回 true 表示这是脏能力标记（{key: bool} 形式），应丢弃，并记录 warn 日志。
+func skipBogusBoolFlag(modelName, source, key string, value interface{}) bool {
+	if !model.IsBogusFlagKey(key) {
+		return false
+	}
+	if _, isBool := value.(bool); !isBool {
+		return false
+	}
+	logger.L.Warn("extra_params: skip bogus bool flag (likely dirty capability marker)",
+		zap.String("model", modelName),
+		zap.String("source", source),
+		zap.String("key", key),
+	)
+	return true
+}
+
+// modelMeta 是模型前置校验所需的最小元信息
+type modelMeta struct {
+	ID        uint   `gorm:"column:id"`
+	ModelName string `gorm:"column:model_name"`
+	ModelType string `gorm:"column:model_type"`
+	Status    string `gorm:"column:status"`
+	IsActive  bool   `gorm:"column:is_active"`
+}
+
+// loadModelMeta 从 ai_models 表查找模型的可用状态与类型
+// 返回 ErrRecordNotFound 视为"未知模型"，由后续 SelectChannel 统一处理
+func (h *CompletionsHandler) loadModelMeta(modelName string) (*modelMeta, error) {
+	var m modelMeta
+	err := h.db.Table("ai_models").
+		Select("id, model_name, model_type, status, is_active").
+		Where("model_name = ?", modelName).
+		Take(&m).Error
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// isChatCompatibleModelType 判断 model_type 是否允许走 /v1/chat/completions
+// 空字符串视为历史数据（默认兼容），仅拒绝明确声明的非 chat 类型
+func isChatCompatibleModelType(t string) bool {
+	tl := strings.ToLower(strings.TrimSpace(t))
+	if tl == "" {
+		return true
+	}
+	switch tl {
+	case "llm", "chat", "vlm", "vision", "reasoning", "multimodal":
+		return true
+	}
+	return false
+}
+
+// endpointHintForModelType 根据模型类型给出正确端点的提示信息
+func endpointHintForModelType(t string) string {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "imagegeneration", "image":
+		return "/v1/images/generations"
+	case "videogeneration", "video":
+		return "/v1/videos/generations"
+	case "tts", "speech":
+		return "/v1/audio/speech"
+	case "asr", "stt":
+		return "/v1/audio/transcriptions"
+	case "embedding", "embeddings":
+		return "/v1/embeddings"
+	case "rerank", "reranker":
+		return "/v1/rerank"
+	case "translation":
+		return "/v1/translations"
+	case "moderation":
+		return "/v1/moderations"
+	}
+	return "the matching dedicated endpoint"
 }

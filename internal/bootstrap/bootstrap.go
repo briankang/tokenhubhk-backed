@@ -15,6 +15,7 @@ import (
 	pkgi18n "tokenhub-server/internal/pkg/i18n"
 	"tokenhub-server/internal/pkg/logger"
 	pkgredis "tokenhub-server/internal/pkg/redis"
+	permissionsvc "tokenhub-server/internal/service/permission"
 )
 
 // Result 保存初始化后的基础设施引用，供调用方获取清理函数
@@ -64,6 +65,16 @@ func runSeeds() {
 	database.RunSeedLevels(database.DB)
 	database.RunSeedParams()
 	database.RunCachePriceMigration(database.DB)
+	database.RunPriceTiers2DMigration(database.DB)
+	database.RunExtraParamsCleanupMigration(database.DB)
+	database.RunExtraParamsFeatureFlagsCleanup(database.DB) // 清理 {key:bool} 能力标记脏数据
+	database.RunQwqRequiresStreamMigration(database.DB)     // 为 qwq/qvq 系列回填 features.requires_stream=true
+	database.RunSupplierPricingURLMigration(database.DB)
+	database.RunCacheTypeCleanup(database.DB)
+
+	// v3.5: 统一标签字典（多语言 + 颜色 + 图标 + 排序权重）+ tags→labels 迁移
+	database.RunSeedLabelDictionary(database.DB)
+	database.RunMigrateTagsToLabels(database.DB)
 
 	if err := database.MigrateChannelCapabilities(database.DB); err != nil {
 		logger.L.Warn("channel capabilities migration failed", zap.Error(err))
@@ -72,12 +83,30 @@ func runSeeds() {
 		logger.L.Warn("drop agent tables migration failed", zap.Error(err))
 	}
 
-	database.RunSeedNonTokenModels(database.DB)
+	// RunSeedNonTokenModels 已禁用：硬编码模型与 auto-discovery 数据冲突
+	// database.RunSeedNonTokenModels(database.DB)
 	database.RunSeedQianfan(database.DB)
 	database.RunSeedHunyuan(database.DB)
+	database.RunSeedCapabilityCases(database.DB)
+
+	// AI 客服系统种子（模型配置 + 供应商文档 URL + 热门问题）
+	database.RunSeedSupport(database.DB)
+
+	// v3.2.3: 汇率 API 配置种子（SystemConfig 表）
+	database.RunSeedExchangeRateConfig(database.DB)
 
 	if err := database.MigrateVolcengineBatch8Deprecation(database.DB); err != nil {
 		logger.L.Warn("volcengine batch8 deprecation migration failed", zap.Error(err))
+	}
+
+	if err := database.RunSeedTrendingModels(); err != nil {
+		logger.L.Warn("seed trending models failed", zap.Error(err))
+	}
+
+	// v4.0: RBAC 权限系统种子（permissions/roles/role_permissions/user_roles 回填）
+	// 幂等，每次启动安全执行。
+	if err := permissionsvc.Seed(database.DB); err != nil {
+		logger.L.Warn("permission seed failed", zap.Error(err))
 	}
 }
 
@@ -85,6 +114,7 @@ func runSeeds() {
 func InitRedis() error {
 	if err := pkgredis.Init(pkgredis.Config{
 		Addr:     config.Global.Redis.Addr,
+		Username: config.Global.Redis.Username,
 		Password: config.Global.Redis.Password,
 		DB:       config.Global.Redis.DB,
 	}); err != nil {

@@ -28,6 +28,7 @@ type WechatGateway struct {
 	appID        string
 	mchID        string
 	apiKey       string
+	apiV3Key     string // v3.2: V3 API 密钥，用于 AEAD_AES_256_GCM 回调资源解密
 	certSerialNo string
 	privateKey   *rsa.PrivateKey
 	notifyURL    string
@@ -42,6 +43,7 @@ func NewWechatGateway(logger *zap.Logger) (*WechatGateway, error) {
 		appID:        cfg.AppID,
 		mchID:        cfg.MchID,
 		apiKey:       cfg.APIKey,
+		apiV3Key:     cfg.APIV3Key,
 		certSerialNo: cfg.CertSerialNo,
 		notifyURL:    cfg.NotifyURL,
 		httpClient:   &http.Client{Timeout: 30 * time.Second},
@@ -307,8 +309,13 @@ func (g *WechatGateway) VerifyCallback(_ context.Context, data []byte, headers m
 		return nil, fmt.Errorf("wechat: unmarshal notification: %w", err)
 	}
 
-	// Decrypt the resource ciphertext using AES-256-GCM with the API key.
-	plaintext, err := decryptAES256GCM(g.apiKey, notification.Resource.Nonce, notification.Resource.Ciphertext, notification.Resource.AssociatedData)
+	// Decrypt the resource ciphertext using AEAD_AES_256_GCM with the V3 API key.
+	// 优先使用 APIV3Key（微信支付 V3 官方要求）；空时兼容回退到 APIKey
+	decryptKey := g.apiV3Key
+	if decryptKey == "" {
+		decryptKey = g.apiKey
+	}
+	plaintext, err := decryptAES256GCM(decryptKey, notification.Resource.Nonce, notification.Resource.Ciphertext, notification.Resource.AssociatedData)
 	if err != nil {
 		return nil, fmt.Errorf("wechat: decrypt resource: %w", err)
 	}

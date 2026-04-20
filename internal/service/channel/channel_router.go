@@ -595,6 +595,8 @@ func (r *ChannelRouter) fallbackToChannelGroup(ctx context.Context, modelName st
 // ======================== 负载跟踪 ========================
 
 // RecordResult 记录请求结果，用于熔断器和负载跟踪（Redis 全局共享）
+//
+// Deprecated: 使用 RecordResultWithError 以支持错误分类与熔断器豁免
 func (r *ChannelRouter) RecordResult(channelID uint, success bool, latencyMs int, statusCode int) {
 	ctx := context.Background()
 
@@ -614,6 +616,63 @@ func (r *ChannelRouter) RecordResult(channelID uint, success bool, latencyMs int
 			zap.Int("latency_ms", latencyMs),
 		)
 	}
+}
+
+// RecordResultWithError 根据错误分类记录请求结果（推荐使用）
+//
+// 与 RecordResult 的区别：
+//   - 使用 ClassifyError 推断错误类别
+//   - 仅当 category.ShouldCountForBreaker()==true 时才记录熔断器失败
+//   - client_canceled / timeout / upstream_4xx 不触发熔断器
+//   - 成功时正常记录熔断器成功并衰减失败计数
+//
+// 返回错误类别，便于调用方写入 channel_logs.error_category
+func (r *ChannelRouter) RecordResultWithError(
+	channelID uint,
+	err error,
+	upstreamStatus int,
+	latencyMs int,
+) ErrorCategory {
+	ctx := context.Background()
+
+	// 1. 无论成败都先减少全局负载计数器
+	field := fmt.Sprintf("%d", channelID)
+	r.redis.HIncrBy(ctx, loadCounterKey, field, -1)
+
+	// 2. 分类错误
+	cat := ClassifyError(err, upstreamStatus)
+
+	breaker := r.getOrCreateBreaker(channelID)
+
+	if cat.IsSuccess() {
+		// 成功 → 记录熔断器成功（半开状态下恢复、计数衰减）
+		breaker.RecordSuccess(ctx)
+		return cat
+	}
+
+	// 3. 失败，但非所有失败都计熔断
+	if !cat.ShouldCountForBreaker() {
+		// 仅记日志，不计熔断器失败
+		r.logger.Info("channel failure skipped for breaker",
+			zap.Uint("channel_id", channelID),
+			zap.String("category", string(cat)),
+			zap.Int("upstream_status", upstreamStatus),
+			zap.Int("latency_ms", latencyMs),
+			zap.Error(err),
+		)
+		return cat
+	}
+
+	// 4. 真实失败 → 记熔断器
+	breaker.RecordFailure(ctx)
+	r.logger.Warn("channel request failed",
+		zap.Uint("channel_id", channelID),
+		zap.String("category", string(cat)),
+		zap.Int("upstream_status", upstreamStatus),
+		zap.Int("latency_ms", latencyMs),
+		zap.Error(err),
+	)
+	return cat
 }
 
 // IncrementLoad 增加渠道的在途请求计数（Redis 全局共享）

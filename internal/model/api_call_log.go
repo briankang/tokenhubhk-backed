@@ -54,6 +54,8 @@ type ApiCallLog struct {
 	CacheReadTokens  int     `gorm:"default:0" json:"cache_read_tokens"`           // 缓存命中Token数（从供应商响应中解析）
 	CacheWriteTokens int     `gorm:"default:0" json:"cache_write_tokens"`          // 缓存写入Token数（Anthropic cache_creation_input_tokens）
 	CacheSavingsRMB  float64 `gorm:"type:decimal(16,6);default:0" json:"cache_savings_rmb"` // 因缓存节省的费用（相比全量输入价的差值）
+	MatchedPriceTier    string `gorm:"type:varchar(64);index" json:"matched_price_tier,omitempty"`  // 命中的阶梯名称
+	MatchedPriceTierIdx int    `gorm:"default:-1" json:"matched_price_tier_idx"`                     // 命中阶梯下标（-1 表示未命中/无阶梯）
 
 	// ── 多计费单位：非 Token 量化字段（与 AIModel.PricingUnit 对应）──
 	ImageCount  int     `gorm:"default:0" json:"image_count,omitempty"`                   // 图片生成张数（per_image）

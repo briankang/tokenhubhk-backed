@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	auditmw "tokenhub-server/internal/middleware/audit"
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 	"tokenhub-server/internal/service/withdrawal"
@@ -50,6 +51,10 @@ func (h *WithdrawalAdminHandler) Approve(c *gin.Context) {
 	if id == 0 {
 		return
 	}
+	// 审计：记录审批前的提现快照
+	if old, gerr := h.svc.GetByID(c.Request.Context(), id); gerr == nil && old != nil {
+		auditmw.SetOldValue(c, old)
+	}
 	var req struct {
 		Remark string `json:"remark"`
 	}
@@ -68,6 +73,9 @@ func (h *WithdrawalAdminHandler) Reject(c *gin.Context) {
 	id := h.parseID(c)
 	if id == 0 {
 		return
+	}
+	if old, gerr := h.svc.GetByID(c.Request.Context(), id); gerr == nil && old != nil {
+		auditmw.SetOldValue(c, old)
 	}
 	var req struct {
 		Reason string `json:"reason" binding:"required"`
@@ -90,6 +98,9 @@ func (h *WithdrawalAdminHandler) MarkPaid(c *gin.Context) {
 	id := h.parseID(c)
 	if id == 0 {
 		return
+	}
+	if old, gerr := h.svc.GetByID(c.Request.Context(), id); gerr == nil && old != nil {
+		auditmw.SetOldValue(c, old)
 	}
 	var req struct {
 		BankTxnID string `json:"bankTxnId"`

@@ -42,6 +42,18 @@ type CostResult struct {
 	TotalCostRMB float64 `json:"total_cost_rmb"` // 总成本（人民币）
 	PlatformCost int64   `json:"platform_cost"` // 平台基础成本（积分），用于利润计算
 	PriceDetail  PriceResult `json:"price_detail"`
+
+	// 阶梯定价命中信息（未命中时 MatchedTierIdx=-1）
+	MatchedTier    string `json:"matched_tier,omitempty"`
+	MatchedTierIdx int    `json:"matched_tier_idx"`
+
+	// 缓存计费明细（仅 CalculateCostWithCache 路径填充）
+	CacheReadTokens    int64 `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens   int64 `json:"cache_write_tokens,omitempty"`
+	CacheReadCost      int64 `json:"cache_read_cost,omitempty"`       // 缓存命中部分扣费（积分）
+	CacheWriteCost     int64 `json:"cache_write_cost,omitempty"`      // 缓存写入部分扣费（积分）
+	RegularInputCost   int64 `json:"regular_input_cost,omitempty"`    // 非缓存输入部分扣费（积分）
+	CacheSavingCredits int64 `json:"cache_saving_credits,omitempty"`  // 对比无缓存路径节省的积分
 }
 
 // UsageInput 多计费单位的用量输入
@@ -157,6 +169,12 @@ func (c *PricingCalculator) CalculatePrice(ctx context.Context, modelID uint, te
 
 // CalculateCost 计算单次请求的费用（根据 Token 数量，返回积分）
 // 参数: modelID 模型ID, tenantID 租户ID, agentLevel 代理等级, inputTokens 输入token数, outputTokens 输出token数
+//
+// 计费路径（优先级从高到低）：
+//  1. selectPriceForTokens 命中阶梯 → 使用阶梯价格
+//     - SellingOverride=true: 跳过 FIXED/MARKUP，仅叠加 DISCOUNT 代理折扣
+//     - SellingOverride=false: 完整走 applyDiscount 链路（阶梯价代替平台基础价）
+//  2. 未命中阶梯 → 旧路径：CalculatePrice + 单价
 func (c *PricingCalculator) CalculateCost(ctx context.Context, modelID uint, tenantID uint, agentLevel int, inputTokens, outputTokens int) (*CostResult, error) {
 	if inputTokens < 0 {
 		inputTokens = 0
@@ -165,22 +183,85 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, modelID uint, ten
 		outputTokens = 0
 	}
 
-	priceResult, err := c.CalculatePrice(ctx, modelID, tenantID, agentLevel)
-	if err != nil {
-		return nil, err
-	}
-
 	// Get platform base price for profit calculation
 	platformPrice, err := c.getPlatformPrice(ctx, modelID)
 	if err != nil {
 		return nil, fmt.Errorf("get platform price for cost: %w", err)
 	}
 
+	// 1. 尝试阶梯选择
+	tierSel, _ := c.selectPriceForTokens(ctx, modelID, int64(inputTokens), int64(outputTokens))
+
+	var (
+		inputPerMillion  int64
+		outputPerMillion int64
+		inputPriceRMB    float64
+		outputPriceRMB   float64
+		source           = "platform"
+		matchedTier      string
+		matchedTierIdx   = -1
+	)
+
+	if tierSel != nil && tierSel.FromTier {
+		inputPerMillion = tierSel.InputPricePerMillion
+		outputPerMillion = tierSel.OutputPricePerMillion
+		inputPriceRMB = tierSel.InputPriceRMB
+		outputPriceRMB = tierSel.OutputPriceRMB
+		source = "platform+tier"
+		matchedTier = tierSel.MatchedTier
+		matchedTierIdx = tierSel.MatchedTierIdx
+
+		// 叠加代理折扣（SellingOverride=true 时仅 DISCOUNT；否则完整链路）
+		if tenantID > 0 {
+			discount, derr := c.resolver.ResolveDiscount(ctx, tenantID, modelID, agentLevel)
+			if derr == nil && discount != nil && discount.Type != "none" {
+				if tierSel.SellingOverride {
+					// 只叠加 DISCOUNT（阶梯已是终价）
+					if discount.PricingType == "DISCOUNT" && discount.InputDiscount > 0 {
+						inputPerMillion = int64(float64(inputPerMillion) * discount.InputDiscount)
+						inputPriceRMB = inputPriceRMB * discount.InputDiscount
+						source = "agent_discount+tier"
+					}
+					if discount.PricingType == "DISCOUNT" && discount.OutputDiscount > 0 {
+						outputPerMillion = int64(float64(outputPerMillion) * discount.OutputDiscount)
+						outputPriceRMB = outputPriceRMB * discount.OutputDiscount
+					}
+				} else {
+					// 以 tier 价为基础价完整走 applyDiscount
+					tierAsPlatform := &model.ModelPricing{
+						InputPricePerToken:  inputPerMillion,
+						OutputPricePerToken: outputPerMillion,
+						InputPriceRMB:       inputPriceRMB,
+						OutputPriceRMB:      outputPriceRMB,
+						Currency:            platformPrice.Currency,
+					}
+					adjusted := c.applyDiscount(tierAsPlatform, discount)
+					inputPerMillion = adjusted.InputPricePerMillion
+					outputPerMillion = adjusted.OutputPricePerMillion
+					inputPriceRMB = adjusted.InputPriceRMB
+					outputPriceRMB = adjusted.OutputPriceRMB
+					source = adjusted.Source + "+tier"
+				}
+			}
+		}
+	} else {
+		// 2. 旧路径：无阶梯，走 CalculatePrice + 单价
+		priceResult, err := c.CalculatePrice(ctx, modelID, tenantID, agentLevel)
+		if err != nil {
+			return nil, err
+		}
+		inputPerMillion = priceResult.InputPricePerMillion
+		outputPerMillion = priceResult.OutputPricePerMillion
+		inputPriceRMB = priceResult.InputPriceRMB
+		outputPriceRMB = priceResult.OutputPriceRMB
+		source = priceResult.Source
+	}
+
 	// 计算费用：价格单位是"每百万token的积分"，需要乘以 token 数再除以 1,000,000
 	// 为避免浮点运算，使用整数运算：cost = price * tokens / 1_000_000
 	// 最小1积分保底：有token消耗时至少扣1积分，防止小请求因整数截断免费
-	inputCost := priceResult.InputPricePerMillion * int64(inputTokens) / 1_000_000
-	outputCost := priceResult.OutputPricePerMillion * int64(outputTokens) / 1_000_000
+	inputCost := inputPerMillion * int64(inputTokens) / 1_000_000
+	outputCost := outputPerMillion * int64(outputTokens) / 1_000_000
 	platformCost := (platformPrice.InputPricePerToken*int64(inputTokens) + platformPrice.OutputPricePerToken*int64(outputTokens)) / 1_000_000
 
 	totalCost := inputCost + outputCost
@@ -196,7 +277,16 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, modelID uint, ten
 		TotalCost:    totalCost,
 		TotalCostRMB: totalCostRMB,
 		PlatformCost: platformCost,
-		PriceDetail:  *priceResult,
+		PriceDetail: PriceResult{
+			InputPricePerMillion:  inputPerMillion,
+			OutputPricePerMillion: outputPerMillion,
+			InputPriceRMB:         inputPriceRMB,
+			OutputPriceRMB:        outputPriceRMB,
+			Currency:              platformPrice.Currency,
+			Source:                source,
+		},
+		MatchedTier:    matchedTier,
+		MatchedTierIdx: matchedTierIdx,
 	}, nil
 }
 
@@ -303,6 +393,118 @@ type CacheUsageInput struct {
 	OutputTokens     int // 输出Token
 	CacheReadTokens  int // 缓存命中Token（来自供应商响应）
 	CacheWriteTokens int // 缓存写入Token（Anthropic cache_creation_input_tokens）
+}
+
+// CalculateCostWithCache 按缓存比率扣除用户积分（本次修复的核心路径）
+//
+// 用户侧计费逻辑：
+//  1. 先调用 CalculateCost 得到用户售价（含阶梯 / 代理折扣 / 会员折扣）
+//  2. 根据 AIModel 的成本侧比率（cache_input_price_rmb / input_cost_rmb）
+//     按同等折扣推导出用户侧缓存价（售价 × 比率）
+//  3. 将 input tokens 拆分为三段：
+//       - regular    = InputTokens - CacheReadTokens - CacheWriteTokens
+//       - cache_read  = CacheReadTokens（auto/explicit/both 命中）
+//       - cache_write = CacheWriteTokens（explicit/both 写入溢价）
+//  4. 三段分别按对应单价结算后加总
+//
+// 返回的 CostResult 附带 CacheReadCost / CacheWriteCost / RegularInputCost /
+// CacheSavingCredits 便于日志记录与对账展示。
+func (c *PricingCalculator) CalculateCostWithCache(
+	ctx context.Context,
+	aiModel *model.AIModel,
+	tenantID uint, agentLevel int,
+	usage CacheUsageInput,
+) (*CostResult, error) {
+	if aiModel == nil {
+		return nil, fmt.Errorf("aiModel is nil")
+	}
+	// 不支持缓存或无缓存用量 → 走普通路径
+	if !aiModel.SupportsCache || aiModel.CacheMechanism == "none" ||
+		(usage.CacheReadTokens == 0 && usage.CacheWriteTokens == 0) {
+		return c.CalculateCost(ctx, aiModel.ID, tenantID, agentLevel,
+			usage.InputTokens, usage.OutputTokens)
+	}
+
+	// 1) 先按售价计算基础 CostResult（用户侧售价，已含阶梯/代理折扣）
+	base, err := c.CalculateCost(ctx, aiModel.ID, tenantID, agentLevel,
+		usage.InputTokens, usage.OutputTokens)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2) 从成本侧反推缓存比率
+	baseCostRMB := aiModel.InputCostRMB
+	ratio := func(cachePriceRMB, fallback float64) float64 {
+		if baseCostRMB > 0 && cachePriceRMB > 0 {
+			return cachePriceRMB / baseCostRMB
+		}
+		return fallback
+	}
+
+	var cacheReadRatio, cacheWriteRatio float64
+	switch aiModel.CacheMechanism {
+	case "both":
+		if usage.CacheWriteTokens > 0 {
+			cacheReadRatio = ratio(aiModel.CacheExplicitInputPriceRMB, 0.10)
+		} else {
+			cacheReadRatio = ratio(aiModel.CacheInputPriceRMB, 0.20)
+		}
+		cacheWriteRatio = ratio(aiModel.CacheWritePriceRMB, 1.25)
+	case "explicit":
+		cacheReadRatio = ratio(aiModel.CacheInputPriceRMB, 0.10)
+		cacheWriteRatio = ratio(aiModel.CacheWritePriceRMB, 1.25)
+	default: // auto
+		cacheReadRatio = ratio(aiModel.CacheInputPriceRMB, 0.50)
+		cacheWriteRatio = 1.0 // auto 无写入溢价
+	}
+
+	// 3) 按售价 × 比率得到用户侧缓存单价（每百万 token 积分）
+	inputPerMillion := base.PriceDetail.InputPricePerMillion
+	outputPerMillion := base.PriceDetail.OutputPricePerMillion
+	cacheReadPerMillion := int64(float64(inputPerMillion) * cacheReadRatio)
+	cacheWritePerMillion := int64(float64(inputPerMillion) * cacheWriteRatio)
+
+	readTokens := int64(usage.CacheReadTokens)
+	writeTokens := int64(usage.CacheWriteTokens)
+	totalInput := int64(usage.InputTokens)
+	regularTokens := totalInput - readTokens - writeTokens
+	if regularTokens < 0 {
+		regularTokens = 0
+	}
+
+	regularCost := inputPerMillion * regularTokens / 1_000_000
+	cacheReadCost := cacheReadPerMillion * readTokens / 1_000_000
+	cacheWriteCost := cacheWritePerMillion * writeTokens / 1_000_000
+	inputCost := regularCost + cacheReadCost + cacheWriteCost
+	outputCost := outputPerMillion * int64(usage.OutputTokens) / 1_000_000
+
+	totalCost := inputCost + outputCost
+	if totalCost == 0 && (usage.InputTokens > 0 || usage.OutputTokens > 0) {
+		totalCost = 1
+	}
+
+	// 节省 = 无缓存路径的扣费 - 实际扣费
+	savings := base.TotalCost - totalCost
+	if savings < 0 {
+		savings = 0
+	}
+
+	return &CostResult{
+		InputCost:          inputCost,
+		OutputCost:         outputCost,
+		TotalCost:          totalCost,
+		TotalCostRMB:       credits.CreditsToRMB(totalCost),
+		PlatformCost:       base.PlatformCost,
+		PriceDetail:        base.PriceDetail,
+		MatchedTier:        base.MatchedTier,
+		MatchedTierIdx:     base.MatchedTierIdx,
+		CacheReadTokens:    readTokens,
+		CacheWriteTokens:   writeTokens,
+		CacheReadCost:      cacheReadCost,
+		CacheWriteCost:     cacheWriteCost,
+		RegularInputCost:   regularCost,
+		CacheSavingCredits: savings,
+	}, nil
 }
 
 // CalculateWithCache 计算含缓存的总成本（用户付费侧不变，额外返回平台侧节省金额）

@@ -47,6 +47,16 @@ func NewPaymentConfigService(db *gorm.DB) *PaymentConfigService {
 
 // ==================== AES-256-GCM 加密/解密 ====================
 
+// EncryptPlaintext 公开的加密方法（供 admin handler 对多账号 config 加密）
+func (s *PaymentConfigService) EncryptPlaintext(plaintext string) (string, error) {
+	return s.encrypt(plaintext)
+}
+
+// DecryptCiphertext 公开的解密方法（供 admin handler / account router 解密后调用网关）
+func (s *PaymentConfigService) DecryptCiphertext(encoded string) (string, error) {
+	return s.decrypt(encoded)
+}
+
 // encrypt 使用 AES-256-GCM 加密明文
 func (s *PaymentConfigService) encrypt(plaintext string) (string, error) {
 	if plaintext == "" {

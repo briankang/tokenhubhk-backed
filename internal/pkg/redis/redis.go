@@ -14,8 +14,11 @@ import (
 var Client *goredis.Client
 
 // Config Redis连接配置
+// Username 可选：阿里云 Tair 推荐使用 ACL 账号密码（实例名作为默认账号名）
+// 留空时走 AUTH password 模式
 type Config struct {
 	Addr     string
+	Username string
 	Password string
 	DB       int
 }
@@ -27,6 +30,7 @@ func Init(cfg Config) error {
 	}
 	Client = goredis.NewClient(&goredis.Options{
 		Addr:     cfg.Addr,
+		Username: cfg.Username,
 		Password: cfg.Password,
 		DB:       cfg.DB,
 	})

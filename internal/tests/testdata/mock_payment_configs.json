@@ -1,0 +1,257 @@
+{
+  "_description": "四网关完整 Mock 配置数据（沙箱/测试模式），用于系统兼容性验证与集成测试",
+  "_updated": "2026-04-19",
+  "_usage": "此文件为测试数据种子，config 字段与实际上线时仅需替换为真实密钥，字段结构和格式完全兼容",
+
+  "providers": {
+    "WECHAT": {
+      "_gateway": "微信支付 V3",
+      "_doc": "https://pay.weixin.qq.com/docs/merchant/apis/",
+      "_note": "微信/支付宝按监管合规仅支持单账号模式",
+      "provider_type": "WECHAT",
+      "display_name": "微信支付",
+      "is_active": false,
+      "is_sandbox": true,
+      "sort_order": 1,
+      "config": {
+        "app_id": "wx1234567890abcdef",
+        "mch_id": "1900000109",
+        "api_key": "MOCK_API_KEY_v2_32bytes_placeholder01",
+        "api_v3_key": "MOCK_APIv3_KEY_32bytes_placeholder012",
+        "cert_serial_no": "5A3F6B1C2D3E4F5A6B7C8D9E0F1A2B3C4D5E6F7",
+        "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7MOCK_KEY\n-----END PRIVATE KEY-----",
+        "notify_url": "https://api.tokenhubhk.com/api/v1/callback/wechat"
+      },
+      "_field_notes": {
+        "app_id": "微信开放平台或公众号 AppID，格式 wx 开头 18位",
+        "mch_id": "微信支付商户号，10位数字",
+        "api_key": "V2 API 密钥，32位字符串，在商户平台设置",
+        "api_v3_key": "V3 API 密钥，32位字符串，用于回调解密（AES-256-GCM）",
+        "cert_serial_no": "商户证书序列号，在商户平台下载证书后获取",
+        "private_key": "商户API证书私钥（PEM格式 RSA2048），对应 cert_serial_no",
+        "notify_url": "异步通知地址，必须 HTTPS，路径格式 /callback/wechat"
+      },
+      "_compatibility_checks": {
+        "api_key_length": "32 bytes",
+        "api_v3_key_length": "32 bytes",
+        "private_key_format": "PEM PKCS#8",
+        "notify_url_scheme": "HTTPS required",
+        "pay_flow": "JSAPI/Native/App/H5"
+      }
+    },
+
+    "ALIPAY": {
+      "_gateway": "支付宝 RSA2",
+      "_doc": "https://opendocs.alipay.com/open/270/105899",
+      "_note": "支付宝按监管合规仅支持单账号模式",
+      "provider_type": "ALIPAY",
+      "display_name": "支付宝",
+      "is_active": false,
+      "is_sandbox": true,
+      "sort_order": 2,
+      "config": {
+        "app_id": "2021000000000000",
+        "private_key": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA1MOCK_MERCHANT_RSA_PRIVATE_KEY_PLACEHOLDER_BASE64\n-----END RSA PRIVATE KEY-----",
+        "alipay_public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMOCK_ALIPAY_PUBLIC_KEY\n-----END PUBLIC KEY-----",
+        "sign_type": "RSA2",
+        "notify_url": "https://api.tokenhubhk.com/api/v1/callback/alipay",
+        "return_url": "https://tokenhubhk.com/balance?status=success"
+      },
+      "_field_notes": {
+        "app_id": "支付宝开放平台应用 AppID，16位数字",
+        "private_key": "商户 RSA2 私钥（PKCS#1 或 PKCS#8 格式），用于签名请求",
+        "alipay_public_key": "支付宝公钥（RSA2），用于验证回调签名，从开放平台获取",
+        "sign_type": "固定为 RSA2（SHA256withRSA），不支持 RSA",
+        "notify_url": "异步通知地址，必须 HTTPS，路径格式 /callback/alipay",
+        "return_url": "用户支付完成后的同步跳转地址"
+      },
+      "_compatibility_checks": {
+        "sign_type": "RSA2 only",
+        "private_key_format": "PKCS#1 or PKCS#8",
+        "notify_url_scheme": "HTTPS required",
+        "alipay_sdk": "alipay-sdk-golang or alipay-sdk-go"
+      }
+    },
+
+    "STRIPE": {
+      "_gateway": "Stripe",
+      "_doc": "https://stripe.com/docs/api",
+      "_note": "Stripe 支持多账号，通过 weight+region 路由",
+      "provider_type": "STRIPE",
+      "display_name": "Stripe",
+      "is_active": false,
+      "is_sandbox": true,
+      "sort_order": 3,
+      "config": {
+        "publishable_key": "pk_test_51MockStripeUSMain1234567890abcdefghijklmnopqrstuvwxyz",
+        "secret_key": "sk_test_51MockStripeUSMain0987654321zyxwvutsrqponmlkjihgfedcba",
+        "webhook_secret": "whsec_mock_us_main_abcdef1234567890",
+        "currency": "usd",
+        "success_url": "https://tokenhubhk.com/balance?status=success",
+        "cancel_url": "https://tokenhubhk.com/checkout?status=cancel"
+      },
+      "_field_notes": {
+        "publishable_key": "可发布密钥（前端使用），沙箱 pk_test_ 开头，生产 pk_live_ 开头",
+        "secret_key": "秘密密钥（后端使用），沙箱 sk_test_ 开头，生产 sk_live_ 开头，不能暴露",
+        "webhook_secret": "Webhook 端点密钥（whsec_ 开头），在 Stripe Dashboard 创建端点时获取",
+        "currency": "默认计费币种，小写 ISO 4217 格式（usd/eur/gbp/hkd）",
+        "success_url": "支付成功后跳转 URL，需包含 session_id 参数占位符",
+        "cancel_url": "用户取消支付时跳转 URL"
+      },
+      "_compatibility_checks": {
+        "publishable_key_prefix": "pk_test_ or pk_live_",
+        "secret_key_prefix": "sk_test_ or sk_live_",
+        "webhook_secret_prefix": "whsec_",
+        "currency_format": "lowercase ISO 4217",
+        "api_version": "2023-10-16 or later"
+      },
+      "_multi_account_sample": {
+        "us_main": {
+          "account_name": "Stripe US 主账号",
+          "weight": 70,
+          "priority": 0,
+          "supported_currencies": "USD,EUR",
+          "supported_regions": "US,CA",
+          "config": {
+            "publishable_key": "pk_test_51MockStripeUSMain",
+            "secret_key": "sk_test_51MockStripeUSMain",
+            "webhook_secret": "whsec_mock_us_main",
+            "currency": "usd"
+          }
+        },
+        "eu_secondary": {
+          "account_name": "Stripe EU 副账号",
+          "weight": 30,
+          "priority": 0,
+          "supported_currencies": "USD,EUR,GBP",
+          "supported_regions": "EU,UK",
+          "config": {
+            "publishable_key": "pk_test_51MockStripeEU",
+            "secret_key": "sk_test_51MockStripeEU",
+            "webhook_secret": "whsec_mock_eu",
+            "currency": "eur"
+          }
+        }
+      }
+    },
+
+    "PAYPAL": {
+      "_gateway": "PayPal REST API v2",
+      "_doc": "https://developer.paypal.com/docs/api/orders/v2/",
+      "_note": "PayPal 支持多账号，通过 weight+currency 路由",
+      "provider_type": "PAYPAL",
+      "display_name": "PayPal",
+      "is_active": false,
+      "is_sandbox": true,
+      "sort_order": 4,
+      "config": {
+        "client_id": "AblxxxxMockPayPalClientIDSandbox1234567890ABCDEFGHIJKLMNOPQRST",
+        "client_secret": "EmxxxxMockPayPalClientSecretSandbox1234567890ABCDEFGHIJKLMNOP",
+        "webhook_id": "3XY44955XF432341J",
+        "mode": "sandbox",
+        "return_url": "https://tokenhubhk.com/balance?status=success",
+        "cancel_url": "https://tokenhubhk.com/checkout?status=cancel"
+      },
+      "_field_notes": {
+        "client_id": "PayPal 应用客户端 ID，从 developer.paypal.com 创建应用获取",
+        "client_secret": "PayPal 应用客户端密钥，不能暴露",
+        "webhook_id": "Webhook ID，在 PayPal 开发者控制台「Webhooks」创建端点后获取",
+        "mode": "环境模式：sandbox（沙箱测试）或 live（生产）",
+        "return_url": "用户批准支付后的跳转 URL",
+        "cancel_url": "用户取消支付时的跳转 URL"
+      },
+      "_compatibility_checks": {
+        "mode": "sandbox or live",
+        "client_id_length": ">= 40 chars",
+        "client_secret_length": ">= 40 chars",
+        "webhook_events": ["PAYMENT.CAPTURE.COMPLETED", "CHECKOUT.ORDER.APPROVED", "PAYMENT.SALE.COMPLETED"],
+        "api_version": "v2/checkout/orders"
+      }
+    }
+  },
+
+  "payment_methods": [
+    {"type": "WECHAT",        "display_name": "微信支付",  "icon": "wechat",   "is_active": false, "sort_order": 1},
+    {"type": "ALIPAY",        "display_name": "支付宝",    "icon": "alipay",   "is_active": false, "sort_order": 2},
+    {"type": "STRIPE",        "display_name": "Stripe",   "icon": "stripe",   "is_active": false, "sort_order": 3},
+    {"type": "PAYPAL",        "display_name": "PayPal",   "icon": "paypal",   "is_active": false, "sort_order": 4},
+    {"type": "BANK_TRANSFER", "display_name": "对公转账",  "icon": "bank",     "is_active": true,  "sort_order": 5}
+  ],
+
+  "bank_accounts_sample": [
+    {
+      "account_name": "TokenHub Technology Limited",
+      "bank_name": "中国银行",
+      "branch_name": "上海浦东支行",
+      "account_number": "6228480000000001",
+      "swift_code": "BKCHCNBJ",
+      "currency": "CNY",
+      "remark": "对公人民币结算账号",
+      "is_active": true,
+      "sort_order": 1
+    },
+    {
+      "account_name": "TokenHub Technology Limited",
+      "bank_name": "汇丰银行 HSBC",
+      "branch_name": "香港总行",
+      "account_number": "HSBC-HK-0000000001",
+      "swift_code": "HSBCHKHHHKH",
+      "currency": "HKD",
+      "remark": "港元结算账号",
+      "is_active": true,
+      "sort_order": 2
+    }
+  ],
+
+  "callback_urls": {
+    "_description": "标准回调 URL 模板（生产环境替换域名即可）",
+    "wechat":  "https://api.tokenhubhk.com/api/v1/callback/wechat",
+    "alipay":  "https://api.tokenhubhk.com/api/v1/callback/alipay",
+    "stripe":  "https://api.tokenhubhk.com/api/v1/callback/stripe",
+    "paypal":  "https://api.tokenhubhk.com/api/v1/callback/paypal",
+    "success": "https://tokenhubhk.com/balance?status=success",
+    "cancel":  "https://tokenhubhk.com/checkout?status=cancel",
+    "_note": "notify_url 必须使用 HTTPS，不支持 IP 直接访问，微信/支付宝需在商户平台配置白名单"
+  },
+
+  "go_live_checklist": {
+    "_description": "上线前配置检查清单，确认以下各项后支付即可正常使用",
+    "wechat": [
+      "将 app_id 替换为正式 AppID（非沙箱）",
+      "将 mch_id 替换为正式商户号",
+      "将 api_key 替换为正式 V2 API 密钥（32字节）",
+      "将 api_v3_key 替换为正式 V3 API 密钥（32字节）",
+      "下载正式商户证书，填入 cert_serial_no 和 private_key",
+      "在商户平台配置 notify_url 白名单：https://api.tokenhubhk.com",
+      "将 is_sandbox 设为 false",
+      "将 is_active 设为 true（点击启用按钮）"
+    ],
+    "alipay": [
+      "将 app_id 替换为正式应用 AppID",
+      "替换 private_key 为正式商户私钥（RSA2，PKCS#1格式）",
+      "替换 alipay_public_key 为支付宝正式公钥",
+      "确认 sign_type=RSA2",
+      "在支付宝开放平台配置 notify_url 白名单",
+      "将 is_sandbox 设为 false",
+      "将 is_active 设为 true"
+    ],
+    "stripe": [
+      "将 pk_test_ 密钥替换为 pk_live_ 密钥",
+      "将 sk_test_ 密钥替换为 sk_live_ 密钥",
+      "在 Stripe Dashboard 创建生产 Webhook 端点，填入 webhook_secret",
+      "Webhook 端点 URL：https://api.tokenhubhk.com/api/v1/callback/stripe",
+      "订阅事件：checkout.session.completed, payment_intent.succeeded",
+      "将 is_sandbox 设为 false",
+      "将 is_active 设为 true"
+    ],
+    "paypal": [
+      "将 sandbox 应用替换为正式 Live 应用的 client_id/client_secret",
+      "将 mode 设为 live",
+      "在 PayPal 开发者控制台创建 Live Webhook，填入 webhook_id",
+      "Webhook 端点 URL：https://api.tokenhubhk.com/api/v1/callback/paypal",
+      "订阅事件：PAYMENT.CAPTURE.COMPLETED, CHECKOUT.ORDER.APPROVED",
+      "将 is_sandbox 设为 false",
+      "将 is_active 设为 true"
+    ]
+  }
+}

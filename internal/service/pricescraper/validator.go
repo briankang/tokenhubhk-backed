@@ -197,35 +197,27 @@ func validatePriceTiers(modelName string, tiers []model.PriceTier) []ValidationE
 			})
 		}
 
-		// 检查 token 区间递增
+		// 检查 token 区间递增（优先使用新字段 InputMin，兼容旧字段 MinTokens）
 		if i > 0 {
 			prevTier := tiers[i-1]
-			if tier.MinTokens <= prevTier.MinTokens {
+			curMin := tier.InputMin
+			if curMin == 0 {
+				curMin = tier.MinTokens
+			}
+			prevMin := prevTier.InputMin
+			if prevMin == 0 {
+				prevMin = prevTier.MinTokens
+			}
+			if curMin > 0 && prevMin > 0 && curMin <= prevMin {
 				errors = append(errors, ValidationError{
 					ModelName: modelName,
-					Field:     fmt.Sprintf("tier[%d].min_tokens", i),
-					Message:   fmt.Sprintf("阶梯 %s 的 MinTokens(%d) 应大于上一阶梯 %s 的 MinTokens(%d)", tier.Name, tier.MinTokens, prevTier.Name, prevTier.MinTokens),
+					Field:     fmt.Sprintf("tier[%d].input_min", i),
+					Message:   fmt.Sprintf("阶梯 %s 的下界(%d) 应大于上一阶梯 %s 的下界(%d)", tier.Name, curMin, prevTier.Name, prevMin),
 					Severity:  "error",
 				})
 			}
 
-			// 检查价格递减或相等（量大优惠原则）
-			if tier.InputPrice > prevTier.InputPrice && prevTier.InputPrice > 0 {
-				errors = append(errors, ValidationError{
-					ModelName: modelName,
-					Field:     fmt.Sprintf("tier[%d].input_price", i),
-					Message:   fmt.Sprintf("阶梯 %s 输入价格 %.4f 高于上一阶梯 %.4f（预期量大优惠递减）", tier.Name, tier.InputPrice, prevTier.InputPrice),
-					Severity:  "warning",
-				})
-			}
-			if tier.OutputPrice > prevTier.OutputPrice && prevTier.OutputPrice > 0 {
-				errors = append(errors, ValidationError{
-					ModelName: modelName,
-					Field:     fmt.Sprintf("tier[%d].output_price", i),
-					Message:   fmt.Sprintf("阶梯 %s 输出价格 %.4f 高于上一阶梯 %.4f（预期量大优惠递减）", tier.Name, tier.OutputPrice, prevTier.OutputPrice),
-					Severity:  "warning",
-				})
-			}
+			// 长上下文模型的阶梯价格可能随 token 数量上升（长文档计费更贵），不发出警告
 		}
 	}
 

@@ -426,12 +426,162 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 		outputCostCredits = int64(aiModel.OutputCostRMB * 10000)
 	}
 
+	// ─── 阶梯价格覆盖 ───
+	// 若日志记录了命中的阶梯下标，从 ModelPricing.PriceTiers 取阶梯售价覆盖基础价格
+	// 这样"重算"结果才能正确反映用户实际被计费的阶梯价格
+	effectiveInputPricePerToken := mp.InputPricePerToken
+	effectiveOutputPricePerToken := mp.OutputPricePerToken
+	effectiveInputPriceRMB := mp.InputPriceRMB
+	effectiveOutputPriceRMB := mp.OutputPriceRMB
+	if pricingFound && log.MatchedPriceTierIdx >= 0 {
+		var tierData model.PriceTiersData
+		if len(mp.PriceTiers) > 0 {
+			if jerr := json.Unmarshal(mp.PriceTiers, &tierData); jerr == nil &&
+				log.MatchedPriceTierIdx < len(tierData.Tiers) {
+				tier := tierData.Tiers[log.MatchedPriceTierIdx]
+				if tier.SellingInputPrice != nil {
+					effectiveInputPriceRMB = *tier.SellingInputPrice
+					effectiveInputPricePerToken = int64(*tier.SellingInputPrice * 10000)
+				}
+				if tier.SellingOutputPrice != nil {
+					effectiveOutputPriceRMB = *tier.SellingOutputPrice
+					effectiveOutputPricePerToken = int64(*tier.SellingOutputPrice * 10000)
+				}
+			}
+		}
+	}
+
+	// ─── 阶梯价格明细（用于前端展示所有阶梯的成本价 vs 售价） ───
+	// 格式：[{tier_name, tier_idx, input_min, input_max(-1=∞), cost_input_rmb, cost_output_rmb,
+	//          sell_input_rmb, sell_output_rmb, is_matched}]
+	type TierDetailItem struct {
+		TierName      string  `json:"tier_name"`
+		TierIdx       int     `json:"tier_idx"`
+		InputMin      int64   `json:"input_min"`
+		InputMax      int64   `json:"input_max"` // -1 表示无上限
+		CostInputRMB  float64 `json:"cost_input_rmb"`
+		CostOutputRMB float64 `json:"cost_output_rmb"`
+		SellInputRMB  float64 `json:"sell_input_rmb"`
+		SellOutputRMB float64 `json:"sell_output_rmb"`
+		IsMatched     bool    `json:"is_matched"`
+	}
+	var priceTiersDetail []TierDetailItem
+	if pricingFound {
+		var mpTierData model.PriceTiersData
+		if len(mp.PriceTiers) > 0 {
+			_ = json.Unmarshal(mp.PriceTiers, &mpTierData)
+		}
+		// 同时解析 aiModel.PriceTiers 作为供应商成本阶梯（可能为空）
+		var costTierData model.PriceTiersData
+		if len(aiModel.PriceTiers) > 0 {
+			_ = json.Unmarshal(aiModel.PriceTiers, &costTierData)
+		}
+		if len(mpTierData.Tiers) > 0 {
+			priceTiersDetail = make([]TierDetailItem, 0, len(mpTierData.Tiers))
+			for i, tier := range mpTierData.Tiers {
+				// 确定成本价：优先用 aiModel 的成本阶梯（对应下标），否则用 flat 成本价
+				costIn := aiModel.InputCostRMB
+				costOut := aiModel.OutputCostRMB
+				if i < len(costTierData.Tiers) {
+					if costTierData.Tiers[i].InputPrice > 0 {
+						costIn = costTierData.Tiers[i].InputPrice
+					}
+					if costTierData.Tiers[i].OutputPrice > 0 {
+						costOut = costTierData.Tiers[i].OutputPrice
+					}
+				}
+				// 确定售价：优先 SellingInputPrice，否则 InputPrice，再 fallback 基础价
+				sellIn := mp.InputPriceRMB
+				if tier.SellingInputPrice != nil {
+					sellIn = *tier.SellingInputPrice
+				} else if tier.InputPrice > 0 {
+					sellIn = tier.InputPrice
+				}
+				sellOut := mp.OutputPriceRMB
+				if tier.SellingOutputPrice != nil {
+					sellOut = *tier.SellingOutputPrice
+				} else if tier.OutputPrice > 0 {
+					sellOut = tier.OutputPrice
+				}
+				// 确定范围上限（-1 = ∞）
+				inputMax := int64(-1)
+				if tier.InputMax != nil {
+					inputMax = *tier.InputMax
+				}
+				priceTiersDetail = append(priceTiersDetail, TierDetailItem{
+					TierName:      tier.Name,
+					TierIdx:       i,
+					InputMin:      tier.InputMin,
+					InputMax:      inputMax,
+					CostInputRMB:  costIn,
+					CostOutputRMB: costOut,
+					SellInputRMB:  sellIn,
+					SellOutputRMB: sellOut,
+					IsMatched:     i == log.MatchedPriceTierIdx,
+				})
+			}
+		}
+	}
+
 	var recomputedInputCost, recomputedOutputCost, recomputedTotal int64
 	var platformCostCredits int64
 	formulaApplicable := false
+
+	// 缓存拆分重算（当日志有缓存用量且模型支持缓存时按比率重算用户侧扣费）
+	cacheReadTokens := int64(log.CacheReadTokens)
+	cacheWriteTokens := int64(log.CacheWriteTokens)
+	var (
+		cacheReadPerMillion  int64
+		cacheWritePerMillion int64
+		cacheReadCost        int64
+		cacheWriteCost       int64
+		regularInputTokens   int64
+		regularInputCost     int64
+		cacheReadRatio       float64
+		cacheWriteRatio      float64
+	)
+
 	if pricingFound && (aiModel.PricingUnit == "" || aiModel.PricingUnit == "per_million_tokens") {
-		recomputedInputCost = mp.InputPricePerToken * prompt / 1_000_000
-		recomputedOutputCost = mp.OutputPricePerToken * completion / 1_000_000
+		// 含缓存用量时，按比率拆分用户侧售价扣费
+		if aiModel.SupportsCache && aiModel.CacheMechanism != "none" && aiModel.CacheMechanism != "" &&
+			(cacheReadTokens > 0 || cacheWriteTokens > 0) && aiModel.InputCostRMB > 0 {
+			ratio := func(cachePriceRMB, fallback float64) float64 {
+				if cachePriceRMB > 0 {
+					return cachePriceRMB / aiModel.InputCostRMB
+				}
+				return fallback
+			}
+			switch aiModel.CacheMechanism {
+			case "both":
+				if cacheWriteTokens > 0 {
+					cacheReadRatio = ratio(aiModel.CacheExplicitInputPriceRMB, 0.10)
+				} else {
+					cacheReadRatio = ratio(aiModel.CacheInputPriceRMB, 0.20)
+				}
+				cacheWriteRatio = ratio(aiModel.CacheWritePriceRMB, 1.25)
+			case "explicit":
+				cacheReadRatio = ratio(aiModel.CacheInputPriceRMB, 0.10)
+				cacheWriteRatio = ratio(aiModel.CacheWritePriceRMB, 1.25)
+			default: // auto
+				cacheReadRatio = ratio(aiModel.CacheInputPriceRMB, 0.50)
+				cacheWriteRatio = 1.0
+			}
+			cacheReadPerMillion = int64(float64(effectiveInputPricePerToken) * cacheReadRatio)
+			cacheWritePerMillion = int64(float64(effectiveInputPricePerToken) * cacheWriteRatio)
+			regularInputTokens = prompt - cacheReadTokens - cacheWriteTokens
+			if regularInputTokens < 0 {
+				regularInputTokens = 0
+			}
+			regularInputCost = effectiveInputPricePerToken * regularInputTokens / 1_000_000
+			cacheReadCost = cacheReadPerMillion * cacheReadTokens / 1_000_000
+			cacheWriteCost = cacheWritePerMillion * cacheWriteTokens / 1_000_000
+			recomputedInputCost = regularInputCost + cacheReadCost + cacheWriteCost
+		} else {
+			regularInputTokens = prompt
+			regularInputCost = effectiveInputPricePerToken * prompt / 1_000_000
+			recomputedInputCost = regularInputCost
+		}
+		recomputedOutputCost = effectiveOutputPricePerToken * completion / 1_000_000
 		recomputedTotal = recomputedInputCost + recomputedOutputCost
 		if recomputedTotal == 0 && (prompt > 0 || completion > 0) {
 			recomputedTotal = 1 // 保底 1 积分，与计价引擎逻辑一致
@@ -443,18 +593,63 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 	deviation := log.CostCredits - recomputedTotal
 	profitCredits := log.CostCredits - platformCostCredits
 
+	// 动态重算缓存节省金额（比较"全部按常规价"与"实际缓存拆分"的差值）
+	// 日志中存储的 CacheSavingsRMB 可能为 0（旧日志 / 手动插入），此处基于当前价格重算
+	computedCacheSavingsRMB := log.CacheSavingsRMB
+	if formulaApplicable && (cacheReadTokens > 0 || cacheWriteTokens > 0) {
+		noCacheInputCost := effectiveInputPricePerToken * prompt / 1_000_000
+		savedCredits := noCacheInputCost - recomputedInputCost
+		if savedCredits > 0 {
+			computedCacheSavingsRMB = float64(savedCredits) / 10000.0
+		}
+	}
+
 	// 人类可读公式（中文）
 	formula := ""
 	if formulaApplicable {
-		formula = fmt.Sprintf(
-			"输入成本 = %d（每百万积分） × %d（输入tokens） ÷ 1,000,000 = %d 积分\n"+
-				"输出成本 = %d（每百万积分） × %d（输出tokens） ÷ 1,000,000 = %d 积分\n"+
-				"合计 = %d + %d = %d 积分（%.4f 元）",
-			mp.InputPricePerToken, prompt, recomputedInputCost,
-			mp.OutputPricePerToken, completion, recomputedOutputCost,
-			recomputedInputCost, recomputedOutputCost, recomputedTotal,
-			float64(recomputedTotal)/10000.0,
-		)
+		// 阶梯价格说明前缀
+		tierPrefix := ""
+		if log.MatchedPriceTierIdx >= 0 && log.MatchedPriceTier != "" {
+			tierPrefix = fmt.Sprintf("【命中阶梯】%s（下标 #%d），输入售价 %.4f 元/百万\n",
+				log.MatchedPriceTier, log.MatchedPriceTierIdx, effectiveInputPriceRMB)
+		}
+
+		if cacheReadTokens > 0 || cacheWriteTokens > 0 {
+			noCacheInputCost := effectiveInputPricePerToken * prompt / 1_000_000
+			savedCredits := noCacheInputCost - recomputedInputCost
+			savingsLine := ""
+			if savedCredits > 0 {
+				savingsLine = fmt.Sprintf("\n缓存节省 = %d（无缓存） - %d（实际）= %d 积分（%.4f 元）",
+					noCacheInputCost, recomputedInputCost, savedCredits, float64(savedCredits)/10000.0)
+			}
+			formula = tierPrefix + fmt.Sprintf(
+				"输入成本（按缓存拆分）：\n"+
+					"  · 常规输入 = %d × %d ÷ 1,000,000 = %d 积分\n"+
+					"  · 缓存命中 = %d（= %d × %.2f 比率） × %d ÷ 1,000,000 = %d 积分\n"+
+					"  · 缓存写入 = %d（= %d × %.2f 比率） × %d ÷ 1,000,000 = %d 积分\n"+
+					"  · 输入合计 = %d + %d + %d = %d 积分\n"+
+					"输出成本 = %d × %d ÷ 1,000,000 = %d 积分\n"+
+					"合计 = %d + %d = %d 积分（%.4f 元）%s",
+				effectiveInputPricePerToken, regularInputTokens, regularInputCost,
+				cacheReadPerMillion, effectiveInputPricePerToken, cacheReadRatio, cacheReadTokens, cacheReadCost,
+				cacheWritePerMillion, effectiveInputPricePerToken, cacheWriteRatio, cacheWriteTokens, cacheWriteCost,
+				regularInputCost, cacheReadCost, cacheWriteCost, recomputedInputCost,
+				effectiveOutputPricePerToken, completion, recomputedOutputCost,
+				recomputedInputCost, recomputedOutputCost, recomputedTotal,
+				float64(recomputedTotal)/10000.0,
+				savingsLine,
+			)
+		} else {
+			formula = tierPrefix + fmt.Sprintf(
+				"输入成本 = %d（每百万积分） × %d（输入tokens） ÷ 1,000,000 = %d 积分\n"+
+					"输出成本 = %d（每百万积分） × %d（输出tokens） ÷ 1,000,000 = %d 积分\n"+
+					"合计 = %d + %d = %d 积分（%.4f 元）",
+				effectiveInputPricePerToken, prompt, recomputedInputCost,
+				effectiveOutputPricePerToken, completion, recomputedOutputCost,
+				recomputedInputCost, recomputedOutputCost, recomputedTotal,
+				float64(recomputedTotal)/10000.0,
+			)
+		}
 	} else if modelFound {
 		formula = fmt.Sprintf("模型计费单位为 %s，非按百万 tokens 计费，公式无法线性重算。", aiModel.PricingUnit)
 	} else {
@@ -483,12 +678,14 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 		"current_input_cost_rmb":          aiModel.InputCostRMB,
 		"current_output_cost_rmb":         aiModel.OutputCostRMB,
 
-		// 售价（model_pricings）- 平台对用户的定价
-		"current_input_price_per_million":  mp.InputPricePerToken,
-		"current_output_price_per_million": mp.OutputPricePerToken,
-		"current_input_price_rmb":          mp.InputPriceRMB,
-		"current_output_price_rmb":         mp.OutputPriceRMB,
+		// 售价（model_pricings）- 平台对用户的定价（含阶梯覆盖）
+		"current_input_price_per_million":  effectiveInputPricePerToken,
+		"current_output_price_per_million": effectiveOutputPricePerToken,
+		"current_input_price_rmb":          effectiveInputPriceRMB,
+		"current_output_price_rmb":         effectiveOutputPriceRMB,
 		"pricing_effective_from":           mp.EffectiveFrom,
+		// 所有阶梯的成本价 vs 售价明细（nil = 无阶梯定价，仅单价）
+		"price_tiers_detail": priceTiersDetail,
 
 		// 重算值
 		"recomputed_input_cost":     recomputedInputCost,
@@ -509,10 +706,100 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 		"deviation_rmb":         float64(deviation) / 10000.0,
 		"cost_match":            deviation == 0 || !formulaApplicable,
 
+		// 缓存定价明细
+		"supports_cache":                 aiModel.SupportsCache,
+		"cache_mechanism":                aiModel.CacheMechanism,
+		"cache_read_tokens":              log.CacheReadTokens,
+		"cache_write_tokens":             log.CacheWriteTokens,
+		"cache_savings_rmb":              computedCacheSavingsRMB,
+		"cache_input_price_rmb":          aiModel.CacheInputPriceRMB,
+		"cache_explicit_input_price_rmb": aiModel.CacheExplicitInputPriceRMB,
+		"cache_write_price_rmb":          aiModel.CacheWritePriceRMB,
+		"cache_read_ratio":               cacheReadRatio,
+		"cache_write_ratio":              cacheWriteRatio,
+		"cache_read_per_million":         cacheReadPerMillion,
+		"cache_write_per_million":        cacheWritePerMillion,
+		"cache_read_cost":                cacheReadCost,
+		"cache_write_cost":               cacheWriteCost,
+		"regular_input_tokens":           regularInputTokens,
+		"regular_input_cost":             regularInputCost,
+
+		// 多级定价命中信息
+		"matched_price_tier":     log.MatchedPriceTier,
+		"matched_price_tier_idx": log.MatchedPriceTierIdx,
+		"discount_info":          h.resolvePricingLayers(ctx, log.UserID, aiModel.ID, user.TenantID),
+
 		"formula": formula,
 	}
 
 	response.Success(c, payload)
+}
+
+// resolvePricingLayers 解析该用户/模型组合命中的多级定价链路
+// 返回 [{layer, detail}] 供前端展示：
+//   - agent_custom: 该租户针对该模型的自定义定价
+//   - level_discount: 该用户会员等级的折扣率
+//   - platform: 兜底平台售价
+func (h *ApiCallLogHandler) resolvePricingLayers(ctx context.Context, userID, modelID, tenantID uint) []map[string]interface{} {
+	layers := make([]map[string]interface{}, 0, 3)
+
+	// 代理商自定义定价
+	if tenantID > 0 && modelID > 0 {
+		var ap model.AgentPricing
+		if err := h.db.WithContext(ctx).
+			Where("tenant_id = ? AND model_id = ?", tenantID, modelID).
+			First(&ap).Error; err == nil && ap.PricingType != "INHERIT" {
+			layer := map[string]interface{}{
+				"layer":        "agent_custom",
+				"label":        "代理商自定义定价",
+				"pricing_type": ap.PricingType,
+			}
+			if ap.InputPrice != nil {
+				layer["input_price"] = *ap.InputPrice
+			}
+			if ap.OutputPrice != nil {
+				layer["output_price"] = *ap.OutputPrice
+			}
+			if ap.MarkupRate != nil {
+				layer["markup_rate"] = *ap.MarkupRate
+			}
+			if ap.DiscountRate != nil {
+				layer["discount_rate"] = *ap.DiscountRate
+			}
+			layers = append(layers, layer)
+		}
+	}
+
+	// 会员等级折扣（基于 user.member_level）
+	if userID > 0 {
+		var mlevel struct {
+			LevelCode string
+			Discount  float64
+		}
+		// user_balances.member_level_id → member_levels.model_discount
+		_ = h.db.WithContext(ctx).Raw(`
+			SELECT ml.level_code AS level_code, COALESCE(ml.model_discount, 1.0) AS discount
+			FROM user_balances ub
+			LEFT JOIN member_levels ml ON ml.id = ub.member_level_id AND ml.deleted_at IS NULL
+			WHERE ub.user_id = ? LIMIT 1
+		`, userID).Scan(&mlevel).Error
+		if mlevel.LevelCode != "" && mlevel.Discount > 0 && mlevel.Discount < 1.0 {
+			layers = append(layers, map[string]interface{}{
+				"layer":         "member_level",
+				"label":         "会员等级折扣",
+				"level_code":    mlevel.LevelCode,
+				"discount_rate": mlevel.Discount,
+			})
+		}
+	}
+
+	// 平台基础售价（兜底）
+	layers = append(layers, map[string]interface{}{
+		"layer": "platform",
+		"label": "平台基础售价",
+	})
+
+	return layers
 }
 
 // Summary 聚合统计：与 List 接受相同筛选参数，返回当前筛选条件下的汇总数据

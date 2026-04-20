@@ -17,6 +17,7 @@ database:
 
 redis:
   addr: 127.0.0.1:6379
+  username: ""   # 可选：阿里云 Tair ACL 账号名；本地开发留空走 AUTH password 模式
   password: ""
   db: 0
 
@@ -39,6 +40,25 @@ ratelimit:
 i18n:
   default_lang: en
   locales_dir: ./internal/pkg/i18n/locales
+
+support:
+  enabled: true
+  internal_base_url: "http://localhost:8080"  # 单体模式走 localhost；三服务模式在 docker-compose 中以 SUPPORT_INTERNAL_BASE_URL=http://gateway:8080 覆盖
+  internal_api_key: ""                        # 系统级 API Key。留空时 AI 客服对外返回 503；管理员可在 Dashboard 创建普通 APIKey 并贴进 system_configs.support.internal_api_key（或此处）
+  embedding_model: "text-embedding-v3"
+  budget_monthly_credits: 5000000             # 月预算：500 万积分 = ¥500
+  budget_economy_pct: 30                      # 剩余 <30% 降级 economy 模型
+  budget_emergency_pct: 5                     # 剩余 <5% 熔断为固定话术 + 强制转工单
+  rag_top_k: 5
+  rag_score_threshold: 0.5
+  rag_multi_source: true
+  max_history_turns: 8
+  max_msg_len: 2000
+  memory_top_k: 10
+  ticket_sla_hours: 24
+  provider_docs_top_k: 3
+  rate_limit_per_hour: 60
+  ticket_rate_limit_per_day: 20
 
 payment:
   wechat:

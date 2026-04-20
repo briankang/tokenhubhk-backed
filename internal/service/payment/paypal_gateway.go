@@ -20,6 +20,7 @@ import (
 type PayPalGateway struct {
 	clientID     string
 	clientSecret string
+	webhookID    string // v3.2: webhook 签名校验必填
 	sandbox      bool
 	baseURL      string
 	httpClient   *http.Client
@@ -40,6 +41,7 @@ func NewPayPalGateway(logger *zap.Logger) *PayPalGateway {
 	return &PayPalGateway{
 		clientID:     cfg.ClientID,
 		clientSecret: cfg.ClientSecret,
+		webhookID:    cfg.WebhookID,
 		sandbox:      cfg.Sandbox,
 		baseURL:      baseURL,
 		httpClient:   &http.Client{Timeout: 30 * time.Second},
@@ -365,7 +367,7 @@ func (g *PayPalGateway) VerifyCallback(ctx context.Context, data []byte, headers
 		"cert_url":          certURL,
 		"auth_algo":         authAlgo,
 		"transmission_sig":  transmissionSig,
-		"webhook_id":        "", // Should be configured; omitted for brevity
+		"webhook_id":        g.webhookID,
 		"webhook_event":     json.RawMessage(data),
 	}
 	verifyPayload, _ := json.Marshal(verifyBody)
@@ -397,39 +399,95 @@ func (g *PayPalGateway) VerifyCallback(ctx context.Context, data []byte, headers
 		return nil, fmt.Errorf("paypal: webhook verification failed: %s", verifyResult.VerificationStatus)
 	}
 
-	// Parse the event
-	var event struct {
-		EventType string `json:"event_type"`
-		Resource  struct {
-			ID            string `json:"id"`
-			Status        string `json:"status"`
-			PurchaseUnits []struct {
-				ReferenceID string `json:"reference_id"`
-				Amount      struct {
-					Value string `json:"value"`
-				} `json:"amount"`
-			} `json:"purchase_units"`
-		} `json:"resource"`
+	return parsePayPalEvent(data)
+}
+
+// parsePayPalEvent 解析 PayPal webhook 事件并适配多种事件/资源结构
+// 支持 2024+ 最新格式：
+//   - CHECKOUT.ORDER.APPROVED (V2 Order API, resource.purchase_units[0])
+//   - PAYMENT.CAPTURE.COMPLETED (V2 Capture, resource.custom_id + resource.amount.value)
+//   - PAYMENT.SALE.COMPLETED (Classic Sale, resource.invoice_number + resource.amount.total)
+//   - CHECKOUT.ORDER.COMPLETED (V2 新命名)
+//   - PAYMENT.CAPTURE.REFUNDED / PAYMENT.CAPTURE.DENIED (退款/失败)
+func parsePayPalEvent(data []byte) (*CallbackResult, error) {
+	var base struct {
+		EventType string          `json:"event_type"`
+		Resource  json.RawMessage `json:"resource"`
 	}
-	if err := json.Unmarshal(data, &event); err != nil {
+	if err := json.Unmarshal(data, &base); err != nil {
 		return nil, fmt.Errorf("paypal: unmarshal event: %w", err)
 	}
 
-	status := "failed"
-	if event.EventType == "CHECKOUT.ORDER.APPROVED" || event.EventType == "PAYMENT.CAPTURE.COMPLETED" {
-		status = "success"
+	// 解析 resource 时兼容三种 shape
+	var resource struct {
+		ID            string `json:"id"`
+		Status        string `json:"status"`
+		CustomID      string `json:"custom_id"`        // V2 Capture: 业务订单号透传
+		InvoiceNumber string `json:"invoice_number"`   // Classic Sale: 业务订单号
+		ParentPayment string `json:"parent_payment"`
+		Amount        struct {
+			Value    string `json:"value"`    // V2 format
+			Total    string `json:"total"`    // Classic format
+			Currency string `json:"currency_code"`
+		} `json:"amount"`
+		PurchaseUnits []struct {
+			ReferenceID string `json:"reference_id"`
+			CustomID    string `json:"custom_id"`
+			Amount      struct {
+				Value string `json:"value"`
+			} `json:"amount"`
+		} `json:"purchase_units"`
+	}
+	if err := json.Unmarshal(base.Resource, &resource); err != nil {
+		return nil, fmt.Errorf("paypal: unmarshal resource: %w", err)
 	}
 
-	var orderNo string
+	status := "failed"
+	switch base.EventType {
+	case "CHECKOUT.ORDER.APPROVED",
+		"PAYMENT.CAPTURE.COMPLETED",
+		"PAYMENT.SALE.COMPLETED",
+		"CHECKOUT.ORDER.COMPLETED":
+		status = "success"
+	case "PAYMENT.CAPTURE.REFUNDED":
+		status = "refunded"
+	case "PAYMENT.CAPTURE.DENIED",
+		"PAYMENT.SALE.DENIED":
+		status = "failed"
+	default:
+		// 未识别事件，仍返回错误让 handler 拒绝
+		return nil, fmt.Errorf("paypal: unhandled event type: %s", base.EventType)
+	}
+
+	// 优先级：CustomID (Capture) → InvoiceNumber (Sale) → purchase_units[0].ReferenceID/CustomID (Order)
+	orderNo := resource.CustomID
+	if orderNo == "" {
+		orderNo = resource.InvoiceNumber
+	}
+	if orderNo == "" && len(resource.PurchaseUnits) > 0 {
+		if resource.PurchaseUnits[0].CustomID != "" {
+			orderNo = resource.PurchaseUnits[0].CustomID
+		} else {
+			orderNo = resource.PurchaseUnits[0].ReferenceID
+		}
+	}
+
+	// 金额：优先直接 resource.amount.value，其次 amount.total（Classic），最后 purchase_units[0].amount.value
 	var amount float64
-	if len(event.Resource.PurchaseUnits) > 0 {
-		orderNo = event.Resource.PurchaseUnits[0].ReferenceID
-		fmt.Sscanf(event.Resource.PurchaseUnits[0].Amount.Value, "%f", &amount)
+	valueStr := resource.Amount.Value
+	if valueStr == "" {
+		valueStr = resource.Amount.Total
+	}
+	if valueStr == "" && len(resource.PurchaseUnits) > 0 {
+		valueStr = resource.PurchaseUnits[0].Amount.Value
+	}
+	if valueStr != "" {
+		fmt.Sscanf(valueStr, "%f", &amount)
 	}
 
 	return &CallbackResult{
 		OrderNo:      orderNo,
-		GatewayTxnID: event.Resource.ID,
+		GatewayTxnID: resource.ID,
 		Amount:       amount,
 		Status:       status,
 		PaidAt:       time.Now().Format(time.RFC3339),

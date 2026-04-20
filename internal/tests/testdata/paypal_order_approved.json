@@ -1,0 +1,27 @@
+{
+  "_description": "PayPal V2 Order API — CHECKOUT.ORDER.APPROVED（resource.purchase_units[0] 含业务订单号）",
+  "id": "WH-ORDER-APPROVED-12345",
+  "event_type": "CHECKOUT.ORDER.APPROVED",
+  "create_time": "2026-04-17T03:17:00.000Z",
+  "resource_type": "checkout-order",
+  "resource": {
+    "id": "8XE89203BZ563461V",
+    "status": "APPROVED",
+    "intent": "CAPTURE",
+    "purchase_units": [
+      {
+        "reference_id": "ORD-2026041703170007",
+        "custom_id": "ORD-2026041703170007",
+        "amount": {
+          "currency_code": "USD",
+          "value": "50.00"
+        }
+      }
+    ],
+    "payer": {
+      "email_address": "test@example.com",
+      "payer_id": "QYR5Z8XWVGKUA"
+    }
+  },
+  "links": []
+}

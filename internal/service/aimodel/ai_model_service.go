@@ -105,6 +105,15 @@ func (s *AIModelService) GetStats(ctx context.Context) (*ModelStats, error) {
 }
 
 // ListWithFilter 带供应商和搜索过滤的分页模型列表
+//
+// v3.5 排序优先级（从高到低）：
+//  1. label_priority DESC（标签优先级：热卖 100 > 优惠 80 > 新品 70 > 免费 60 > 推荐 50）
+//  2. is_active DESC（已启用在前）
+//  3. has_price DESC（有价格在前）
+//  4. call_count DESC（调用次数高在前）
+//  5. id DESC（最新创建兜底）
+//
+// 标签优先级通过子查询 JOIN label_dictionary 取该模型所有标签中 priority 的最大值。
 func (s *AIModelService) ListWithFilter(ctx context.Context, page, pageSize int, supplierID uint, search string) ([]model.AIModel, int64, error) {
 	if page < 1 {
 		page = 1
@@ -126,7 +135,22 @@ func (s *AIModelService) ListWithFilter(ctx context.Context, page, pageSize int,
 	}
 	var models []model.AIModel
 	offset := (page - 1) * pageSize
-	if err := query.Preload("Category").Preload("Supplier").Preload("Pricing").Offset(offset).Limit(pageSize).Order("id DESC").Find(&models).Error; err != nil {
+
+	// v3.5 多级排序：标签优先级 > is_active > has_price > call_count > id
+	// 注意：MySQL 保留字 `key` 必须加反引号；sql_mode=only_full_group_by 下 CASE 表达式需单独排序列
+	orderClause := "COALESCE((SELECT MAX(ld.priority) FROM model_labels ml " +
+		"JOIN label_dictionary ld ON ld.`key` = ml.label_key AND ld.is_active = 1 " +
+		"WHERE ml.model_id = ai_models.id AND ml.deleted_at IS NULL), 0) DESC, " +
+		"is_active DESC, " +
+		"(CASE WHEN input_cost_rmb > 0 OR output_cost_rmb > 0 THEN 1 ELSE 0 END) DESC, " +
+		"call_count DESC, " +
+		"id DESC"
+
+	if err := query.
+		Preload("Category").Preload("Supplier").Preload("Pricing").
+		Offset(offset).Limit(pageSize).
+		Order(orderClause).
+		Find(&models).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to list ai models: %w", err)
 	}
 	return models, total, nil

@@ -13,16 +13,16 @@ import (
 	"tokenhub-server/internal/pkg/response"
 )
 
-// Claims JWT Token 的声明体，包含用户 ID、租户 ID 和角色
+// Claims JWT Token 的声明体
+// v4.0: 移除 Role 字段 —— 权限来源改为 user_roles 表，由 LoadSubjectPerms 动态解析。
+// 兼容：旧 token 含 Role 字段仍可解析（json 反序列化忽略未知字段）。
 type Claims struct {
-	UserID   uint   `json:"user_id"`
-	TenantID uint   `json:"tenant_id"`
-	Role     string `json:"role"`
+	UserID   uint `json:"user_id"`
+	TenantID uint `json:"tenant_id"`
 	jwt.RegisteredClaims
 }
 
-// Auth 返回 JWT 认证中间件
-// 从 Authorization 头提取 Bearer Token，验证签名并将用户信息注入上下文
+// Auth JWT 认证中间件：解析 Bearer Token 并注入 userId/tenantId 到 ctx
 func Auth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := extractToken(c)
@@ -39,46 +39,15 @@ func Auth() gin.HandlerFunc {
 			return
 		}
 
-		// 将用户信息写入 Gin 上下文
 		c.Set("userId", claims.UserID)
 		c.Set("tenantId", claims.TenantID)
-		c.Set("role", claims.Role)
 
-		// 同时写入 request context，便于 Service 层通过 ctx.Value() 读取
 		ctx := c.Request.Context()
 		ctx = context.WithValue(ctx, "userId", claims.UserID)
 		ctx = context.WithValue(ctx, "tenantId", claims.TenantID)
-		ctx = context.WithValue(ctx, "role", claims.Role)
 		c.Request = c.Request.WithContext(ctx)
 
 		c.Next()
-	}
-}
-
-// RequireRole 返回角色校验中间件，检查用户是否拥有指定角色之一
-// 参数 roles: 允许的角色列表 (如 "ADMIN", "AGENT_L1")
-func RequireRole(roles ...string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		role, exists := c.Get("role")
-		if !exists {
-			response.Error(c, http.StatusForbidden, errcode.ErrPermissionDenied)
-			c.Abort()
-			return
-		}
-		roleStr, ok := role.(string)
-		if !ok {
-			response.Error(c, http.StatusForbidden, errcode.ErrPermissionDenied)
-			c.Abort()
-			return
-		}
-		for _, r := range roles {
-			if r == roleStr {
-				c.Next()
-				return
-			}
-		}
-		response.Error(c, http.StatusForbidden, errcode.ErrPermissionDenied)
-		c.Abort()
 	}
 }
 
@@ -95,7 +64,7 @@ func extractToken(c *gin.Context) string {
 	return strings.TrimSpace(parts[1])
 }
 
-// parseToken 解析并验证 JWT Token，返回 Claims
+// parseToken 解析并验证 JWT Token
 func parseToken(tokenStr string) (*Claims, error) {
 	secret := config.Global.JWT.Secret
 	claims := &Claims{}

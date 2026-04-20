@@ -36,9 +36,8 @@ func RunSeed(db *gorm.DB) {
 		if err := seedCategories(tx); err != nil {
 			return fmt.Errorf("categories: %w", err)
 		}
-		if err := seedModels(tx); err != nil {
-			return fmt.Errorf("models: %w", err)
-		}
+		// seedModels / seedModelPricings 已禁用：硬编码模型会与 auto-discovery 数据冲突
+		// 模型数据源：管理员填 APIKey 后触发模型同步（DiscoveryService.SyncAllActive）
 		if err := seedChannels(tx); err != nil {
 			return fmt.Errorf("channels: %w", err)
 		}
@@ -48,18 +47,17 @@ func RunSeed(db *gorm.DB) {
 		if err := seedBackupRules(tx); err != nil {
 			return fmt.Errorf("backup_rules: %w", err)
 		}
-		if err := seedModelPricings(tx); err != nil {
-			return fmt.Errorf("model_pricings: %w", err)
-		}
 		if err := seedAdminUser(tx); err != nil {
 			return fmt.Errorf("admin_user: %w", err)
 		}
 		if err := seedPaymentConfig(tx); err != nil {
 			return fmt.Errorf("payment_config: %w", err)
 		}
-		if err := seedCodingPlanChannels(tx); err != nil {
-			return fmt.Errorf("coding_plan: %w", err)
-		}
+		// seedCodingPlanChannels 已禁用（v3.2）：Coding Plan 供应商已从 supplierDefs 移除
+		// 如需启用 Coding Plan 功能，管理员可通过「供应商管理」+「渠道管理」手动添加：
+		//   1. POST /admin/suppliers 创建 access_type=coding_plan 的供应商
+		//   2. POST /admin/channels 创建 channel_type=CODING 的渠道
+		//   3. POST /admin/channel-groups 创建 Coding Plan 渠道组
 		return nil
 	}); err != nil {
 		logger.L.Error("seed: transaction failed", zap.Error(err))
@@ -104,25 +102,23 @@ type supplierDef struct {
 	Discount        float64 // 折扣比例，1.0 表示无折扣
 }
 
-// supplierDefs 供应商种子数据列表
-// 每个供应商可以有 api 和 coding_plan 两条记录
+// supplierDefs 供应商种子数据列表（v3.2 精简版）
+//
+// 仅保留 4 家真实供应商（已签约或具备完整接入条件）：
+//   1. 阿里云百炼   - seed.go 创建（api 类型）
+//   2. 火山引擎     - seed.go 创建（api 类型）
+//   3. 百度千帆     - seed.go 创建（api 类型）
+//   4. 腾讯混元     - RunSeedHunyuan 创建（api 类型，单独维护）
+//
+// 已移除的供应商（OpenAI/Anthropic/Gemini/Azure/DeepSeek/Moonshot/智谱/文心/Coding Plan）：
+//   - 未签约或不实际使用，避免 UI 噪音
+//   - 如需启用，管理员可通过「供应商管理」-「新建」手动添加（POST /admin/suppliers）
 var supplierDefs = []supplierDef{
-	// API 类型供应商（默认接入点）
-	{"OpenAI", "openai", "https://api.openai.com/v1", "bearer_token", true, "api", 17.5, 70, 1.0},
-	{"Anthropic", "anthropic", "https://api.anthropic.com", "api_key_header", true, "api", 21, 105, 1.0},
-	{"Google Gemini", "google_gemini", "https://generativelanguage.googleapis.com/v1beta", "api_key_param", true, "api", 0.5, 2, 1.0},
-	{"Azure OpenAI", "azure_openai", "", "api_key_header", false, "api", 17.5, 70, 1.0},
-	{"DeepSeek", "deepseek", "https://api.deepseek.com/v1", "bearer_token", true, "api", 0.5, 2, 1.0},
+	// API 类型供应商（默认接入点）—— 4 家真实供应商中的 3 家
 	{"阿里云百炼", "aliyun_dashscope", "https://dashscope.aliyuncs.com/compatible-mode/v1", "bearer_token", true, "api", 0.3, 0.6, 1.0},
 	{"火山引擎", "volcengine", "https://ark.cn-beijing.volces.com/api/v3", "bearer_token", true, "api", 0.8, 2, 1.0},
-	{"Moonshot", "moonshot", "https://api.moonshot.cn/v1", "bearer_token", true, "api", 1, 1, 1.0},
-	{"智谱GLM", "zhipu", "https://open.bigmodel.cn/api/paas/v4", "jwt_sign", true, "api", 5, 5, 1.0},
-	{"百度文心", "baidu_wenxin", "https://aip.baidubce.com", "oauth2_token", true, "api", 0.8, 2, 1.0},
-	// 百度千帆 V2（OpenAI 兼容，直接 Bearer bce-v3 密钥，独立于旧文心一言 OAuth2 接口）
 	{"百度千帆", "baidu_qianfan", "https://qianfan.baidubce.com/v2", "bearer_token", true, "api", 4, 16, 1.0},
-	// Coding Plan 类型供应商（代码补全接入点）
-	{"阿里云百炼 (Coding Plan)", "aliyun_dashscope", "https://dashscope.aliyuncs.com/compatible-mode/v1", "bearer_token", true, "coding_plan", 0.3, 0.6, 1.0},
-	{"火山引擎 (Coding Plan)", "volcengine", "https://ark.cn-beijing.volces.com/api/v3", "bearer_token", true, "coding_plan", 0.8, 2, 1.0},
+	// 第 4 家（腾讯混元）由 RunSeedHunyuan 单独维护
 }
 
 // seedSuppliers 创建供应商种子数据
@@ -141,6 +137,8 @@ func seedSuppliers(tx *gorm.DB) error {
 			OutputPricePerM: s.OutputPricePerM,
 			Discount:        s.Discount,
 			Status:          "active",
+			// 首次 seed 时即写入官网定价 URL（defaultPricingURLByCode 定义在 migrate_supplier_pricing_url.go）
+			PricingURL: defaultPricingURLByCode[s.Code],
 		}
 		// 设置默认值
 		if sup.AccessType == "" {
@@ -167,31 +165,14 @@ type categoryDef struct {
 	Code         string
 }
 
+// categoryDefs 模型分类种子（v3.2 精简版，仅含 4 家真实供应商）
+// 腾讯混元的分类由 RunSeedHunyuan 单独创建
 var categoryDefs = []categoryDef{
-	// OpenAI
-	{"openai", "通用对话", "openai_chat"},
-	{"openai", "编码模型", "openai_code"},
-	// Anthropic
-	{"anthropic", "通用对话", "anthropic_chat"},
-	// Google
-	{"google_gemini", "通用对话", "gemini_chat"},
-	{"google_gemini", "推理模型", "gemini_reasoning"},
-	// Azure
-	{"azure_openai", "通用对话", "azure_chat"},
-	// DeepSeek
-	{"deepseek", "通用对话", "deepseek_chat"},
-	{"deepseek", "推理模型", "deepseek_reasoning"},
-	// 阿里云
+	// 阿里云百炼
 	{"aliyun_dashscope", "通用对话", "qwen_chat"},
 	{"aliyun_dashscope", "推理模型", "qwen_reasoning"},
 	// 火山引擎
 	{"volcengine", "通用对话", "doubao_chat"},
-	// Moonshot
-	{"moonshot", "通用对话", "moonshot_chat"},
-	// 智谱
-	{"zhipu", "通用对话", "zhipu_chat"},
-	// 百度文心（旧接口）
-	{"baidu_wenxin", "通用对话", "ernie_chat"},
 	// 百度千帆 V2（新 OpenAI 兼容接口）
 	{"baidu_qianfan", "通用对话", "qianfan_chat"},
 	{"baidu_qianfan", "推理模型", "qianfan_reasoning"},
@@ -326,43 +307,8 @@ func seedModels(tx *gorm.DB) error {
 // ---------- channels ----------
 
 func seedChannels(tx *gorm.DB) error {
-	// 为每个 api 类型供应商创建模板渠道（未激活，APIKey为空）
-	for _, sd := range supplierDefs {
-		// 只为 api 类型创建模板渠道
-		if sd.AccessType != "api" {
-			continue
-		}
-		var sup model.Supplier
-		if err := tx.Where("code = ? AND access_type = ?", sd.Code, "api").First(&sup).Error; err != nil {
-			return fmt.Errorf("find supplier %s: %w", sd.Code, err)
-		}
-
-		channelType := sd.Code
-		if sd.Code == "aliyun_dashscope" || sd.Code == "volcengine" || sd.Code == "moonshot" ||
-			sd.Code == "zhipu" || sd.Code == "baidu_wenxin" || sd.Code == "baidu_qianfan" {
-			channelType = "openai" // OpenAI-compatible
-		}
-		if sd.Code == "azure_openai" {
-			channelType = "azure"
-		}
-
-		ch := model.Channel{
-			Name:           fmt.Sprintf("%s 模板渠道", sd.Name),
-			SupplierID:     sup.ID,
-			Type:           channelType,
-			Endpoint:       sd.BaseURL,
-			APIKey:         "",
-			Models:         mustJSON([]string{}),
-			Weight:         1,
-			Priority:       0,
-			Status:         "inactive",
-			MaxConcurrency: 100,
-			QPM:            60,
-		}
-		if err := tx.Create(&ch).Error; err != nil {
-			return fmt.Errorf("create template channel %s: %w", sd.Code, err)
-		}
-	}
+	// 模板渠道循环已禁用：未被任何路由/降级代码使用，仅产生 UI 噪音
+	// 历史问题：每次 fresh DB 启动都会冒出 11 条 inactive 模板渠道，混淆管理员
 
 	// 真实渠道：阿里云百炼
 	var aliyunSup model.Supplier

@@ -10,7 +10,9 @@ import (
 // RunCachePriceMigration 幂等地为已有模型回填缓存定价字段
 //
 // 策略：
-//   - 按模型名前缀匹配，仅处理 supports_cache = 0 的行（已启用的跳过，不覆盖管理员配置）
+//   - 按模型名前缀匹配
+//   - 场景 A：supports_cache = 0 的行 → 全量启用并填充价格
+//   - 场景 B：supports_cache = 1 但 cache_input_price_rmb <= 0 的行 → 仅回填价格（修复部分状态）
 //   - 价格基于 input_cost_rmb 按比例推算（input_cost_rmb = 0 时缓存价也置 0，管理员可事后手动填）
 //   - 适用场景：生产数据库升级后首次启动，为历史模型补充缓存定价
 //
@@ -84,11 +86,17 @@ func RunCachePriceMigration(db *gorm.DB) {
 		// ── 智谱 GLM ─────────────────────────────────────────────────────
 		// 全自动多轮缓存，命中价约为原价20%
 		{Pattern: "glm%", CacheMechanism: "auto", CacheMinTokens: 0, CacheInputRatio: 0.2},
+
+		// ── 百度千帆 ERNIE ───────────────────────────────────────────────
+		// 双模式：隐式(auto)命中20%价，显式(explicit)命中10%价，写入125%
+		// 参考 qianfan_scraper.go::annotateQianfanCacheSupport
+		{Pattern: "ernie-%", CacheMechanism: "both", CacheMinTokens: 1024, CacheInputRatio: 0.2, CacheExplicitInputRatio: 0.1, CacheWriteRatio: 1.25},
 	}
 
 	totalUpdated := int64(0)
 	for _, r := range rules {
-		result := db.Exec(`
+		// 场景 A：未启用缓存 → 启用并填充
+		resultA := db.Exec(`
 			UPDATE ai_models
 			SET
 				supports_cache               = 1,
@@ -108,14 +116,41 @@ func RunCachePriceMigration(db *gorm.DB) {
 			r.CacheWriteRatio,
 			r.Pattern,
 		)
-		if result.Error != nil {
-			logger.L.Warn("cache price migration: update failed",
+		if resultA.Error != nil {
+			logger.L.Warn("cache price migration: enable+fill failed",
 				zap.String("pattern", r.Pattern),
-				zap.Error(result.Error),
+				zap.Error(resultA.Error),
 			)
 			continue
 		}
-		totalUpdated += result.RowsAffected
+		totalUpdated += resultA.RowsAffected
+
+		// 场景 B：已启用但价格缺失 → 仅回填价格（不覆盖管理员已配置的机制/门槛）
+		resultB := db.Exec(`
+			UPDATE ai_models
+			SET
+				cache_input_price_rmb        = CASE WHEN input_cost_rmb > 0 THEN input_cost_rmb * ? ELSE cache_input_price_rmb END,
+				cache_explicit_input_price_rmb = CASE WHEN input_cost_rmb > 0 AND (cache_explicit_input_price_rmb IS NULL OR cache_explicit_input_price_rmb = 0) THEN input_cost_rmb * ? ELSE cache_explicit_input_price_rmb END,
+				cache_write_price_rmb        = CASE WHEN input_cost_rmb > 0 AND (cache_write_price_rmb IS NULL OR cache_write_price_rmb = 0) THEN input_cost_rmb * ? ELSE cache_write_price_rmb END
+			WHERE model_name LIKE ?
+			  AND supports_cache = 1
+			  AND (cache_input_price_rmb IS NULL OR cache_input_price_rmb = 0)
+			  AND input_cost_rmb > 0
+			  AND deleted_at IS NULL
+		`,
+			r.CacheInputRatio,
+			r.CacheExplicitInputRatio,
+			r.CacheWriteRatio,
+			r.Pattern,
+		)
+		if resultB.Error != nil {
+			logger.L.Warn("cache price migration: backfill prices failed",
+				zap.String("pattern", r.Pattern),
+				zap.Error(resultB.Error),
+			)
+			continue
+		}
+		totalUpdated += resultB.RowsAffected
 	}
 
 	if totalUpdated > 0 {

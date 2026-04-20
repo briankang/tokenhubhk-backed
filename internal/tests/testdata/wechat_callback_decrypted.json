@@ -1,0 +1,22 @@
+{
+  "_description": "微信支付 V3 回调 resource 解密后的订单明文（模拟 AES-256-GCM 解密结果，用于 HandleCallback 单测）",
+  "mchid": "1900000109",
+  "appid": "wx1234567890abcdef",
+  "out_trade_no": "ORD-2026041703170003",
+  "transaction_id": "4200000001202604171234567890",
+  "trade_type": "NATIVE",
+  "trade_state": "SUCCESS",
+  "trade_state_desc": "支付成功",
+  "bank_type": "CMB_DEBIT",
+  "attach": "",
+  "success_time": "2026-04-17T03:17:05+08:00",
+  "payer": {
+    "openid": "oUpF8uMuAJO_M2pxb1Q9zNjWeS6o"
+  },
+  "amount": {
+    "total": 10000,
+    "payer_total": 10000,
+    "currency": "CNY",
+    "payer_currency": "CNY"
+  }
+}

@@ -279,7 +279,16 @@ func (g *StripeGateway) VerifyCallback(_ context.Context, data []byte, headers m
 		return nil, fmt.Errorf("stripe: signature verification failed")
 	}
 
-	// Parse the event
+	return parseStripeEvent(data)
+}
+
+// parseStripeEvent 解析 Stripe 事件并映射到 CallbackResult
+// 支持 2024+ 最新事件格式：
+//   - checkout.session.completed（推荐，包含 metadata.order_no）
+//   - payment_intent.succeeded（低层事件，兼容旧版集成）
+//   - charge.refunded（退款回调）
+//   - charge.succeeded（V1 兼容）
+func parseStripeEvent(data []byte) (*CallbackResult, error) {
 	var event struct {
 		Type string `json:"type"`
 		Data struct {
@@ -290,32 +299,72 @@ func (g *StripeGateway) VerifyCallback(_ context.Context, data []byte, headers m
 		return nil, fmt.Errorf("stripe: unmarshal event: %w", err)
 	}
 
-	if event.Type != "checkout.session.completed" {
+	switch event.Type {
+	case "checkout.session.completed":
+		var session struct {
+			PaymentIntent string            `json:"payment_intent"`
+			PaymentStatus string            `json:"payment_status"`
+			AmountTotal   int64             `json:"amount_total"`
+			Metadata      map[string]string `json:"metadata"`
+		}
+		if err := json.Unmarshal(event.Data.Object, &session); err != nil {
+			return nil, fmt.Errorf("stripe: unmarshal session: %w", err)
+		}
+		status := "failed"
+		if session.PaymentStatus == "paid" {
+			status = "success"
+		}
+		return &CallbackResult{
+			OrderNo:      session.Metadata["order_no"],
+			GatewayTxnID: session.PaymentIntent,
+			Amount:       float64(session.AmountTotal) / 100.0,
+			Status:       status,
+			PaidAt:       time.Now().Format(time.RFC3339),
+		}, nil
+
+	case "payment_intent.succeeded", "charge.succeeded":
+		var pi struct {
+			ID       string            `json:"id"`
+			Amount   int64             `json:"amount"`
+			Status   string            `json:"status"`
+			Metadata map[string]string `json:"metadata"`
+		}
+		if err := json.Unmarshal(event.Data.Object, &pi); err != nil {
+			return nil, fmt.Errorf("stripe: unmarshal payment_intent: %w", err)
+		}
+		status := "failed"
+		if pi.Status == "succeeded" {
+			status = "success"
+		}
+		return &CallbackResult{
+			OrderNo:      pi.Metadata["order_no"],
+			GatewayTxnID: pi.ID,
+			Amount:       float64(pi.Amount) / 100.0,
+			Status:       status,
+			PaidAt:       time.Now().Format(time.RFC3339),
+		}, nil
+
+	case "charge.refunded":
+		// 退款回调：业务侧可忽略（RefundService 已同步跟踪），但仍返回结构
+		var charge struct {
+			ID       string            `json:"id"`
+			Amount   int64             `json:"amount_refunded"`
+			Metadata map[string]string `json:"metadata"`
+		}
+		if err := json.Unmarshal(event.Data.Object, &charge); err != nil {
+			return nil, fmt.Errorf("stripe: unmarshal refund: %w", err)
+		}
+		return &CallbackResult{
+			OrderNo:      charge.Metadata["order_no"],
+			GatewayTxnID: charge.ID,
+			Amount:       float64(charge.Amount) / 100.0,
+			Status:       "refunded",
+			PaidAt:       time.Now().Format(time.RFC3339),
+		}, nil
+
+	default:
 		return nil, fmt.Errorf("stripe: unhandled event type: %s", event.Type)
 	}
-
-	var session struct {
-		PaymentIntent string            `json:"payment_intent"`
-		PaymentStatus string            `json:"payment_status"`
-		AmountTotal   int64             `json:"amount_total"`
-		Metadata      map[string]string `json:"metadata"`
-	}
-	if err := json.Unmarshal(event.Data.Object, &session); err != nil {
-		return nil, fmt.Errorf("stripe: unmarshal session: %w", err)
-	}
-
-	status := "failed"
-	if session.PaymentStatus == "paid" {
-		status = "success"
-	}
-
-	return &CallbackResult{
-		OrderNo:      session.Metadata["order_no"],
-		GatewayTxnID: session.PaymentIntent,
-		Amount:       float64(session.AmountTotal) / 100.0,
-		Status:       status,
-		PaidAt:       time.Now().Format(time.RFC3339),
-	}, nil
 }
 
 // urlEncode 简单的URL编码工具函数，对特殊字符进行百分号编码

@@ -1,0 +1,15 @@
+{
+  "_description": "微信支付 V3 TRANSACTION.SUCCESS 回调原始 payload (resource 节点为 AEAD_AES_256_GCM 加密)",
+  "id": "EV-2026041703170000000001",
+  "create_time": "2026-04-17T03:17:00+08:00",
+  "event_type": "TRANSACTION.SUCCESS",
+  "resource_type": "encrypt-resource",
+  "resource": {
+    "original_type": "transaction",
+    "algorithm": "AEAD_AES_256_GCM",
+    "ciphertext": "MOCK_CIPHERTEXT_BASE64_PLACEHOLDER_abcdefghijklmnopqrstuvwxyz==",
+    "associated_data": "transaction",
+    "nonce": "mock_nonce_16byte"
+  },
+  "summary": "支付成功"
+}

@@ -11,106 +11,198 @@ import (
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
+	"tokenhub-server/internal/config"
 )
 
 // ========================================================================
 // GeoService — IP 地理位置服务
 // 根据客户端 IP 地址判断所属国家，映射为平台支持的语言代码。
-// 支持三级 fallback 外部数据源: ip-api.com → ipinfo.io → ip.sb
-// 查询结果缓存在 Redis 中（TTL 24h），避免重复调用外部 API。
+// 数据源架构：
+//   L0: 阿里云市场 cmapi021970（https://c2ba.api.huachen.cn/ip，APPCODE 鉴权）
+//   L1-L6: 6 个免费 API 并发竞速（ip-api / ipinfo / ip.sb / ipwho / country.is / geojs）
+// 查询结果缓存在 Redis 中（TTL 可配，默认 1 年），避免重复调用外部 API。
 // ========================================================================
 
 const (
-	// redisTTL 地理位置缓存过期时间 24 小时
-	redisTTL = 24 * time.Hour
-	// redisKeyPrefix Redis 缓存键前缀
 	redisKeyPrefix = "geo:ip:"
-	// httpTimeout 外部 API 请求超时
-	httpTimeout = 5 * time.Second
 )
 
 // GeoResult 地理位置查询结果
 type GeoResult struct {
 	Locale      string `json:"locale"`       // 推荐的语言代码 (如 "zh", "en", "ja")
 	CountryCode string `json:"country_code"` // ISO 3166-1 alpha-2 国家代码
-	Source      string `json:"source"`       // 数据来源标识 ("ip-api" / "ipinfo" / "ip.sb" / "cache" / "default")
+	Source      string `json:"source"`       // 数据来源标识 ("aliyun" / "ip-api" / "ipinfo" / "ip.sb" / "ipwho" / "country.is" / "geojs" / "cache" / "default")
 }
 
 // GeoService IP 地理位置服务，支持多数据源 fallback 和 Redis 缓存
 type GeoService struct {
-	redisClient *goredis.Client
-	httpClient  *http.Client
+	redisClient      *goredis.Client
+	cfg              config.GeoConfig
+	httpClient       *http.Client
+	aliyunTimeout    time.Duration
+	fallbackTimeout  time.Duration
+	providerTimeout  time.Duration
+	cacheTTL         time.Duration
 }
 
 // NewGeoService 创建地理位置服务实例
 // 参数:
 //   - redisClient: Redis 客户端（可为 nil，此时不启用缓存）
-func NewGeoService(redisClient *goredis.Client) *GeoService {
+//   - cfg: 地理位置服务配置（可传零值 config.GeoConfig{}，内部会应用安全默认值）
+func NewGeoService(redisClient *goredis.Client, cfg ...config.GeoConfig) *GeoService {
+	var c config.GeoConfig
+	if len(cfg) > 0 {
+		c = cfg[0]
+	}
+	// 零值防护（测试场景或漏配）
+	if c.AliyunURL == "" {
+		c.AliyunURL = "https://c2ba.api.huachen.cn/ip"
+	}
+	if c.AppCode == "" {
+		c.AppCode = "dcbcacff20e7413ab50231113b364655"
+	}
+	if c.CacheTTL == 0 {
+		c.CacheTTL = 31536000
+	}
+	if c.AliyunTimeoutMs == 0 {
+		c.AliyunTimeoutMs = 2500
+	}
+	if c.FallbackTimeoutMs == 0 {
+		c.FallbackTimeoutMs = 3000
+	}
+	if c.SingleProviderTimeout == 0 {
+		c.SingleProviderTimeout = 2500
+	}
 	return &GeoService{
 		redisClient: redisClient,
+		cfg:         c,
 		httpClient: &http.Client{
-			Timeout: httpTimeout,
+			// 整体 client 超时兜底（最长路径 = aliyun + fallback）
+			Timeout: time.Duration(c.AliyunTimeoutMs+c.FallbackTimeoutMs+500) * time.Millisecond,
 		},
+		aliyunTimeout:   time.Duration(c.AliyunTimeoutMs) * time.Millisecond,
+		fallbackTimeout: time.Duration(c.FallbackTimeoutMs) * time.Millisecond,
+		providerTimeout: time.Duration(c.SingleProviderTimeout) * time.Millisecond,
+		cacheTTL:        time.Duration(c.CacheTTL) * time.Second,
 	}
 }
 
 // DetectLocale 根据 IP 地址检测推荐语言
-// 处理流程: Redis 缓存 → ip-api.com → ipinfo.io → ip.sb → 默认 "en"
-// 参数:
-//   - ctx: 上下文
-//   - ip: 客户端 IP 地址
-//
-// 返回:
-//   - *GeoResult: 检测结果（语言代码、国家代码、数据来源）
+// 处理流程: private-IP 短路 → Redis 缓存 → 阿里云 L0 → 免费源并发竞速 → 默认 "en"
 func (s *GeoService) DetectLocale(ctx context.Context, ip string) *GeoResult {
-	// 私有/本地 IP 直接返回默认语言
 	if isPrivateIP(ip) {
 		return &GeoResult{Locale: "en", CountryCode: "", Source: "default"}
 	}
 
-	// 尝试从 Redis 缓存读取
+	// L0-: Redis 缓存
 	if s.redisClient != nil {
 		if cached := s.getFromCache(ctx, ip); cached != nil {
 			return cached
 		}
 	}
 
-	// 依次尝试三个外部 API 数据源
+	// L0: 阿里云市场主源（独立超时，不走竞速）
+	aliyunCtx, cancelAliyun := context.WithTimeout(ctx, s.aliyunTimeout)
+	country, err := s.queryAliyun(aliyunCtx, ip)
+	cancelAliyun()
+	if err == nil && country != "" {
+		result := &GeoResult{
+			Locale:      CountryToLocale(country),
+			CountryCode: country,
+			Source:      "aliyun",
+		}
+		if s.redisClient != nil {
+			go s.setCache(context.Background(), ip, result)
+		}
+		return result
+	}
+
+	// L1+: 6 个免费源并发竞速
 	providers := []struct {
 		name string
-		fn   func(ctx context.Context, ip string) (string, error)
+		fn   func(context.Context, string) (string, error)
 	}{
 		{"ip-api", s.queryIPAPI},
 		{"ipinfo", s.queryIPInfo},
 		{"ip.sb", s.queryIPSB},
+		{"ipwho", s.queryIPWho},
+		{"country.is", s.queryCountryIs},
+		{"geojs", s.queryGeoJS},
+	}
+	if name, cc, ok := s.raceProviders(ctx, ip, providers); ok {
+		result := &GeoResult{
+			Locale:      CountryToLocale(cc),
+			CountryCode: cc,
+			Source:      name,
+		}
+		if s.redisClient != nil {
+			go s.setCache(context.Background(), ip, result)
+		}
+		return result
 	}
 
+	// 全部失败 → 默认 "en"
+	return &GeoResult{Locale: "en", CountryCode: "", Source: "default"}
+}
+
+// raceProviders 并发请求多个免费数据源，返回第一个成功结果
+// 未被选中的 goroutine 由 context.Cancel 统一终止，不会泄漏
+func (s *GeoService) raceProviders(
+	parent context.Context,
+	ip string,
+	providers []struct {
+		name string
+		fn   func(context.Context, string) (string, error)
+	},
+) (string, string, bool) {
+	ctx, cancel := context.WithTimeout(parent, s.fallbackTimeout)
+	defer cancel()
+
+	type result struct {
+		name    string
+		country string
+	}
+	ch := make(chan result, len(providers))
 	for _, p := range providers {
-		countryCode, err := p.fn(ctx, ip)
-		if err == nil && countryCode != "" {
-			locale := CountryToLocale(countryCode)
-			result := &GeoResult{
-				Locale:      locale,
-				CountryCode: countryCode,
-				Source:      p.name,
+		p := p
+		go func() {
+			cc, err := p.fn(ctx, ip)
+			if err == nil && cc != "" {
+				select {
+				case ch <- result{name: p.name, country: strings.ToUpper(cc)}:
+				case <-ctx.Done():
+				}
+			} else {
+				// 非成功结果也投递（name="" 标识失败），保证主循环不会全等直到超时
+				select {
+				case ch <- result{name: "", country: ""}:
+				case <-ctx.Done():
+				}
 			}
-			// 异步写入 Redis 缓存
-			if s.redisClient != nil {
-				go s.setCache(context.Background(), ip, result)
+		}()
+	}
+
+	failed := 0
+	for {
+		select {
+		case r := <-ch:
+			if r.name != "" && r.country != "" {
+				return r.name, r.country, true
 			}
-			return result
+			failed++
+			if failed >= len(providers) {
+				return "", "", false
+			}
+		case <-ctx.Done():
+			return "", "", false
 		}
 	}
-
-	// 所有数据源均失败，返回默认语言
-	return &GeoResult{Locale: "en", CountryCode: "", Source: "default"}
 }
 
 // ========================================================================
 // Redis 缓存操作
 // ========================================================================
 
-// getFromCache 从 Redis 缓存中读取 IP 对应的地理位置结果
 func (s *GeoService) getFromCache(ctx context.Context, ip string) *GeoResult {
 	key := redisKeyPrefix + ip
 	val, err := s.redisClient.Get(ctx, key).Result()
@@ -125,50 +217,93 @@ func (s *GeoService) getFromCache(ctx context.Context, ip string) *GeoResult {
 	return &result
 }
 
-// setCache 将地理位置结果写入 Redis 缓存
 func (s *GeoService) setCache(ctx context.Context, ip string, result *GeoResult) {
 	key := redisKeyPrefix + ip
 	data, err := json.Marshal(result)
 	if err != nil {
 		return
 	}
-	_ = s.redisClient.Set(ctx, key, string(data), redisTTL).Err()
+	_ = s.redisClient.Set(ctx, key, string(data), s.cacheTTL).Err()
 }
 
 // ========================================================================
-// 外部 API 数据源 (三级 fallback)
+// 外部 API 数据源实现
 // ========================================================================
+
+// aliyunResponse 阿里云市场 cmapi021970 返回结构
+// 实测响应：{"ret":200,"msg":"success","data":{"country_id":"CN","country":"中国","region":"广东",...}}
+type aliyunResponse struct {
+	Ret  int    `json:"ret"`
+	Msg  string `json:"msg"`
+	Data struct {
+		IP        string `json:"ip"`
+		CountryID string `json:"country_id"` // ISO 两位码，如 "CN"、"US"
+		Country   string `json:"country"`    // 中文名
+		Region    string `json:"region"`     // 省份中文名，对台港澳特殊处理依据
+	} `json:"data"`
+}
+
+// queryAliyun 通过阿里云市场 cmapi021970 查询国家代码
+// 注意：阿里云对台港澳返回 country_id="CN" + region="台湾/香港/澳门"，需按 region 覆盖
+func (s *GeoService) queryAliyun(ctx context.Context, ip string) (string, error) {
+	url := fmt.Sprintf("%s?ip=%s", s.cfg.AliyunURL, ip)
+	body, err := s.doGetWithHeaders(ctx, url, map[string]string{
+		"Authorization": "APPCODE " + s.cfg.AppCode,
+	})
+	if err != nil {
+		return "", err
+	}
+	var resp aliyunResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("aliyun 解析失败: %w", err)
+	}
+	if resp.Ret != 200 {
+		return "", fmt.Errorf("aliyun 返回失败状态 ret=%d msg=%s", resp.Ret, resp.Msg)
+	}
+	cc := strings.ToUpper(strings.TrimSpace(resp.Data.CountryID))
+	if cc == "" {
+		return "", fmt.Errorf("aliyun 未返回 country_id")
+	}
+	// 台港澳特殊处理：country_id=CN 但 region 为台湾/香港/澳门时覆盖为对应 ISO
+	if cc == "CN" {
+		switch strings.TrimSpace(resp.Data.Region) {
+		case "台湾", "臺灣":
+			return "TW", nil
+		case "香港":
+			return "HK", nil
+		case "澳门", "澳門":
+			return "MO", nil
+		}
+	}
+	return cc, nil
+}
 
 // ipAPIResponse ip-api.com 返回结构
 type ipAPIResponse struct {
 	CountryCode string `json:"countryCode"`
-	Country     string `json:"country"`
 	Status      string `json:"status"`
 }
 
-// queryIPAPI 通过 ip-api.com 查询国家代码（免费，45 req/min 限制）
 func (s *GeoService) queryIPAPI(ctx context.Context, ip string) (string, error) {
-	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=countryCode,country,status", ip)
+	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=countryCode,status", ip)
 	body, err := s.doGet(ctx, url)
 	if err != nil {
 		return "", err
 	}
 	var resp ipAPIResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return "", fmt.Errorf("ip-api 解析失败: %w", err)
+		return "", err
 	}
 	if resp.Status != "success" {
-		return "", fmt.Errorf("ip-api 返回失败状态: %s", resp.Status)
+		return "", fmt.Errorf("ip-api status=%s", resp.Status)
 	}
 	return strings.ToUpper(resp.CountryCode), nil
 }
 
-// ipInfoResponse ipinfo.io 返回结构
 type ipInfoResponse struct {
 	Country string `json:"country"`
 }
 
-// queryIPInfo 通过 ipinfo.io 查询国家代码（免费额度 50K/月）
 func (s *GeoService) queryIPInfo(ctx context.Context, ip string) (string, error) {
 	url := fmt.Sprintf("https://ipinfo.io/%s/json", ip)
 	body, err := s.doGet(ctx, url)
@@ -177,20 +312,18 @@ func (s *GeoService) queryIPInfo(ctx context.Context, ip string) (string, error)
 	}
 	var resp ipInfoResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return "", fmt.Errorf("ipinfo 解析失败: %w", err)
+		return "", err
 	}
 	if resp.Country == "" {
-		return "", fmt.Errorf("ipinfo 未返回国家代码")
+		return "", fmt.Errorf("ipinfo empty country")
 	}
 	return strings.ToUpper(resp.Country), nil
 }
 
-// ipSBResponse ip.sb 返回结构
 type ipSBResponse struct {
 	CountryCode string `json:"country_code"`
 }
 
-// queryIPSB 通过 ip.sb 查询国家代码（免费）
 func (s *GeoService) queryIPSB(ctx context.Context, ip string) (string, error) {
 	url := fmt.Sprintf("https://api.ip.sb/geoip/%s", ip)
 	body, err := s.doGet(ctx, url)
@@ -199,23 +332,98 @@ func (s *GeoService) queryIPSB(ctx context.Context, ip string) (string, error) {
 	}
 	var resp ipSBResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return "", fmt.Errorf("ip.sb 解析失败: %w", err)
+		return "", err
 	}
 	if resp.CountryCode == "" {
-		return "", fmt.Errorf("ip.sb 未返回国家代码")
+		return "", fmt.Errorf("ip.sb empty country_code")
 	}
 	return strings.ToUpper(resp.CountryCode), nil
 }
 
-// doGet 执行 HTTP GET 请求，返回响应体
+// ipWhoResponse ipwho.is 返回结构
+type ipWhoResponse struct {
+	Success     bool   `json:"success"`
+	CountryCode string `json:"country_code"`
+}
+
+func (s *GeoService) queryIPWho(ctx context.Context, ip string) (string, error) {
+	url := fmt.Sprintf("https://ipwho.is/%s", ip)
+	body, err := s.doGet(ctx, url)
+	if err != nil {
+		return "", err
+	}
+	var resp ipWhoResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", err
+	}
+	if !resp.Success || resp.CountryCode == "" {
+		return "", fmt.Errorf("ipwho unsuccessful")
+	}
+	return strings.ToUpper(resp.CountryCode), nil
+}
+
+// countryIsResponse country.is 返回结构：{"ip":"x","country":"CN"}
+type countryIsResponse struct {
+	Country string `json:"country"`
+}
+
+func (s *GeoService) queryCountryIs(ctx context.Context, ip string) (string, error) {
+	url := fmt.Sprintf("https://api.country.is/%s", ip)
+	body, err := s.doGet(ctx, url)
+	if err != nil {
+		return "", err
+	}
+	var resp countryIsResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", err
+	}
+	if resp.Country == "" {
+		return "", fmt.Errorf("country.is empty country")
+	}
+	return strings.ToUpper(resp.Country), nil
+}
+
+// geoJSResponse geojs.io 返回结构：{"country":"CN","ip":"x","name":"China"}
+type geoJSResponse struct {
+	Country string `json:"country"`
+}
+
+func (s *GeoService) queryGeoJS(ctx context.Context, ip string) (string, error) {
+	url := fmt.Sprintf("https://get.geojs.io/v1/ip/country/%s.json", ip)
+	body, err := s.doGet(ctx, url)
+	if err != nil {
+		return "", err
+	}
+	var resp geoJSResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", err
+	}
+	if resp.Country == "" {
+		return "", fmt.Errorf("geojs empty country")
+	}
+	return strings.ToUpper(resp.Country), nil
+}
+
+// doGet 执行 HTTP GET 请求（免费源使用单次 providerTimeout）
 func (s *GeoService) doGet(ctx context.Context, url string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	return s.doGetWithHeaders(ctx, url, nil)
+}
+
+// doGetWithHeaders 通用 HTTP GET，可自定义请求头
+func (s *GeoService) doGetWithHeaders(ctx context.Context, url string, headers map[string]string) ([]byte, error) {
+	// 为每个请求派生短超时（在父 ctx 之下），避免慢源拖累竞速
+	perReqCtx, cancel := context.WithTimeout(ctx, s.providerTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(perReqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "TokenHub-GeoService/1.0")
 	req.Header.Set("Accept", "application/json")
-
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -225,12 +433,7 @@ func (s *GeoService) doGet(ctx context.Context, url string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10240)) // 限制读取 10KB
-	if err != nil {
-		return nil, err
-	}
-	return body, nil
+	return io.ReadAll(io.LimitReader(resp.Body, 10240))
 }
 
 // ========================================================================
@@ -238,16 +441,14 @@ func (s *GeoService) doGet(ctx context.Context, url string) ([]byte, error) {
 // ========================================================================
 
 // isPrivateIP 判断 IP 是否为私有/本地地址
-// 包括: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, ::1, fc00::/7
 func isPrivateIP(ipStr string) bool {
 	if ipStr == "" || ipStr == "::1" || ipStr == "localhost" {
 		return true
 	}
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
-		return true // 无法解析的 IP 视为私有
+		return true
 	}
-	// 常见私有网段
 	privateRanges := []string{
 		"127.0.0.0/8",
 		"10.0.0.0/8",
@@ -329,11 +530,6 @@ var countryToLocaleMap = map[string]string{
 }
 
 // CountryToLocale 将 ISO 3166-1 国家代码转换为平台支持的语言代码
-// 参数:
-//   - countryCode: 两位大写国家代码 (如 "CN", "US")
-//
-// 返回:
-//   - 对应的语言代码，未匹配时返回 "en"
 func CountryToLocale(countryCode string) string {
 	code := strings.ToUpper(strings.TrimSpace(countryCode))
 	if locale, ok := countryToLocaleMap[code]; ok {
@@ -343,9 +539,7 @@ func CountryToLocale(countryCode string) string {
 }
 
 // GetClientIP 从 HTTP 请求中提取客户端真实 IP
-// 优先级: X-Forwarded-For → X-Real-IP → RemoteAddr
 func GetClientIP(r *http.Request) string {
-	// X-Forwarded-For 可能包含多个 IP（经过多层代理），取第一个
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
 		ip := strings.TrimSpace(parts[0])
@@ -353,11 +547,9 @@ func GetClientIP(r *http.Request) string {
 			return ip
 		}
 	}
-	// X-Real-IP 通常由 Nginx 设置
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
 		return strings.TrimSpace(xri)
 	}
-	// 降级使用 RemoteAddr（可能包含端口号）
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

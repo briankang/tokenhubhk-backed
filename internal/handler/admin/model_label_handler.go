@@ -113,7 +113,9 @@ func (h *ModelLabelHandler) Remove(c *gin.Context) {
 		return
 	}
 
-	if err := h.db.Where("model_id = ? AND label_key = ? AND label_value = ?",
+	// 使用 Unscoped 硬删除，避免软删除残留行占用 uidx_model_label 唯一索引，
+	// 导致用户删除后无法重新添加同一标签
+	if err := h.db.Unscoped().Where("model_id = ? AND label_key = ? AND label_value = ?",
 		uint(id), req.LabelKey, req.LabelValue).
 		Delete(&model.ModelLabel{}).Error; err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
@@ -173,7 +175,8 @@ func (h *ModelLabelHandler) BatchRemove(c *gin.Context) {
 		return
 	}
 
-	result := h.db.Where("model_id IN ? AND label_key = ?", req.ModelIDs, req.LabelKey).
+	// 硬删除：避免软删除残留占用唯一索引，导致后续重新打标冲突
+	result := h.db.Unscoped().Where("model_id IN ? AND label_key = ?", req.ModelIDs, req.LabelKey).
 		Delete(&model.ModelLabel{})
 	if result.Error != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, result.Error.Error())
@@ -196,8 +199,8 @@ func (h *ModelLabelHandler) ListKeys(c *gin.Context) {
 		return
 	}
 
-	// 确保系统预置的常用键总是出现在列表头部
-	systemKeys := []string{"tag", "license"}
+	// value-only 简化版：所有标签统一使用 "tag" 作为 key
+	systemKeys := []string{"tag"}
 	seen := make(map[string]bool)
 	for _, k := range keys {
 		seen[k] = true

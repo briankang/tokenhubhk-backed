@@ -256,6 +256,10 @@ func autoMigrate() error {
 		&model.PriceSyncLog{},        // 价格同步历史日志
 		&model.ModelCheckLog{},       // 模型可用性检测记录
 		&model.ModelCheckTask{},      // 模型检测后台任务
+		&model.CapabilityTestCase{},    // 能力测试用例模板（可复用）
+		&model.CapabilityTestTask{},    // 能力测试批量运行任务
+		&model.CapabilityTestResult{},  // 能力测试单条结果（model×case）
+		&model.CapabilityTestBaseline{}, // 能力测试回归基线
 		&model.BackgroundTask{},     // 后台异步任务
 		&model.ApiCallLog{},         // API 调用全链路日志
 		&model.PlatformParam{},      // 平台标准参数定义
@@ -277,7 +281,37 @@ func autoMigrate() error {
 		&model.UserAnnouncementRead{}, // 用户公告已读记录
 
 		// --- 模型 k:v 标签系统 ---
-		&model.ModelLabel{}, // 模型标签（热卖/开源/优惠等，支持自定义 k:v）
+		&model.ModelLabel{},       // 模型标签（热卖/开源/优惠等，支持自定义 k:v）
+		&model.LabelDictionary{},  // v3.5 标签字典（多语言 + 颜色 + 图标 + 排序权重）
+
+		// --- v3.2 支付/订单/财务系统重构 ---
+		&model.ExchangeRateHistory{},    // 汇率历史快照（审计 + 降级 fallback）
+		&model.PaymentProviderAccount{}, // 多账号支付配置（Stripe/PayPal 权重路由）
+		&model.PaymentRefundRequest{},   // 用户退款申请
+		&model.PaymentEventLog{},        // 支付/退款/提现/汇率全链路事件日志
+
+		&model.TrendingModel{}, // 全球热门模型参考库
+
+		// --- 用户调用日表聚合（性能优化：api_call_logs 7天清理前持久化用户维度数据）---
+		&model.UserDailyStat{}, // 按用户×模型×日期聚合的调用统计
+
+		// --- AI 客服 + 工单系统（9 张表）---
+		&model.SupportSession{},       // AI 客服会话
+		&model.SupportMessage{},       // 会话消息
+		&model.KnowledgeChunk{},       // RAG 知识切片（统一表，source_type 区分）
+		&model.ProviderDocReference{}, // 供应商官方文档 URL 引用
+		&model.AcceptedAnswer{},       // 用户采纳的答案（管理员审核后入知识库）
+		&model.HotQuestion{},          // 管理员编辑的热门问题（带标准答案）
+		&model.UserSupportMemory{},    // 用户个人长期记忆
+		&model.SupportModelProfile{},  // 客服模型候选配置（多模型 Fallback）
+		&model.SupportTicket{},        // 用户工单
+		&model.SupportTicketReply{},   // 工单回复
+
+		// --- RBAC 权限系统（v4.0）---
+		&model.Permission{},     // 权限目录（从 audit.routeMap 种子化）
+		&model.Role{},           // 角色定义（内置 + 自定义）
+		&model.RolePermission{}, // 角色-权限关联
+		&model.UserRole{},       // 用户-角色关联
 	)
 }
 
@@ -369,21 +403,73 @@ func Close() error {
 	return nil
 }
 
-// seedModelLabels 幂等写入模型标签种子数据
-// 根据模型名称模糊匹配预置热卖/开源/优惠标签，每次启动安全重复执行
+// seedModelLabels 幂等写入模型标签种子数据（value-only 简化版）
+// 所有标签统一使用 label_key="tag"，前端只展示 value
+// Phase 0 迁移所有历史变体（英文 k:v、中文 k:v）→ 统一 tag:热卖/tag:优惠/tag:开源
+// 每次启动安全重复执行（FirstOrCreate）
 func seedModelLabels() error {
+	// ── Phase 0：迁移历史变体 ────────────────────────────────────────────────
+	// 映射：(old_key, old_value) → new_value（统一 key="tag"）
+	type migrateRule struct {
+		oldKey   string
+		oldValue string
+		newValue string
+	}
+	migrations := []migrateRule{
+		// 英文 k:v（最早版本）
+		{"tag", "hot", "热卖"},
+		{"tag", "discount", "优惠"},
+		{"license", "open-source", "开源"},
+		// 中文 k:v（中间版本）
+		{"受欢迎程度", "热卖", "热卖"},
+		{"价格", "优惠", "优惠"},
+		{"是否开源", "开源", "开源"},
+	}
+
+	for _, m := range migrations {
+		// 先找出所有匹配旧 key/value 的 model_id 列表
+		var modelIDs []uint
+		DB.Model(&model.ModelLabel{}).Unscoped().
+			Where("label_key = ? AND label_value = ?", m.oldKey, m.oldValue).
+			Distinct("model_id").
+			Pluck("model_id", &modelIDs)
+
+		if len(modelIDs) == 0 {
+			continue
+		}
+
+		// 硬删除旧记录（含软删除），避免唯一索引冲突
+		DB.Unscoped().
+			Where("label_key = ? AND label_value = ?", m.oldKey, m.oldValue).
+			Delete(&model.ModelLabel{})
+
+		// 写入新的统一格式 tag:<value>
+		for _, mid := range modelIDs {
+			label := model.ModelLabel{
+				ModelID:    mid,
+				LabelKey:   "tag",
+				LabelValue: m.newValue,
+			}
+			DB.FirstOrCreate(&label, model.ModelLabel{
+				ModelID:    mid,
+				LabelKey:   "tag",
+				LabelValue: m.newValue,
+			})
+		}
+	}
+
+	// ── Phase 1：种子规则（统一 key="tag"） ────────────────────────────────
 	type rule struct {
 		patterns []string
-		key      string
 		value    string
 	}
 	rules := []rule{
-		// 热卖模型：DeepSeek V3/R1、Qwen 3系列、Moonshot/Kimi、MiniMax
-		{[]string{"deepseek-v3", "deepseek-r1", "qwen3", "moonshot", "kimi", "minimax"}, "tag", "hot"},
-		// 开源模型：DeepSeek 全系、Qwen 全系、Yi、Baichuan、GLM
-		{[]string{"deepseek-", "qwen", "yi-", "baichuan", "glm-"}, "license", "open-source"},
-		// 优惠模型：DeepSeek V3/R1-Distill、Qwen Turbo/Plus
-		{[]string{"deepseek-v3", "deepseek-r1-distill", "qwen-turbo", "qwen-plus"}, "tag", "discount"},
+		// 热卖 — DeepSeek V3/R1、Qwen3系列、Moonshot/Kimi、MiniMax
+		{[]string{"deepseek-v3", "deepseek-r1", "qwen3", "moonshot", "kimi", "minimax"}, "热卖"},
+		// 开源 — DeepSeek 全系、Qwen 全系、Yi、Baichuan、GLM
+		{[]string{"deepseek-", "qwen", "yi-", "baichuan", "glm-"}, "开源"},
+		// 优惠 — DeepSeek V3/R1-Distill、Qwen Turbo/Plus
+		{[]string{"deepseek-v3", "deepseek-r1-distill", "qwen-turbo", "qwen-plus"}, "优惠"},
 	}
 
 	var models []model.AIModel
@@ -398,16 +484,16 @@ func seedModelLabels() error {
 				if strings.Contains(name, strings.ToLower(p)) {
 					label := model.ModelLabel{
 						ModelID:    m.ID,
-						LabelKey:   r.key,
+						LabelKey:   "tag",
 						LabelValue: r.value,
 					}
 					// FirstOrCreate 保证幂等：已存在则跳过
 					DB.FirstOrCreate(&label, model.ModelLabel{
 						ModelID:    m.ID,
-						LabelKey:   r.key,
+						LabelKey:   "tag",
 						LabelValue: r.value,
 					})
-					break // 同一规则只写一次
+					break // 同一规则每个模型只写一次
 				}
 			}
 		}

@@ -6,7 +6,7 @@ type BalanceRecord struct {
 	BaseModel
 	UserID         uint    `gorm:"index;not null" json:"userId"`
 	TenantID       uint    `gorm:"index;not null" json:"tenantId"`
-	Type           string  `gorm:"size:20;not null" json:"type"`                  // RECHARGE/CONSUME/GIFT/REFUND/ADMIN_ADJUST
+	Type           string  `gorm:"size:20;not null;index:idx_type" json:"type"` // RECHARGE/CONSUME/GIFT/INVITEE_BONUS/INVITER_BONUS/REFUND/ADMIN_ADJUST
 	Amount         int64   `gorm:"type:bigint;not null" json:"amount"`            // 变动积分（正数增加,负数减少）
 	AmountRMB      float64 `gorm:"type:decimal(16,4);default:0" json:"amountRmb"` // 变动等值人民币
 	BeforeBalance  int64   `gorm:"type:bigint" json:"beforeBalance"`              // 变动前余额（积分）

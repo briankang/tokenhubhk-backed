@@ -373,13 +373,22 @@ func (s *MemberLevelService) GetUserRateLimits(ctx context.Context, userID uint)
 	}
 
 	// 查询用户会员等级
+	// 未找到档案时仍写入缓存默认值，避免每次请求都打 DB
+	defaultLimits := &UserRateLimits{RPM: 60, TPM: 100000}
 	var profile model.UserMemberProfile
 	if err := s.db.WithContext(ctx).
 		Preload("MemberLevel").
 		Where("user_id = ?", userID).
 		First(&profile).Error; err != nil {
-		// 无档案，返回默认值
-		return &UserRateLimits{RPM: 60, TPM: 100000}, nil
+		// 无会员档案：缓存默认值后返回，避免后续请求重复查 DB
+		// 使用 context.Background() 而非请求 ctx，防止请求取消后缓存写入失败导致每次都打 DB
+		if s.redis != nil {
+			cacheKey := fmt.Sprintf("%s%d", memberRateLimitsCachePrefix, userID)
+			if data, jerr := json.Marshal(defaultLimits); jerr == nil {
+				_ = s.redis.Set(context.Background(), cacheKey, data, memberRateLimitsCacheTTL).Err()
+			}
+		}
+		return defaultLimits, nil
 	}
 
 	limits := &UserRateLimits{

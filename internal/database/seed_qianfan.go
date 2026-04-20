@@ -8,7 +8,6 @@ import (
 	"gorm.io/gorm"
 
 	"tokenhub-server/internal/model"
-	"tokenhub-server/internal/pkg/credits"
 	"tokenhub-server/internal/pkg/logger"
 )
 
@@ -126,117 +125,13 @@ func RunSeedQianfan(db *gorm.DB) {
 		{"qianfan_embedding", "tao-8k", "Tao 8K Embedding", 0.2, 0, 0, 8192},
 	}
 
-	createdModels := 0
-	for _, md := range modelDefs {
-		catID, ok := catIDMap[md.CategoryCode]
-		if !ok {
-			// 分类创建失败时降级使用供应商下第一个分类
-			var cat model.ModelCategory
-			if findErr := db.Where("code = ?", md.CategoryCode).First(&cat).Error; findErr != nil {
-				log.Warn("seed_qianfan: 分类未找到，跳过模型",
-					zap.String("category", md.CategoryCode),
-					zap.String("model", md.ModelName))
-				continue
-			}
-			catID = cat.ID
-		}
+	// 模型创建已禁用：交由 auto-discovery（DiscoveryService.SyncFromChannel）从千帆 API 拉取
+	// 避免硬编码模型与官方实际模型列表/价格漂移
+	_ = modelDefs
+	_ = catIDMap
+	log.Info("seed_qianfan: 模型创建已禁用，等待 auto-discovery 同步")
 
-		var existing model.AIModel
-		if findErr := db.Where("supplier_id = ? AND model_name = ?",
-			qianfanSup.ID, md.ModelName).First(&existing).Error; findErr == nil {
-			// 已存在：更新价格 + 上线
-			// input_cost_rmb 存 ¥/百万tokens（与 pricescraper ApplyPrices 写入规范一致）
-			db.Model(&model.AIModel{}).Where("id = ?", existing.ID).Updates(map[string]interface{}{
-				"input_cost_rmb":         md.InputPriceM,
-				"output_cost_rmb":        md.OutputPriceM,
-				"input_price_per_token":  credits.RMBToCredits(md.InputPriceM / 1e6),
-				"output_price_per_token": credits.RMBToCredits(md.OutputPriceM / 1e6),
-				"context_window":         md.ContextWin,
-				"max_tokens":             md.MaxTokens,
-				"status":                 "online",
-				"is_active":              true,
-			})
-			continue
-		}
-
-		// 根据分类推断模型类型
-		modelType := "LLM"
-		tags := "Baidu"
-		if md.CategoryCode == "qianfan_embedding" {
-			modelType = "Embedding"
-			tags = "Baidu,Embedding"
-		} else if md.CategoryCode == "qianfan_reasoning" {
-			tags = "Baidu,Reasoning"
-		}
-
-		aim := model.AIModel{
-			CategoryID:  catID,
-			SupplierID:  qianfanSup.ID,
-			ModelName:   md.ModelName,
-			DisplayName: md.DisplayName,
-			IsActive:    true,
-			Status:      "online", // 直接上线
-			MaxTokens:   md.MaxTokens,
-			ContextWindow: md.ContextWin,
-			// InputPricePerToken 是 credits/token
-			InputPricePerToken:  credits.RMBToCredits(md.InputPriceM / 1e6),
-			OutputPricePerToken: credits.RMBToCredits(md.OutputPriceM / 1e6),
-			// InputCostRMB 存 ¥/百万tokens（供前台定价展示，pricescraper 也按此规范写入）
-			InputCostRMB:  md.InputPriceM,
-			OutputCostRMB: md.OutputPriceM,
-			Currency:      "CREDIT",
-			ModelType:     modelType,
-			PricingUnit:   "per_million_tokens",
-			Source:        "seed",
-			Tags:          tags,
-		}
-		if createErr := db.Create(&aim).Error; createErr != nil {
-			log.Error("seed_qianfan: 创建模型失败",
-				zap.String("model", md.ModelName), zap.Error(createErr))
-			continue
-		}
-
-		// 创建对应的 ModelPricing 记录（加价 30%，单位同 InputCostRMB: ¥/百万tokens）
-		inputPriceMRmb := md.InputPriceM * 1.3
-		outputPriceMRmb := md.OutputPriceM * 1.3
-		mp := model.ModelPricing{
-			ModelID:             aim.ID,
-			InputPricePerToken:  credits.RMBToCredits(inputPriceMRmb / 1e6),
-			InputPriceRMB:       inputPriceMRmb,
-			OutputPricePerToken: credits.RMBToCredits(outputPriceMRmb / 1e6),
-			OutputPriceRMB:      outputPriceMRmb,
-			Currency:            "CREDIT",
-		}
-		db.Create(&mp)
-
-		createdModels++
-	}
-	log.Info("seed_qianfan: 模型种子完成", zap.Int("created", createdModels))
-
-	// ---- 4. 模板渠道（未激活）----
-	var templateCh model.Channel
-	if db.Where("name = ?", "百度千帆 模板渠道").First(&templateCh).Error != nil {
-		templateCh = model.Channel{
-			Name:           "百度千帆 模板渠道",
-			SupplierID:     qianfanSup.ID,
-			Type:           "openai",
-			Endpoint:       "https://qianfan.baidubce.com/v2",
-			APIKey:         "",
-			Models:         mustJSONArr([]string{}),
-			Weight:         1,
-			Priority:       0,
-			Status:         "inactive",
-			MaxConcurrency: 100,
-			QPM:            60,
-		}
-		if createErr := db.Create(&templateCh).Error; createErr != nil {
-			log.Error("seed_qianfan: 创建模板渠道失败", zap.Error(createErr))
-		} else {
-			log.Info("seed_qianfan: 创建模板渠道成功")
-		}
-	}
-
-	// ---- 5. 真实渠道（未激活，APIKey 需在管理后台配置）----
+	// ---- 4. 真实渠道（未激活，APIKey 需在管理后台配置）----
 	// 注意：APIKey 不在代码中存储，请通过管理后台「渠道管理」填入
 	var realCh model.Channel
 	if db.Where("name = ?", "百度千帆-真实渠道").First(&realCh).Error != nil {

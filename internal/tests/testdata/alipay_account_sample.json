@@ -1,0 +1,15 @@
+{
+  "_description": "支付宝账号配置样本（config_json 解密后结构，用于测试数据种子）",
+  "provider_type": "ALIPAY",
+  "account_name": "支付宝主账号",
+  "is_active": true,
+  "is_sandbox": true,
+  "config": {
+    "app_id": "2021000000000000",
+    "private_key": "-----BEGIN RSA PRIVATE KEY-----\nMOCK_MERCHANT_RSA_PRIVATE_KEY_PLACEHOLDER\n-----END RSA PRIVATE KEY-----",
+    "alipay_public_key": "-----BEGIN PUBLIC KEY-----\nMOCK_ALIPAY_PUBLIC_KEY_PLACEHOLDER\n-----END PUBLIC KEY-----",
+    "sign_type": "RSA2",
+    "notify_url": "https://api.tokenhubhk.com/api/v1/callback/alipay",
+    "return_url": "https://tokenhubhk.com/balance?status=success"
+  }
+}

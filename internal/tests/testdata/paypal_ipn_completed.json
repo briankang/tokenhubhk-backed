@@ -1,0 +1,22 @@
+{
+  "_description": "PayPal IPN PAYMENT.SALE.COMPLETED 事件（沙箱）",
+  "id": "WH-COMPLETED-2X571456732412345",
+  "event_version": "1.0",
+  "create_time": "2026-04-17T03:17:00.000Z",
+  "resource_type": "sale",
+  "event_type": "PAYMENT.SALE.COMPLETED",
+  "summary": "Payment completed for $100.00 USD",
+  "resource": {
+    "id": "3X574896CY5604625",
+    "state": "completed",
+    "amount": {
+      "total": "100.00",
+      "currency": "USD"
+    },
+    "parent_payment": "PAY-1B56960729604235SKQQSC5A",
+    "invoice_number": "ORD-2026041703170005",
+    "create_time": "2026-04-17T03:16:00Z",
+    "update_time": "2026-04-17T03:17:00Z"
+  },
+  "links": []
+}

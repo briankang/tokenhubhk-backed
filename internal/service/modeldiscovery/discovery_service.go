@@ -11,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"tokenhub-server/internal/model"
+	"tokenhub-server/internal/service/pricescraper"
 )
 
 // DiscoveryService 模型自动发现服务
@@ -254,6 +255,9 @@ func (s *DiscoveryService) SyncAllActive() (*SyncAllResult, error) {
 		allResult.Results = append(allResult.Results, *syncResult)
 	}
 
+	// 同步完成后，停用所有未配置售价的在线模型
+	s.disableModelsWithoutSellPrice()
+
 	return allResult, nil
 }
 
@@ -432,6 +436,18 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 			if isOldDatedModel(modelName) {
 				isActive = false
 			}
+
+			// 定价策略：模型发现阶段价格字段均为 0
+			//  - 命中免费白名单 → 打 "Free/免费" 标签，保持启用
+			//  - 其他 Token 计费模型 → 打 "NeedsPricing/待定价" 标签；对无价格 API 的供应商
+			//    （如腾讯混元）额外强制 IsActive=false，等待价格手动录入
+			isFree := pricescraper.IsFreeModel(modelName, 0, 0)
+			priceMissing := !isFree && pricescraper.IsPriceMissing(modelName, pricingUnit, modelType, 0, 0)
+			if priceMissing && isSupplierWithoutPriceAPI(channel.Supplier.Code) {
+				isActive = false
+			}
+			tags := pricescraper.AugmentTagsForPricing(InferModelTags(modelName, channel.Supplier.Code), isFree, priceMissing)
+
 			aiModel := model.AIModel{
 				ModelName:      modelName,
 				DisplayName:    modelName,
@@ -444,7 +460,14 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 				ModelType:      modelType,
 				PricingUnit:    pricingUnit,
 				ApiCreatedAt:   m.Created,
-				Tags:           InferModelTags(modelName, channel.Supplier.Code),
+				Tags:           tags,
+			}
+			// 强制流式的模型（如阿里云 qwq/qvq 系列）在创建时即标记 features.requires_stream=true
+			// handler 会自动将非流式请求升级为流式，避免上游 400 "only support stream mode"
+			if MatchStreamOnly(modelName) {
+				if featsJSON, err := json.Marshal(map[string]interface{}{"requires_stream": true}); err == nil {
+					aiModel.Features = featsJSON
+				}
 			}
 			if err := s.db.Create(&aiModel).Error; err != nil {
 				if strings.Contains(err.Error(), "Duplicate") || strings.Contains(err.Error(), "UNIQUE") {
@@ -904,6 +927,18 @@ func (s *DiscoveryService) autoCreateRouteForDefault(channelID uint, standardMod
 		FirstOrCreate(&route)
 }
 
+// isSupplierWithoutPriceAPI 判断供应商是否没有公开的价格 API
+// 这类供应商的价格完全依赖人工维护的硬编码表，
+// 新模型在未录入前应默认停用，避免按 0 元进入计费链路
+func isSupplierWithoutPriceAPI(supplierCode string) bool {
+	switch strings.ToLower(strings.TrimSpace(supplierCode)) {
+	case "tencent_hunyuan", "hunyuan":
+		return true
+	default:
+		return false
+	}
+}
+
 // isOldDatedModel 检测模型名称是否带日期后缀，表示老旧版本
 // 例如 qwen-max-1201, qwen-max-0428, qwen-plus-0806 等
 func isOldDatedModel(modelName string) bool {
@@ -1130,4 +1165,59 @@ func (s *DiscoveryService) FetchProviderModelNamesWithStatus(supplierID uint) ([
 		}
 	}
 	return result, nil
+}
+
+// disableModelsWithoutSellPrice 停用所有未配置售价（model_pricings）的启用模型。
+// 被停用的模型追加 "NeedsSellPrice" 标签，管理员配置售价后自动恢复。
+// 免费模型（含 "Free" 标签）豁免检查。
+func (s *DiscoveryService) disableModelsWithoutSellPrice() {
+	var rows []model.AIModel
+	// 查找 is_active=true 且在 model_pricings 中没有记录的模型（排除免费模型）
+	s.db.Select("id, tags").
+		Where("is_active = true").
+		Where("tags NOT LIKE '%Free%'").
+		Where("id NOT IN (SELECT model_id FROM model_pricings)").
+		Find(&rows)
+
+	if len(rows) == 0 {
+		return
+	}
+
+	ids := make([]uint, 0, len(rows))
+	for _, m := range rows {
+		ids = append(ids, m.ID)
+		newTags := addTagToStr(m.Tags, "NeedsSellPrice")
+		s.db.Table("ai_models").Where("id = ?", m.ID).
+			Updates(map[string]interface{}{"tags": newTags})
+	}
+	s.db.Table("ai_models").Where("id IN ?", ids).
+		Update("is_active", false)
+}
+
+// addTagToStr 向逗号分隔的标签字符串中追加一个标签（已存在则跳过）
+func addTagToStr(tags, tag string) string {
+	if tags == "" {
+		return tag
+	}
+	for _, t := range strings.Split(tags, ",") {
+		if strings.TrimSpace(t) == tag {
+			return tags
+		}
+	}
+	return tags + "," + tag
+}
+
+// removeTagFromStr 从逗号分隔的标签字符串中删除一个标签
+func removeTagFromStr(tags, tag string) string {
+	if tags == "" {
+		return ""
+	}
+	parts := strings.Split(tags, ",")
+	result := parts[:0]
+	for _, t := range parts {
+		if strings.TrimSpace(t) != tag {
+			result = append(result, t)
+		}
+	}
+	return strings.Join(result, ",")
 }

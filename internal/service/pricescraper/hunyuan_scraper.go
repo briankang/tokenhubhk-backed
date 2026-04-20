@@ -13,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/logger"
 )
 
@@ -26,15 +27,25 @@ import (
 // =====================================================
 
 const (
-	hunyuanModelsAPIURL  = "https://api.hunyuan.cloud.tencent.com/v1/models"
-	hunyuanSupplierName  = "腾讯混元"
-	hunyuanPricePageURL  = "https://cloud.tencent.com/document/product/1729/97731"
+	hunyuanModelsAPIURL = "https://api.hunyuan.cloud.tencent.com/v1/models"
+	hunyuanSupplierName = "腾讯混元"
+	// 文本模型定价页
+	hunyuanPricePageURL = "https://cloud.tencent.com/document/product/1729/97731"
+	// v3.5：非文本模型（生图等）定价页
+	hunyuanNonTextPriceURL = "https://cloud.tencent.com/document/product/1729/105925"
 )
 
 // HunyuanScraper 腾讯混元价格爬虫
 type HunyuanScraper struct {
 	apiKey     string
 	httpClient *http.Client
+}
+
+// SetAPIKey 动态更新 API Key（优先使用渠道配置的 Key）
+func (s *HunyuanScraper) SetAPIKey(key string) {
+	if key != "" {
+		s.apiKey = key
+	}
 }
 
 // NewHunyuanScraper 创建混元爬虫实例
@@ -207,6 +218,10 @@ func (s *HunyuanScraper) mergeModels(apiModels []hunyuanAPIModel, supplementary 
 			sm.PricingUnit = supp.PricingUnit
 		}
 
+		// 腾讯云混元官方定价页（https://cloud.tencent.com/document/product/1729/97731）
+		// 截至 2026-04 未开放公开的 cached_tokens 计费 SKU，显式标记为不支持缓存
+		sm.SupportsCache = false
+		sm.CacheMechanism = "none"
 		result = append(result, sm)
 	}
 
@@ -217,6 +232,9 @@ func (s *HunyuanScraper) mergeModels(apiModels []hunyuanAPIModel, supplementary 
 			continue
 		}
 		processed[key] = true
+		// 同上：显式标记不支持缓存
+		supp.SupportsCache = false
+		supp.CacheMechanism = "none"
 		result = append(result, supp)
 	}
 
@@ -356,8 +374,182 @@ func getHunyuanSupplementaryPrices() []ScrapedModel {
 			PricingUnit: PricingUnitPerMillionTokens,
 			ModelType:   "Embedding",
 		},
+
+		// ---- 新一代 TurboS 系列（2025 性价比旗舰）----
+		{
+			ModelName:   "hunyuan-turbos",
+			DisplayName: "Hunyuan TurboS",
+			InputPrice:  0.8,
+			OutputPrice: 2,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+		},
+		{
+			ModelName:   "hunyuan-turbos-latest",
+			DisplayName: "Hunyuan TurboS Latest",
+			InputPrice:  0.8,
+			OutputPrice: 2,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+		},
+		{
+			ModelName:   "hunyuan-turbos-20250226",
+			DisplayName: "Hunyuan TurboS 20250226",
+			InputPrice:  0.8,
+			OutputPrice: 2,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+		},
+		{
+			ModelName:   "hunyuan-turbos-vision",
+			DisplayName: "Hunyuan TurboS Vision",
+			InputPrice:  3,
+			OutputPrice: 9,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "VLM",
+		},
+
+		// ---- T1 深度推理系列（对标 DeepSeek-R1）----
+		{
+			ModelName:   "hunyuan-t1-latest",
+			DisplayName: "Hunyuan T1 Latest",
+			InputPrice:  1,
+			OutputPrice: 4,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+		},
+		{
+			ModelName:   "hunyuan-t1-20250321",
+			DisplayName: "Hunyuan T1 20250321",
+			InputPrice:  1,
+			OutputPrice: 4,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+		},
+
+		// ---- 翻译专用 ----
+		{
+			ModelName:   "hunyuan-translation",
+			DisplayName: "Hunyuan Translation",
+			InputPrice:  15,
+			OutputPrice: 15,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+		},
+		{
+			ModelName:   "hunyuan-translation-lite",
+			DisplayName: "Hunyuan Translation Lite",
+			InputPrice:  5,
+			OutputPrice: 5,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+		},
+
+		// ---- 长上下文扩展 ----
+		{
+			ModelName:   "hunyuan-large-longcontext",
+			DisplayName: "Hunyuan Large LongContext",
+			InputPrice:  6,
+			OutputPrice: 18,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+		},
+
+		// ---- 视觉扩展 ----
+		{
+			ModelName:   "hunyuan-standard-vision",
+			DisplayName: "Hunyuan Standard Vision",
+			InputPrice:  8,
+			OutputPrice: 12,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "VLM",
+		},
+		{
+			ModelName:   "hunyuan-lite-vision",
+			DisplayName: "Hunyuan Lite Vision",
+			InputPrice:  0,
+			OutputPrice: 0,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "VLM",
+		},
+
+		// ---- 开源系列（腾讯开源 Hunyuan 模型，官方 API 免费）----
+		{
+			ModelName:   "hunyuan-7b",
+			DisplayName: "Hunyuan 7B (Open Source)",
+			InputPrice:  0,
+			OutputPrice: 0,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+		},
+		{
+			ModelName:   "hunyuan-a13b",
+			DisplayName: "Hunyuan A13B (Open Source)",
+			InputPrice:  0,
+			OutputPrice: 0,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+		},
+
+		// ---- 图像生成（按月用量分档，数据源 https://cloud.tencent.com/document/product/1729/105925） ----
+		// 混元生图：月用量 <1万: ¥0.5/张；≥1万: 阶梯化降价
+		// 注意：阶梯字段表达"单次请求的输入 token 数"语义，此处 InputMin/Max 借用为"月累计调用张数"，
+		// 计费引擎调用 SelectTier 时会传入调用方统计的月累计调用数作为 inputTokens 参数来命中阶梯。
+		{
+			ModelName:   "hunyuan-image",
+			DisplayName: "Hunyuan Image",
+			InputPrice:  0.5, // 首阶梯单价作为展示
+			OutputPrice: 0,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerImage,
+			ModelType:   "ImageGeneration",
+			PriceTiers: []model.PriceTier{
+				{Name: "月用量<1万张", InputMax: i64Hunyuan(10000), InputPrice: 0.5},
+				{Name: "月用量≥1万张", InputMin: 10000, InputPrice: 0.099},
+			},
+		},
+		// 混元文生图轻量版：¥0.099/张起（大用量 ¥0.066）
+		{
+			ModelName:   "hunyuan-dit",
+			DisplayName: "Hunyuan DiT (轻量版)",
+			InputPrice:  0.099,
+			OutputPrice: 0,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerImage,
+			ModelType:   "ImageGeneration",
+			PriceTiers: []model.PriceTier{
+				{Name: "月用量<100万张", InputMax: i64Hunyuan(1000000), InputPrice: 0.099},
+				{Name: "月用量≥100万张", InputMin: 1000000, InputPrice: 0.066},
+			},
+		},
+		// 混元生图快速版
+		{
+			ModelName:   "hunyuan-image-lite",
+			DisplayName: "Hunyuan Image Lite",
+			InputPrice:  0.099,
+			OutputPrice: 0,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerImage,
+			ModelType:   "ImageGeneration",
+		},
 	}
 }
+
+// i64Hunyuan 指针化 int64（混元专用）
+func i64Hunyuan(v int64) *int64 { return &v }
 
 // =====================================================
 // 辅助函数

@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -15,11 +16,13 @@ import (
 	setuphandler "tokenhub-server/internal/handler/setup"
 	userhandler "tokenhub-server/internal/handler/user"
 	"tokenhub-server/internal/middleware"
+	auditmw "tokenhub-server/internal/middleware/audit"
 	pkglogger "tokenhub-server/internal/pkg/logger"
 	"tokenhub-server/internal/pkg/redis"
 	"tokenhub-server/internal/pkg/response"
 	"tokenhub-server/internal/service/apikey"
 	aimodelsvc "tokenhub-server/internal/service/aimodel"
+	auditsvc "tokenhub-server/internal/service/audit"
 	authsvc "tokenhub-server/internal/service/auth"
 	channelsvc "tokenhub-server/internal/service/channel"
 	docsvc "tokenhub-server/internal/service/doc"
@@ -27,6 +30,7 @@ import (
 	modelcatsvc "tokenhub-server/internal/service/modelcategory"
 	orchsvc "tokenhub-server/internal/service/orchestration"
 	"tokenhub-server/internal/service/permission"
+	exchangesvc "tokenhub-server/internal/service/exchange"
 	paymentsvc "tokenhub-server/internal/service/payment"
 	balancesvc "tokenhub-server/internal/service/balance"
 	"tokenhub-server/internal/service/pricing"
@@ -42,10 +46,12 @@ import (
 
 	openhandler "tokenhub-server/internal/handler/openapi"
 	"tokenhub-server/internal/handler/public"
+	supporthandler "tokenhub-server/internal/handler/support"
 	v1handler "tokenhub-server/internal/handler/v1"
 	mcphandler "tokenhub-server/internal/handler/mcp"
 	"tokenhub-server/internal/mcp"
 	openapi "tokenhub-server/internal/service/openapi"
+	supportsvc "tokenhub-server/internal/service/support"
 	geosvc "tokenhub-server/internal/service/geo"
 	cachesvc "tokenhub-server/internal/service/cache"
 	codingsvc "tokenhub-server/internal/service/coding"
@@ -54,6 +60,7 @@ import (
 	"tokenhub-server/internal/service/parammapping"
 	"tokenhub-server/internal/taskqueue"
 	"github.com/spf13/viper"
+	"gorm.io/gorm"
 )
 
 // taskBridge 全局 SSE 桥接器，由 SetupBackend() 初始化。
@@ -61,10 +68,35 @@ import (
 // Setup()（单体模式）中为 nil，handler 在本进程内执行。
 var taskBridge *taskqueue.SSEBridge
 
+// buildExchangeRateConfig 构造 ExchangeRateConfig
+// v3.2.3: 先从 DB (system_configs 表) 读取，覆盖 config.Global 默认值
+// 敏感字段 AppSecret 通过 paymentCfgSvc 解密
+func buildExchangeRateConfig(db *gorm.DB, paymentCfgSvc *paymentsvc.PaymentConfigService) exchangesvc.Config {
+	fallback := exchangesvc.Config{
+		PrimaryURL:     config.Global.ExchangeRate.PrimaryURL,
+		BackupURL:      config.Global.ExchangeRate.BackupURL,
+		PublicURL:      config.Global.ExchangeRate.PublicURL,
+		AppCode:        config.Global.ExchangeRate.AppCode,
+		AppKey:         config.Global.ExchangeRate.AppKey,
+		AppSecret:      config.Global.ExchangeRate.AppSecret,
+		CacheTTL:       time.Duration(config.Global.ExchangeRate.CacheTTL) * time.Second,
+		DefaultRate:    config.Global.ExchangeRate.DefaultRate,
+		RequestTimeout: time.Duration(config.Global.ExchangeRate.RequestTimeout) * time.Second,
+	}
+	var decryptFn exchangesvc.DecryptFn
+	if paymentCfgSvc != nil {
+		decryptFn = paymentCfgSvc.DecryptCiphertext
+	}
+	return exchangesvc.LoadConfigFromDB(db, fallback, decryptFn)
+}
+
 // Setup 注册所有路由和中间件到 Gin 引擎
 func Setup(r *gin.Engine) {
 	// 初始化白标服务
 	domainResolver := whitelabel.NewDomainResolver(database.DB, redis.Client)
+
+	// 初始化全局审计服务（启动异步 consumer goroutine）
+	auditSvc := auditsvc.InitDefault(database.DB, context.Background())
 
 	// 全局中间件
 	r.Use(middleware.Recovery())
@@ -74,6 +106,8 @@ func Setup(r *gin.Engine) {
 	r.Use(middleware.TenantResolveMiddleware(domainResolver, viper.GetString("server.platform_domain")))
 	// 多层级限流中间件（在认证之前，基于 IP/用户/API Key 限流）
 	r.Use(middleware.MultiLevelRateLimiter())
+	// 审计日志中间件（白名单路由命中才记录，仅 2xx 写操作；异步入队不阻塞）
+	r.Use(auditmw.AuditLog(auditSvc))
 
 	// 健康检查端点
 	r.GET("/health", func(c *gin.Context) {
@@ -106,9 +140,6 @@ func Setup(r *gin.Engine) {
 		// --- Public payment methods ---
 		registerPublicPaymentMethodsHandler(publicGroup)
 
-		// --- IP 地理位置语言检测 ---
-		registerLocaleHandler(publicGroup)
-
 		// --- 公开模型列表（无需认证，供前端 /models 页面使用） ---
 		registerPublicModelHandlers(publicGroup)
 
@@ -130,21 +161,30 @@ func Setup(r *gin.Engine) {
 		registerPartnerApplicationHandler(publicWriteGroup)
 		// --- 邀请链接点击追踪 ---
 		registerReferralClickHandler(publicWriteGroup)
+		// --- IP 地理位置语言检测（无缓存：每个 IP 需独立判定，
+		//     Redis 层 geo:ip:{ip} 已提供 1 年命中级缓存）---
+		registerLocaleHandler(publicWriteGroup)
 	}
 
 	// --- 支付回调 (无 JWT, 签名验证) ---
 	registerPaymentCallbacks(v1)
 
 	// --- 已认证路由 ---
+	// v4.0: 初始化全局 Resolver 单例（幂等）
+	if permission.Default == nil {
+		permission.Default = permission.NewResolver(database.DB, redis.Client)
+	}
+
 	authorized := v1.Group("")
 	authorized.Use(middleware.Auth())
+	authorized.Use(middleware.LoadSubjectPerms(permission.Default))
 	authorized.Use(middleware.MemberRateLimiter(database.DB, redis.Client))
 	authorized.Use(middleware.DataScope())
 	authorized.Use(middleware.Idempotent())
 
-	// 管理员路由 (需要 ADMIN 角色)
+	// 管理员路由（v4.0: 基于 audit.routeMap 的细粒度权限网关）
 	adminGroup := authorized.Group("/admin")
-	adminGroup.Use(middleware.RequireRole("ADMIN"))
+	adminGroup.Use(middleware.PermissionGate())
 	{
 		// --- Admin user management (registered via handlers) ---
 		registerAdminUserHandlers(adminGroup)
@@ -161,6 +201,9 @@ func Setup(r *gin.Engine) {
 		// --- Report management (registered via handlers) ---
 		registerAdminReportHandlers(adminGroup)
 
+		// --- Stats management (registered via handlers) ---
+		registerAdminStatsHandlers(adminGroup)
+
 		// --- Pricing management (registered via handlers) ---
 		registerPricingHandlers(adminGroup)
 
@@ -176,14 +219,15 @@ func Setup(r *gin.Engine) {
 		// --- Guard / Disposable email (v3.1 反欺诈配置) ---
 		registerAdminGuardHandlers(adminGroup)
 
-		// --- Withdrawal v3.1 (管理员审核) ---
-		registerAdminWithdrawalHandlers(adminGroup)
-
 		// --- Config Audit Log (v3.1 统一审计日志查询) ---
 		registerAdminConfigAuditHandlers(adminGroup)
 
 		// --- Payment config management ---
 		registerPaymentConfigHandlers(adminGroup)
+
+		// --- v3.2 Payment/Order/Refund/Withdrawal/EventLog/ExchangeRate (聚合) ---
+		// NOTE: 包含提现管理，不再单独注册 registerAdminWithdrawalHandlers（已被 v3.2 超集）
+		registerAdminPaymentV2Handlers(adminGroup)
 
 		// ========== Cache Admin Routes (缓存管理) ==========
 		registerCacheHandlers(adminGroup)
@@ -231,6 +275,18 @@ func Setup(r *gin.Engine) {
 		// ========== Announcement Routes (站内公告管理) ==========
 		announcementAdminHandler := admin.NewAnnouncementHandler(database.DB)
 		announcementAdminHandler.Register(adminGroup)
+
+		// ========== Trending Models Routes (全球热门模型参考库) ==========
+		trendingModelHandler := admin.NewTrendingModelHandler(database.DB)
+		trendingModelHandler.Register(adminGroup)
+
+		// ========== Operations Reports (运营报表：积分消耗 / 注册赠送 / 邀请返佣) ==========
+		admin.NewCreditConsumptionHandler(database.DB).Register(adminGroup)
+		admin.NewRegistrationGiftHandler(database.DB).Register(adminGroup)
+		admin.NewReferralCommissionHandler(database.DB).Register(adminGroup)
+
+		// ========== AI 客服管理 ==========
+		admin.NewSupportAdminHandler(database.DB, getSupportServices()).Register(adminGroup)
 	}
 
 	// 代理商机制已物理移除 (v3.1)
@@ -249,13 +305,26 @@ func Setup(r *gin.Engine) {
 		// --- 提现申请 v3.1 ---
 		registerUserWithdrawalHandlers(userGroup)
 
+		// --- v3.2 用户退款申请 ---
+		registerUserRefundHandlers(userGroup)
+
 		// --- 站内通知（公告已读状态）---
 		notificationHandler := userhandler.NewNotificationHandler(database.DB)
 		notificationHandler.Register(userGroup)
+
+		// --- 图片上传（Playground 视觉调试使用，代理到 catbox.moe / 0x0.st）---
+		imageUploadHandler := userhandler.NewImageUploadHandler()
+		imageUploadHandler.Register(userGroup)
 	}
 
 	// --- 支付路由 (JWT 认证) ---
 	registerPaymentHandlers(authorized, adminGroup)
+
+	// --- AI 客服（需登录） ---
+	supportGroup := authorized.Group("/support")
+	{
+		registerSupportHandlers(supportGroup)
+	}
 
 	// AI 代理路由 (API Key 认证)
 	chatGroup := v1.Group("/chat")
@@ -311,6 +380,9 @@ func SetupBackend(r *gin.Engine) {
 	// 初始化白标服务
 	domainResolver := whitelabel.NewDomainResolver(database.DB, redis.Client)
 
+	// 初始化全局审计服务
+	auditSvc := auditsvc.InitDefault(database.DB, context.Background())
+
 	// 全局中间件
 	r.Use(middleware.Recovery())
 	r.Use(middleware.CORS())
@@ -318,6 +390,8 @@ func SetupBackend(r *gin.Engine) {
 	r.Use(middleware.I18n())
 	r.Use(middleware.TenantResolveMiddleware(domainResolver, viper.GetString("server.platform_domain")))
 	r.Use(middleware.MultiLevelRateLimiter())
+	// 审计日志中间件
+	r.Use(auditmw.AuditLog(auditSvc))
 
 	// 健康检查
 	r.GET("/health", func(c *gin.Context) {
@@ -346,7 +420,6 @@ func SetupBackend(r *gin.Engine) {
 	publicGroup.Use(middleware.CacheMiddleware(cachesvc.TTLLong))
 	{
 		registerPublicPaymentMethodsHandler(publicGroup)
-		registerLocaleHandler(publicGroup)
 		registerPublicModelHandlers(publicGroup)
 		registerParamSupportHandler(publicGroup)
 		registerPublicConfigHandlers(publicGroup)
@@ -354,40 +427,50 @@ func SetupBackend(r *gin.Engine) {
 		annPublicHandler.RegisterPublicBanner(publicGroup)
 	}
 
-	// 公开 POST 路由
+	// 公开 POST 路由 / 不缓存的 GET
 	publicWriteGroup := v1.Group("/public")
 	{
 		registerPartnerApplicationHandler(publicWriteGroup)
 		registerReferralClickHandler(publicWriteGroup)
+		// IP 地理位置语言检测（per-IP 响应，不走公共 URL 缓存；Redis 层 geo:ip:{ip} 已提供 1 年缓存）
+		registerLocaleHandler(publicWriteGroup)
 	}
 
 	// 支付回调
 	registerPaymentCallbacks(v1)
 
 	// 已认证路由
+	// v4.0: 初始化全局 Resolver 单例（幂等）
+	if permission.Default == nil {
+		permission.Default = permission.NewResolver(database.DB, redis.Client)
+	}
+
 	authorized := v1.Group("")
 	authorized.Use(middleware.Auth())
+	authorized.Use(middleware.LoadSubjectPerms(permission.Default))
 	authorized.Use(middleware.MemberRateLimiter(database.DB, redis.Client))
 	authorized.Use(middleware.DataScope())
 	authorized.Use(middleware.Idempotent())
 
-	// 管理员路由
+	// 管理员路由（v4.0: 基于 audit.routeMap 的细粒度权限网关）
 	adminGroup := authorized.Group("/admin")
-	adminGroup.Use(middleware.RequireRole("ADMIN"))
+	adminGroup.Use(middleware.PermissionGate())
 	{
 		registerAdminUserHandlers(adminGroup)
 		registerChannelHandlers(adminGroup)
 		registerOrchestrationHandlers(adminGroup)
 		registerDocHandlers(adminGroup)
 		registerAdminReportHandlers(adminGroup)
+		registerAdminStatsHandlers(adminGroup)
 		registerPricingHandlers(adminGroup)
 		registerQuotaHandlers(adminGroup)
 		registerAdminReferralHandlers(adminGroup)
 		registerAdminCommissionOverrideHandlers(adminGroup)
 		registerAdminGuardHandlers(adminGroup)
-		registerAdminWithdrawalHandlers(adminGroup)
 		registerAdminConfigAuditHandlers(adminGroup)
 		registerPaymentConfigHandlers(adminGroup)
+		// v3.2 聚合：包含提现管理（超集替代旧 registerAdminWithdrawalHandlers）
+		registerAdminPaymentV2Handlers(adminGroup)
 		registerCacheHandlers(adminGroup)
 		registerRateLimitHandlers(adminGroup)
 		registerLevelAdminHandlers(adminGroup)
@@ -413,6 +496,14 @@ func SetupBackend(r *gin.Engine) {
 
 		announcementAdminHandler := admin.NewAnnouncementHandler(database.DB)
 		announcementAdminHandler.Register(adminGroup)
+
+		// ========== Operations Reports (运营报表：积分消耗 / 注册赠送 / 邀请返佣) ==========
+		admin.NewCreditConsumptionHandler(database.DB).Register(adminGroup)
+		admin.NewRegistrationGiftHandler(database.DB).Register(adminGroup)
+		admin.NewReferralCommissionHandler(database.DB).Register(adminGroup)
+
+		// ========== AI 客服管理 ==========
+		admin.NewSupportAdminHandler(database.DB, getSupportServices()).Register(adminGroup)
 	}
 
 	// 用户路由
@@ -426,10 +517,20 @@ func SetupBackend(r *gin.Engine) {
 		registerUserWithdrawalHandlers(userGroup)
 		notificationHandler := userhandler.NewNotificationHandler(database.DB)
 		notificationHandler.Register(userGroup)
+
+		// 图片上传（Playground 视觉调试）
+		imageUploadHandler := userhandler.NewImageUploadHandler()
+		imageUploadHandler.Register(userGroup)
 	}
 
 	// 支付路由
 	registerPaymentHandlers(authorized, adminGroup)
+
+	// AI 客服（需登录）
+	supportGroup := authorized.Group("/support")
+	{
+		registerSupportHandlers(supportGroup)
+	}
 
 	// Chat 路由
 	chatGroup := v1.Group("/chat")
@@ -443,6 +544,32 @@ func SetupBackend(r *gin.Engine) {
 
 	// MCP
 	registerMCPHandlers(v1)
+}
+
+// supportServicesSingleton 单例：首次调用时 Bootstrap，后续重用。
+// Setup 与 SetupBackend 可能在同一进程调用（单体 vs 拆分），此处保证只构造一次。
+var supportServicesSingleton *supportsvc.Services
+
+func getSupportServices() *supportsvc.Services {
+	if supportServicesSingleton == nil {
+		supportServicesSingleton = supportsvc.Bootstrap(database.DB, redis.Client)
+	}
+	return supportServicesSingleton
+}
+
+// registerSupportHandlers 注册 AI 客服路由 (/api/v1/support/*)。
+// 登录用户均可访问：聊天 SSE、会话/消息、工单、热门问题、供应商文档。
+func registerSupportHandlers(rg *gin.RouterGroup) {
+	svc := getSupportServices()
+
+	chatH := supporthandler.NewChatHandler(svc)
+	chatH.Register(rg)
+
+	sessionH := supporthandler.NewSessionHandler(svc)
+	sessionH.Register(rg)
+
+	ticketH := supporthandler.NewTicketHandler(svc)
+	ticketH.Register(rg)
 }
 
 // registerOpenAPIHandlers 注册对外开放 API 路由组 (/api/v1/open/)。
@@ -588,6 +715,12 @@ func registerAdminReportHandlers(rg *gin.RouterGroup) {
 	reportHandler.Register(rg)
 }
 
+// registerAdminStatsHandlers 初始化运营统计 Handler 并注册路由
+func registerAdminStatsHandlers(rg *gin.RouterGroup) {
+	statsH := admin.NewStatsHandler(database.DB)
+	statsH.Register(rg)
+}
+
 // StartStatsAggregator 启动后台统计聚合任务
 func StartStatsAggregator() {
 	db := database.DB
@@ -624,6 +757,18 @@ func registerPaymentHandlers(authorized *gin.RouterGroup, adminGroup *gin.Router
 
 	paymentSvc := paymentsvc.NewPaymentService(db, redisClient, logger)
 
+	// v3.2: 注入多账号路由 + 事件日志 + 汇率服务（让 CreatePaymentWithRouting 真实生效）
+	accountRouter := paymentsvc.NewAccountRouter(db, redisClient)
+	eventLogger := paymentsvc.NewEventLogger(db)
+	// v3.2.3: 汇率配置从 DB 种子读取（system_configs），config.Global 作兜底
+	pcsForFx := paymentsvc.NewPaymentConfigService(db)
+	fxCfg := buildExchangeRateConfig(db, pcsForFx)
+	fxSvc := exchangesvc.New(db, redisClient, fxCfg)
+	fxSvc.SetEventSink(eventLogger)
+	paymentSvc.SetAccountRouter(accountRouter)
+	paymentSvc.SetEventLogger(eventLogger)
+	paymentSvc.SetExchangeFetcher(fxSvc)
+
 	// 支付路由 (已认证用户)
 	paymentHandler := paymenthandler.NewPaymentHandler(paymentSvc)
 	authorized.POST("/payment/create", paymentHandler.Create)
@@ -644,6 +789,11 @@ func registerPaymentCallbacks(v1 *gin.RouterGroup) {
 	}
 
 	paymentSvc := paymentsvc.NewPaymentService(db, redisClient, logger)
+
+	// v3.2: 注入事件日志 + 多账号路由，使回调事件完整入库
+	eventLogger := paymentsvc.NewEventLogger(db)
+	paymentSvc.SetEventLogger(eventLogger)
+
 	callbackHandler := paymenthandler.NewCallbackHandler(paymentSvc)
 	callbackHandler.RegisterCallbacks(v1)
 }
@@ -698,8 +848,21 @@ func registerAdminUserHandlers(rg *gin.RouterGroup) {
 	// --- AI Model CRUD ---
 	registerAdminAIModelHandlers(rg)
 
+	// --- Capability Testing ---
+	registerAdminCapabilityTestHandlers(rg)
+
 	// --- Misc admin endpoints ---
 	registerAdminMiscHandlers(rg)
+}
+
+// registerAdminCapabilityTestHandlers 注册模型能力测试路由
+func registerAdminCapabilityTestHandlers(rg *gin.RouterGroup) {
+	db := database.DB
+	checker := aimodelsvc.NewModelChecker(db)
+	tester := aimodelsvc.NewCapabilityTester(db, checker)
+	baseline := aimodelsvc.NewBaselineService(db)
+	handler := admin.NewCapabilityTestHandler(db, tester, baseline, taskBridge)
+	handler.Register(rg)
 }
 
 // registerUserHandlers 初始化用户个人信息和 API Key 处理器
@@ -709,6 +872,13 @@ func registerUserHandlers(rg *gin.RouterGroup) {
 
 	userSvc := usersvc.NewUserService(db)
 	profileHandler := userhandler.NewProfileHandler(userSvc)
+
+	// v4.0: 全局 Resolver 单例（幂等：仅首次初始化）
+	// 供 /user/profile 返回 permissions/data_scope/role_codes
+	if permission.Default == nil {
+		permission.Default = permission.NewResolver(db, redisClient)
+	}
+	profileHandler.SetResolver(permission.Default)
 
 	rg.GET("/profile", profileHandler.GetProfile)
 	rg.PUT("/profile", profileHandler.UpdateProfile)
@@ -831,6 +1001,8 @@ func registerAdminAIModelHandlers(rg *gin.RouterGroup) {
 	rg.POST("/models/deprecation-scan", handler.DeprecationScan) // 扫描可能下线的模型
 	rg.POST("/models/bulk-deprecate", handler.BulkDeprecate)     // 批量下线 + 创建公告
 	rg.GET("/models/scanned-offline", handler.ScanOfflineAll)    // 所有供应商扫描下线模型汇总
+	// 根据供应商官方下线公告批量标记本地模型为 offline（当前仅支持 baidu_qianfan）
+	rg.POST("/models/mark-official-deprecated/:supplierCode", handler.MarkOfficialDeprecated)
 
 	// ===== 模型 k:v 标签系统 =====
 	// 注意：batch/label-keys 路由必须在 :id 参数路由前注册，避免路径冲突
@@ -869,6 +1041,7 @@ func registerAdminMiscHandlers(rg *gin.RouterGroup) {
 	handler := admin.NewMiscHandler(db)
 
 	rg.GET("/audit-logs", handler.ListAuditLogs)
+	rg.GET("/audit-logs/menus", handler.ListAuditMenus)
 	rg.GET("/stats/daily", handler.DailyStats)
 }
 
@@ -912,7 +1085,37 @@ func registerAdminConfigAuditHandlers(rg *gin.RouterGroup) {
 func registerUserWithdrawalHandlers(rg *gin.RouterGroup) {
 	balSvc := balancesvc.NewBalanceService(database.DB, redis.Client)
 	svc := withdrawalsvc.NewService(database.DB, balSvc)
-	handler := userhandler.NewWithdrawalHandler(svc)
+	svc.SetRedis(redis.Client)
+	// 注入事件日志
+	eventLogger := paymentsvc.NewEventLogger(database.DB)
+	svc.SetEventSink(withdrawalsvc.FuncEventSink{F: func(ctx context.Context, evt withdrawalsvc.WithdrawalEvent) {
+		eventLogger.LogWithdrawalEventInput(ctx, paymentsvc.WithdrawalEventInput{
+			WithdrawID: evt.WithdrawID,
+			UserID:     evt.UserID,
+			EventType:  evt.EventType,
+			ActorType:  evt.ActorType,
+			ActorID:    evt.ActorID,
+			IP:         evt.IP,
+			Payload:    evt.Payload,
+			Success:    evt.Success,
+			ErrorMsg:   evt.ErrorMsg,
+		})
+	}})
+	handler := userhandler.NewWithdrawalHandlerWithDB(svc, database.DB)
+	handler.Register(rg)
+}
+
+// registerUserRefundHandlers v3.2 用户退款申请
+func registerUserRefundHandlers(rg *gin.RouterGroup) {
+	db := database.DB
+	eventLogger := paymentsvc.NewEventLogger(db)
+	refundSvc := paymentsvc.NewRefundService(db, redis.Client, eventLogger)
+	// 网关调用：构建 PaymentService
+	paymentSvc := paymentsvc.NewPaymentService(db, redis.Client, pkglogger.L)
+	paymentSvc.SetEventLogger(eventLogger)
+	refundSvc.SetGatewayInvoker(paymentSvc)
+
+	handler := userhandler.NewRefundHandler(refundSvc)
 	handler.Register(rg)
 }
 
@@ -934,7 +1137,7 @@ func registerPaymentConfigHandlers(rg *gin.RouterGroup) {
 
 // registerLocaleHandler 注册 IP 地理位置语言检测接口
 func registerLocaleHandler(rg *gin.RouterGroup) {
-	geoService := geosvc.NewGeoService(redis.Client)
+	geoService := geosvc.NewGeoService(redis.Client, config.Global.Geo)
 	localeHandler := public.NewLocaleHandler(geoService)
 	localeHandler.Register(rg)
 }
@@ -958,13 +1161,79 @@ func registerPublicPaymentMethodsHandler(rg *gin.RouterGroup) {
 	rg.GET("/payment-methods", handler.GetActivePaymentMethods)
 }
 
-// registerPublicConfigHandlers 注册公开配置接口（邀请返佣 + 注册赠送）
+// registerAdminPaymentV2Handlers 注册 v3.2 聚合支付管理路由
+func registerAdminPaymentV2Handlers(rg *gin.RouterGroup) {
+	db := database.DB
+
+	// EventLogger
+	eventLogger := paymentsvc.NewEventLogger(db)
+
+	// RefundService
+	refundSvc := paymentsvc.NewRefundService(db, redis.Client, eventLogger)
+
+	// AccountRouter
+	accRouter := paymentsvc.NewAccountRouter(db, redis.Client)
+
+	// PaymentConfigService (for encryption)
+	paymentCfgSvc := paymentsvc.NewPaymentConfigService(db)
+
+	// WithdrawalService（带事件日志）
+	balSvc := balancesvc.NewBalanceService(db, redis.Client)
+	wdSvc := withdrawalsvc.NewService(db, balSvc)
+	wdSvc.SetRedis(redis.Client)
+	wdSvc.SetEventSink(withdrawalsvc.FuncEventSink{F: func(ctx context.Context, evt withdrawalsvc.WithdrawalEvent) {
+		eventLogger.LogWithdrawalEventInput(ctx, paymentsvc.WithdrawalEventInput{
+			WithdrawID: evt.WithdrawID,
+			UserID:     evt.UserID,
+			EventType:  evt.EventType,
+			ActorType:  evt.ActorType,
+			ActorID:    evt.ActorID,
+			IP:         evt.IP,
+			Payload:    evt.Payload,
+			Success:    evt.Success,
+			ErrorMsg:   evt.ErrorMsg,
+		})
+	}})
+
+	// ExchangeRateService（v3.2.3：从 DB 种子读取，config.Global 兜底）
+	fxCfg := buildExchangeRateConfig(db, paymentCfgSvc)
+	fxSvc := exchangesvc.New(db, redis.Client, fxCfg)
+	fxSvc.SetEventSink(eventLogger)
+
+	// PaymentService（扩展：注入 accountRouter + eventLogger + exchangeFetcher）
+	paymentSvc := paymentsvc.NewPaymentService(db, redis.Client, pkglogger.L)
+	paymentSvc.SetAccountRouter(accRouter)
+	paymentSvc.SetEventLogger(eventLogger)
+	paymentSvc.SetExchangeFetcher(fxSvc)
+	refundSvc.SetGatewayInvoker(paymentSvc)
+
+	handler := admin.NewPaymentAdminHandler(admin.PaymentAdminHandlerOpts{
+		DB:            db,
+		PaymentSvc:    paymentSvc,
+		RefundSvc:     refundSvc,
+		WithdrawalSvc: wdSvc,
+		AccountRouter: accRouter,
+		EventLogger:   eventLogger,
+		ExchangeSvc:   fxSvc,
+		PaymentConfig: paymentCfgSvc,
+	})
+	handler.Register(rg)
+}
+
+// registerPublicConfigHandlers 注册公开配置接口（邀请返佣 + 注册赠送 + 汇率）
 func registerPublicConfigHandlers(rg *gin.RouterGroup) {
 	db := database.DB
 	referralSvc := referralsvc.NewReferralService(db)
 	balanceSvc := balancesvc.NewBalanceService(db, redis.Client)
 	handler := public.NewConfigHandler(referralSvc, balanceSvc)
 	handler.Register(rg)
+
+	// v3.2 汇率接口（v3.2.3：从 DB 种子读取，config.Global 兜底）
+	pcsForPublic := paymentsvc.NewPaymentConfigService(db)
+	fxCfg := buildExchangeRateConfig(db, pcsForPublic)
+	fxSvc := exchangesvc.New(db, redis.Client, fxCfg)
+	fxHandler := public.NewExchangeRateHandler(fxSvc)
+	fxHandler.Register(rg)
 }
 
 // registerSetupHandlers 注册安装向导路由组 (/api/v1/setup/)
@@ -1201,6 +1470,10 @@ func registerPriceScraperHandlers(rg *gin.RouterGroup) {
 	rg.POST("/models/preview-prices", handler.PreviewPrices)
 	rg.POST("/models/apply-prices", handler.ApplyPrices)
 	rg.GET("/models/price-sync-logs", handler.GetSyncLogs)
+	// 批量按模型ID精准抓取
+	rg.POST("/models/batch-scrape", handler.BatchScrape)
+	rg.GET("/models/batch-scrape/:task_id/result", handler.GetBatchScrapeResult)
+	rg.POST("/models/batch-scrape/apply", handler.ApplyBatchScrape)
 }
 
 // registerTaskHandlers 注册后台任务管理路由

@@ -26,8 +26,10 @@ import (
 // =====================================================
 
 const (
-	// alibabaAPIURL 阿里云 DashScope 原生模型列表 API
+	// alibabaAPIURL 阿里云 DashScope 原生模型列表 API（用于获取模型元数据）
 	alibabaAPIURL = "https://dashscope.aliyuncs.com/api/v1/models"
+	// alibabaPriceDocURL 阿里云百炼官方定价页（用于 SourceURL 展示和浏览器抓取）
+	alibabaPriceDocURL = "https://help.aliyun.com/zh/model-studio/model-pricing"
 	// alibabaSupplierName 供应商名称标识
 	alibabaSupplierName = "阿里云百炼"
 	// alibabaPageSize 每页模型数
@@ -38,6 +40,13 @@ const (
 type AlibabaScraper struct {
 	apiKey     string
 	httpClient *http.Client
+}
+
+// SetAPIKey 动态更新 API Key（优先使用渠道配置的 Key）
+func (s *AlibabaScraper) SetAPIKey(key string) {
+	if key != "" {
+		s.apiKey = key
+	}
 }
 
 // NewAlibabaScraper 创建阿里云爬虫实例
@@ -159,6 +168,10 @@ func (s *AlibabaScraper) ScrapePrices(ctx context.Context) (*ScrapedPriceData, e
 		}
 	}
 
+	// v3.5：合并补充价格表（图片/视频/TTS/ASR/Embedding/Rerank 等非 Token 模型）
+	// API 返回值优先，仅在 API 未覆盖时用硬编码数据兜底
+	scrapedModels = mergeAlibabaWithSupplementary(scrapedModels, getAlibabaSupplementaryPrices())
+
 	log.Info("阿里云 API 价格获取完成",
 		zap.Int("api_models", len(allModels)),
 		zap.Int("with_prices", len(scrapedModels)))
@@ -167,7 +180,8 @@ func (s *AlibabaScraper) ScrapePrices(ctx context.Context) (*ScrapedPriceData, e
 		SupplierName: alibabaSupplierName,
 		FetchedAt:    time.Now(),
 		Models:       scrapedModels,
-		SourceURL:    alibabaAPIURL,
+		// SourceURL 使用官方定价页（不是 API 端点），便于前端"查看官网定价"跳转
+		SourceURL: alibabaPriceDocURL,
 	}, nil
 }
 
@@ -248,50 +262,98 @@ func (s *AlibabaScraper) doFetchPage(ctx context.Context, url string) ([]alibaba
 }
 
 // convertModel 将 API 模型数据转换为 ScrapedModel
-// 只处理有 token 定价的模型（跳过图片/视频/音频按量计费模型）
+// v3.5：支持全类型模型（LLM/VLM/Image/Video/TTS/ASR/Embedding/Rerank）
+// 按 Prices[].Type 推断计费单位，按模型名 + capabilities 推断模型类型
 func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
-	if len(m.Prices) == 0 {
-		return nil
-	}
-
 	sm := ScrapedModel{
 		ModelName:   m.Model,
 		DisplayName: m.Name,
 		Currency:    "CNY",
 	}
 
-	// 解析价格层级
+	// 1. 推断模型类型（优先 capabilities，其次模型名）
+	sm.ModelType = inferAlibabaModelType(m.Model, m.Capabilities)
+
+	// 2. 遍历所有价格层级，按 type 分类
+	// 注意 Aliyun API 的 Type 字段可能包含：
+	//   input_token / output_token                 — Token 计费（LLM/VLM/Embedding）
+	//   input_image / output_image / image / per_image — 图片计费（按张）
+	//   input_video_sec / per_second / per_sec     — 视频/ASR 按秒
+	//   input_audio_10k_chars / per_10k_chars      — TTS 按万字符
+	//   per_million_chars / per_million_characters  — TTS 按百万字符
+	//   per_call / per_request                     — Rerank 按次
+	//   per_hour                                   — ASR 按小时
+	//   per_minute                                 — ASR 按分钟
+	var hasAnyPrice bool
 	for _, priceRange := range m.Prices {
 		var inputPrice, outputPrice float64
-		var hasTokenPrice bool
-
+		var tierUnit string
 		for _, item := range priceRange.Prices {
 			price, err := strconv.ParseFloat(item.Price, 64)
 			if err != nil || price <= 0 {
 				continue
 			}
 
-			// 只处理 token 计费的价格类型
-			switch item.Type {
-			case "input_token":
+			typeLower := strings.ToLower(item.Type)
+			switch {
+			// ---- Token 计费 ----
+			case typeLower == "input_token" || typeLower == "input_tokens":
 				inputPrice = price
-				hasTokenPrice = true
-			case "output_token":
+				tierUnit = PricingUnitPerMillionTokens
+			case typeLower == "output_token" || typeLower == "output_tokens":
 				outputPrice = price
-				hasTokenPrice = true
+				tierUnit = PricingUnitPerMillionTokens
+			// ---- 图片计费（按张）----
+			case strings.Contains(typeLower, "image") || strings.Contains(typeLower, "per_image"):
+				inputPrice = price
+				tierUnit = PricingUnitPerImage
+			// ---- 视频 / ASR 按秒 ----
+			case typeLower == "per_second" || typeLower == "per_sec" ||
+				strings.Contains(typeLower, "video_sec") || strings.Contains(typeLower, "_sec"):
+				inputPrice = price
+				tierUnit = PricingUnitPerSecond
+			// ---- ASR 按分钟 ----
+			case strings.Contains(typeLower, "per_minute") || strings.Contains(typeLower, "minute"):
+				inputPrice = price
+				tierUnit = PricingUnitPerMinute
+			// ---- ASR 按小时 ----
+			case strings.Contains(typeLower, "per_hour") || strings.Contains(typeLower, "hour"):
+				inputPrice = price
+				tierUnit = PricingUnitPerHour
+			// ---- TTS 按万字符 ----
+			case strings.Contains(typeLower, "10k_chars") || strings.Contains(typeLower, "10k_character") ||
+				strings.Contains(typeLower, "万字符"):
+				inputPrice = price
+				tierUnit = PricingUnitPer10kCharacters
+			// ---- TTS 按百万字符 ----
+			case strings.Contains(typeLower, "million_char") || strings.Contains(typeLower, "百万字符") ||
+				strings.Contains(typeLower, "per_m_chars"):
+				inputPrice = price
+				tierUnit = PricingUnitPerMillionCharacters
+			// ---- Rerank 按次 ----
+			case strings.Contains(typeLower, "per_call") || strings.Contains(typeLower, "per_request") ||
+				typeLower == "call":
+				inputPrice = price
+				tierUnit = PricingUnitPerCall
+			}
+			if inputPrice > 0 || outputPrice > 0 {
+				hasAnyPrice = true
 			}
 		}
 
-		if !hasTokenPrice {
+		if inputPrice == 0 && outputPrice == 0 {
 			continue
 		}
 
-		// 第一个价格区间作为基础价格
+		// 首个区间作为基础价格 + 计费单位
 		if sm.InputPrice == 0 && inputPrice > 0 {
 			sm.InputPrice = inputPrice
 		}
 		if sm.OutputPrice == 0 && outputPrice > 0 {
 			sm.OutputPrice = outputPrice
+		}
+		if sm.PricingUnit == "" && tierUnit != "" {
+			sm.PricingUnit = tierUnit
 		}
 
 		// 所有区间记录为 PriceTiers
@@ -307,29 +369,38 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 			InputPrice:  inputPrice,
 			OutputPrice: outputPrice,
 		}
-		// 注入阶梯缓存价格（隐式命中价 = 输入价 × 0.2）
-		if inputPrice > 0 {
+		// 仅 Token 计费单位注入阶梯缓存价（按张/按秒等不支持缓存）
+		if tierUnit == PricingUnitPerMillionTokens && inputPrice > 0 {
 			tier.CacheInputPrice = inputPrice * 0.20
 			tier.CacheWritePrice = inputPrice * 1.25
 		}
-		// 尝试从 price_range 解析 token 范围
-		parseTierRange(tierName, &tier)
+		// 尝试从 price_range 解析 token 范围（Token 单位才有意义）
+		if tierUnit == PricingUnitPerMillionTokens {
+			parseTierRange(tierName, &tier)
+		}
 		sm.PriceTiers = append(sm.PriceTiers, tier)
 	}
 
-	// 跳过没有 token 价格的模型（如纯图片/视频模型）
-	if sm.InputPrice == 0 && sm.OutputPrice == 0 {
+	// 3. 无任何价格 → 跳过
+	if !hasAnyPrice {
 		return nil
 	}
 
-	// 阿里云百炼支持 both 模式缓存（隐式 auto + 显式 explicit 互斥）
-	// 隐式缓存命中价 = 输入价 × 0.20（节省 80%，自动触发，无写入费）
-	// 显式缓存命中价 = 输入价 × 0.10（节省 90%，需 cache_control 参数）
-	// 显式缓存写入价 = 输入价 × 1.25（写入时收取溢价）
-	if sm.InputPrice > 0 {
+	// 4. 计费单位兜底（基于模型类型）
+	if sm.PricingUnit == "" {
+		sm.PricingUnit = inferPricingUnitFromName(sm.ModelName, sm.ModelType)
+	}
+
+	// 5. 缓存定价：仅 LLM/VLM 启用 both 模式（Embedding/Image/Video/TTS/ASR/Rerank 不支持）
+	// 阿里云百炼缓存规则（2026-04）：
+	//   - 隐式 auto：输入价 × 0.20（节省 80%，自动触发，无写入费，最小 1024 Token）
+	//   - 显式 explicit：输入价 × 0.10（节省 90%，需 cache_control 参数）
+	//   - 显式写入：输入价 × 1.25（首次写入溢价）
+	if (sm.ModelType == "LLM" || sm.ModelType == "VLM" || sm.ModelType == "Vision") &&
+		sm.PricingUnit == PricingUnitPerMillionTokens && sm.InputPrice > 0 {
 		sm.SupportsCache = true
 		sm.CacheMechanism = "both"
-		sm.CacheMinTokens = 1024 // 显式缓存最小 Token 门槛
+		sm.CacheMinTokens = 1024
 		sm.CacheInputPrice = sm.InputPrice * 0.20
 		sm.CacheExplicitInputPrice = sm.InputPrice * 0.10
 		sm.CacheWritePrice = sm.InputPrice * 1.25
@@ -338,58 +409,168 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 	return &sm
 }
 
-// parseTierRange 从价格区间描述解析 token 范围
-// 支持中文和英文格式:
-//   中文: "输入<=256k", "128k<输入<=256k", "256k<输入<=1m"
-//   英文: "input<=128k", "128k<input<=256k"
+// inferAlibabaModelType 推断阿里云模型的类型
+// 优先级：Capabilities → 模型名关键字 → 默认 LLM
+func inferAlibabaModelType(modelName string, capabilities []string) string {
+	name := strings.ToLower(modelName)
+
+	// 1. 通过 capabilities 标签判断（阿里云 API 返回如 ["TG","Reasoning"]）
+	for _, c := range capabilities {
+		switch strings.ToUpper(c) {
+		case "IMAGE_GENERATION", "T2I", "I2I":
+			return "ImageGeneration"
+		case "VIDEO_GENERATION", "T2V", "I2V":
+			return "VideoGeneration"
+		case "EMBEDDING", "TEXT_EMBEDDING":
+			return "Embedding"
+		case "TTS", "SPEECH_SYNTHESIS":
+			return "TTS"
+		case "ASR", "SPEECH_RECOGNITION":
+			return "ASR"
+		case "RERANK", "RERANKING":
+			return "Rerank"
+		}
+	}
+
+	// 2. 按模型名推断（与 modeldiscovery / scraper_service 保持一致）
+	// 注意检查顺序：video 必须先于 image（"-t2v" 优先于 "wan2"），
+	// 否则 "wan2.7-t2v" 会被 "wan2" 吞成 ImageGeneration
+	switch {
+	case containsAnyStr(name, "-t2v", "video", "wanx-video", "wanx-t2v"):
+		return "VideoGeneration"
+	case containsAnyStr(name, "-t2i", "image", "wanx-t2i", "wanx2", "wan2", "qwen-image"):
+		return "ImageGeneration"
+	case containsAnyStr(name, "embedding", "text-embedding", "gte-"):
+		if strings.Contains(name, "gte-rerank") {
+			return "Rerank"
+		}
+		return "Embedding"
+	case containsAnyStr(name, "rerank"):
+		return "Rerank"
+	case containsAnyStr(name, "tts", "cosyvoice", "qwen-tts", "qwen3-tts", "speech-synthesis"):
+		return "TTS"
+	case containsAnyStr(name, "asr", "paraformer", "qwen-asr", "qwen3-asr", "sensevoice", "fun-asr"):
+		return "ASR"
+	case containsAnyStr(name, "vl", "qvq", "omni", "-mm", "multimodal"):
+		return "VLM"
+	default:
+		return "LLM"
+	}
+}
+
+// parseTierRange 从价格区间描述解析 token 范围，写入 tier 的 InputMin/InputMax 字段。
+// 支持格式（中英文混合）：
+//   "输入<=256k"           → (0, 256k]
+//   "128k<输入<=256k"      → (128k, 256k]
+//   "256k<输入<=1m"        → (256k, 1m]
+//   "输入>128k"            → (128k, +∞)
+//   "input<=128k"          → (0, 128k]
+//   "128k<input<=256k"     → (128k, 256k]
+//   "上下文<=32k"          → 同 "输入<=32k"
+//   "32k tokens"           → 仅含数字（宽松解析，作上限）
 func parseTierRange(rangeStr string, tier *model.PriceTier) {
-	// 统一处理：将中文"输入"替换为"input"，方便后续统一解析
+	// 统一替换中文关键字为英文占位符
 	normalized := strings.ToLower(rangeStr)
+	normalized = strings.ReplaceAll(normalized, "输入token数", "input")
+	normalized = strings.ReplaceAll(normalized, "输入tokens", "input")
+	normalized = strings.ReplaceAll(normalized, "输入token", "input")
+	normalized = strings.ReplaceAll(normalized, "上下文长度", "input")
+	normalized = strings.ReplaceAll(normalized, "上下文", "input")
 	normalized = strings.ReplaceAll(normalized, "输入", "input")
 	normalized = strings.ReplaceAll(normalized, "输出", "output")
+	normalized = strings.ReplaceAll(normalized, "tokens", "")
+	normalized = strings.ReplaceAll(normalized, "token", "")
+	normalized = strings.TrimSpace(normalized)
 
 	parseTokenCount := func(s string) int64 {
 		s = strings.TrimSpace(s)
 		s = strings.ReplaceAll(s, ",", "")
+		s = strings.ReplaceAll(s, " ", "")
 		multiplier := int64(1)
-		if strings.HasSuffix(s, "k") {
-			multiplier = 1000
-			s = strings.TrimSuffix(s, "k")
-		} else if strings.HasSuffix(s, "m") {
-			multiplier = 1000000
+		switch {
+		case strings.HasSuffix(s, "b"): // billion
+			multiplier = 1_000_000_000
+			s = strings.TrimSuffix(s, "b")
+		case strings.HasSuffix(s, "m"):
+			multiplier = 1_000_000
 			s = strings.TrimSuffix(s, "m")
+		case strings.HasSuffix(s, "k"):
+			multiplier = 1_000
+			s = strings.TrimSuffix(s, "k")
 		}
 		val, err := strconv.ParseFloat(s, 64)
-		if err != nil {
+		if err != nil || val < 0 {
 			return 0
 		}
-		return int64(val) * multiplier
+		return int64(val * float64(multiplier))
 	}
 
-	// 匹配 "NNk<input<=NNk" 格式（有下限和上限）
+	ptr := func(v int64) *int64 { return &v }
+
+	// 情况1: "NNk<input<=NNk" 或 "NNk<input<NNk"（有下限和上限）
 	if idx := strings.Index(normalized, "<input"); idx > 0 {
-		// 提取下限
-		minStr := normalized[:idx]
-		tier.MinTokens = parseTokenCount(minStr)
-		// 提取上限
-		if idx2 := strings.Index(normalized, "<="); idx2 > idx {
-			maxStr := normalized[idx2+2:]
-			maxVal := parseTokenCount(maxStr)
+		minStr := strings.TrimSpace(normalized[:idx])
+		minVal := parseTokenCount(minStr)
+		tier.InputMin = minVal
+		tier.InputMinExclusive = true
+		// 提取上限：<= 或 <
+		rest := normalized[idx+len("<input"):]
+		if strings.HasPrefix(rest, "<=") {
+			maxVal := parseTokenCount(rest[2:])
 			if maxVal > 0 {
-				tier.MaxTokens = &maxVal
+				tier.InputMax = ptr(maxVal)
+			}
+		} else if strings.HasPrefix(rest, "<") {
+			maxVal := parseTokenCount(rest[1:])
+			if maxVal > 0 {
+				tier.InputMax = ptr(maxVal)
+				tier.InputMaxExclusive = true
+			}
+		}
+		tier.MinTokens = tier.InputMin // 同步旧字段
+		tier.MaxTokens = tier.InputMax
+		return
+	}
+
+	// 情况2: "input<=NNk" 或 "input<NNk"（只有上限）
+	if strings.HasPrefix(normalized, "input") {
+		rest := strings.TrimPrefix(normalized, "input")
+		rest = strings.TrimSpace(rest)
+		if strings.HasPrefix(rest, "<=") {
+			maxVal := parseTokenCount(rest[2:])
+			if maxVal > 0 {
+				tier.InputMax = ptr(maxVal)
+				tier.MaxTokens = tier.InputMax
+			}
+		} else if strings.HasPrefix(rest, "<") {
+			maxVal := parseTokenCount(rest[1:])
+			if maxVal > 0 {
+				tier.InputMax = ptr(maxVal)
+				tier.InputMaxExclusive = true
+				tier.MaxTokens = tier.InputMax
+			}
+		} else if strings.HasPrefix(rest, ">") {
+			// "input>NNk" → 下界（开区间）
+			minVal := parseTokenCount(strings.TrimPrefix(rest, ">"))
+			if minVal > 0 {
+				tier.InputMin = minVal
+				tier.InputMinExclusive = true
+				tier.MinTokens = minVal
+			}
+		} else if strings.HasPrefix(rest, ">=") {
+			minVal := parseTokenCount(strings.TrimPrefix(rest, ">="))
+			if minVal > 0 {
+				tier.InputMin = minVal
+				tier.MinTokens = minVal
 			}
 		}
 		return
 	}
 
-	// 匹配 "input<=NNk" 格式（只有上限）
-	if strings.Contains(normalized, "input") && strings.Contains(normalized, "<=") {
-		parts := strings.SplitN(normalized, "<=", 2)
-		if len(parts) == 2 {
-			maxVal := parseTokenCount(parts[1])
-			if maxVal > 0 {
-				tier.MaxTokens = &maxVal
-			}
-		}
+	// 情况3: "NNk<=" 或 "NNk<" + "input" 位于后方（已在情况1处理，此处处理简化形式）
+	// 宽松回退：只有数字，视为上限
+	if v := parseTokenCount(normalized); v > 0 {
+		tier.InputMax = ptr(v)
+		tier.MaxTokens = tier.InputMax
 	}
 }

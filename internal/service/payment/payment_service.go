@@ -22,6 +22,11 @@ type PaymentService struct {
 	gateways       map[string]PaymentGateway
 	logger         *zap.Logger
 	exchangeSvc    *ExchangeService
+
+	// v3.2 新增：可选注入
+	accountRouter   *AccountRouter
+	eventLogger     *EventLogger
+	exchangeFetcher UsdToCnyFetcher
 }
 
 // NewPaymentService 创建支付服务实例，注册所有已配置的支付网关
@@ -173,10 +178,30 @@ func (s *PaymentService) HandleCallback(ctx context.Context, gateway string, dat
 		return fmt.Errorf("unsupported gateway: %s", gateway)
 	}
 
-	// 验证回调签名
-	result, err := gw.VerifyCallback(ctx, data, headers)
+	// v3.2: 开发/测试旁路 — PAYMENT_CALLBACK_DEV_BYPASS=true 时跳过验签直接解析
+	// 仅在沙箱/测试环境使用；生产必须保持关闭
+	var result *CallbackResult
+	var err error
+	if IsCallbackDevBypassEnabled() {
+		s.logger.Warn("callback dev bypass enabled — signature verification SKIPPED",
+			zap.String("gateway", gateway))
+		result, err = BypassVerifyCallback(ctx, gateway, data)
+	} else {
+		result, err = gw.VerifyCallback(ctx, data, headers)
+	}
 	if err != nil {
 		s.logger.Error("callback verification failed", zap.String("gateway", gateway), zap.Error(err))
+		// 事件日志：callback_failed
+		if s.eventLogger != nil {
+			s.eventLogger.Log(ctx, PaymentEvent{
+				EventType: model.EventPaymentCallbackFailed,
+				ActorType: model.ActorGateway,
+				Gateway:   gateway,
+				Payload:   json.RawMessage(data),
+				Success:   false,
+				Err:       err,
+			})
+		}
 		return fmt.Errorf("verify callback: %w", err)
 	}
 
@@ -193,6 +218,30 @@ func (s *PaymentService) HandleCallback(ctx context.Context, gateway string, dat
 	var payment model.Payment
 	if err := s.db.WithContext(ctx).First(&payment, paymentID).Error; err != nil {
 		return fmt.Errorf("load payment: %w", err)
+	}
+
+	// 事件日志：callback_received + callback_verified
+	if s.eventLogger != nil {
+		pid := uint64(payment.ID)
+		s.eventLogger.Log(ctx, PaymentEvent{
+			PaymentID: &pid,
+			OrderNo:   result.OrderNo,
+			EventType: model.EventPaymentCallbackRecv,
+			ActorType: model.ActorGateway,
+			Gateway:   gateway,
+			Payload:   json.RawMessage(data),
+			Result:    result,
+			Success:   true,
+		})
+		s.eventLogger.Log(ctx, PaymentEvent{
+			PaymentID: &pid,
+			OrderNo:   result.OrderNo,
+			EventType: model.EventPaymentCallbackVerify,
+			ActorType: model.ActorSystem,
+			Gateway:   gateway,
+			Result:    result,
+			Success:   true,
+		})
 	}
 
 	// 幂等校验：已处于终态则跳过
@@ -228,12 +277,35 @@ func (s *PaymentService) HandleCallback(ctx context.Context, gateway string, dat
 
 	// 支付成功则充值用户积分
 	if newStatus == "completed" {
-		if err := s.creditUserBalance(ctx, payment.UserID, payment.CreditAmount); err != nil {
+		creditErr := s.creditUserBalance(ctx, payment.UserID, payment.TenantID, payment.CreditAmount, result.OrderNo, gateway)
+		if creditErr != nil {
 			s.logger.Error("credit user balance failed",
 				zap.Uint("user_id", payment.UserID),
 				zap.Int64("credits", payment.CreditAmount),
-				zap.Error(err))
+				zap.Error(creditErr))
 			// 不返回错误；支付已标记为完成，由对账任务处理差异
+		}
+		// 事件日志：credited
+		if s.eventLogger != nil {
+			pid := uint64(payment.ID)
+			evtType := model.EventPaymentCredited
+			if creditErr != nil {
+				evtType = model.EventPaymentCreditFailed
+			}
+			s.eventLogger.Log(ctx, PaymentEvent{
+				PaymentID: &pid,
+				OrderNo:   result.OrderNo,
+				EventType: evtType,
+				ActorType: model.ActorSystem,
+				Gateway:   gateway,
+				Payload: map[string]interface{}{
+					"credit_amount": payment.CreditAmount,
+					"rmb_amount":    payment.RMBAmount,
+					"user_id":       payment.UserID,
+				},
+				Success: creditErr == nil,
+				Err:     creditErr,
+			})
 		}
 
 		// 发布支付成功事件
@@ -372,35 +444,90 @@ func (s *PaymentService) findPaymentIDByOrderNo(ctx context.Context, orderNo str
 }
 
 // creditUserBalance 将支付金额充入用户积分余额
-// 直接调用 BalanceService.Recharge
-func (s *PaymentService) creditUserBalance(ctx context.Context, userID uint, creditAmount int64) error {
-	// 查询用户的租户ID
-	var user model.User
-	if err := s.db.WithContext(ctx).First(&user, userID).Error; err != nil {
-		return fmt.Errorf("user not found: %w", err)
+// 关键改动（2026-04-18）：
+//   - 改为事务内行级锁（SELECT FOR UPDATE）保证并发安全
+//   - 同步写入 balance_records 流水（type=RECHARGE, related_id=order_no），
+//     补齐之前直接 Save() 导致的审计断流
+//   - 失败回滚（积分入账与流水原子性）
+//   - 入账后清理 BalanceService 的 Redis 缓存（key: balance:{userID}）
+func (s *PaymentService) creditUserBalance(ctx context.Context, userID, tenantID uint, creditAmount int64, orderNo, gateway string) error {
+	if creditAmount <= 0 {
+		return fmt.Errorf("invalid credit amount: %d", creditAmount)
 	}
 
-	// 更新 user_balances 表
-	var ub model.UserBalance
-	if err := s.db.WithContext(ctx).Where("user_id = ?", userID).First(&ub).Error; err != nil {
+	// 兜底拿 tenantID（理论上 payment 表已记录，这里防御）
+	if tenantID == 0 {
+		var user model.User
+		if err := s.db.WithContext(ctx).First(&user, userID).Error; err != nil {
+			return fmt.Errorf("user not found: %w", err)
+		}
+		tenantID = user.TenantID
+	}
+
+	amountRMB := credits.CreditsToRMB(creditAmount)
+	remark := fmt.Sprintf("支付充值 [%s] %s", gateway, orderNo)
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 行级锁：与扣减/退款互斥，防并发覆盖
+		var ub model.UserBalance
+		err := tx.Set("gorm:query_option", "FOR UPDATE").
+			Where("user_id = ?", userID).First(&ub).Error
 		if err == gorm.ErrRecordNotFound {
-			// 创建余额记录
 			ub = model.UserBalance{
 				UserID:   userID,
-				TenantID: user.TenantID,
-				Balance:  creditAmount,
-				BalanceRMB: credits.CreditsToRMB(creditAmount),
+				TenantID: tenantID,
 				Currency: "CREDIT",
 			}
-			return s.db.WithContext(ctx).Create(&ub).Error
+			if err := tx.Create(&ub).Error; err != nil {
+				return fmt.Errorf("create balance: %w", err)
+			}
+			// 重新加锁
+			if err := tx.Set("gorm:query_option", "FOR UPDATE").
+				Where("user_id = ?", userID).First(&ub).Error; err != nil {
+				return fmt.Errorf("lock balance: %w", err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("lock balance: %w", err)
 		}
+
+		before := ub.Balance
+		ub.Balance += creditAmount
+		ub.BalanceRMB = credits.CreditsToRMB(ub.Balance)
+		ub.FreeQuotaRMB = credits.CreditsToRMB(ub.FreeQuota)
+
+		if err := tx.Save(&ub).Error; err != nil {
+			return fmt.Errorf("update balance: %w", err)
+		}
+
+		// 写入流水：补齐审计断流
+		record := &model.BalanceRecord{
+			UserID:        userID,
+			TenantID:      tenantID,
+			Type:          "RECHARGE",
+			Amount:        creditAmount,
+			AmountRMB:     amountRMB,
+			BeforeBalance: before,
+			AfterBalance:  ub.Balance,
+			Remark:        remark,
+			RelatedID:     orderNo,
+		}
+		return tx.Create(record).Error
+	})
+
+	if err != nil {
 		return err
 	}
 
-	// 增加积分余额
-	ub.Balance += creditAmount
-	ub.BalanceRMB = credits.CreditsToRMB(ub.Balance)
-	return s.db.WithContext(ctx).Save(&ub).Error
+	// 清理 BalanceService 的 Redis 缓存（key 与 BalanceService.GetBalanceCached 对齐）
+	if s.redis != nil {
+		_ = s.redis.Del(ctx, fmt.Sprintf("balance:%d", userID)).Err()
+	}
+	return nil
+}
+
+// CreditUserFromMock 管理员 Mock 回调专用：直接为用户添加积分（沙箱场景）
+func (s *PaymentService) CreditUserFromMock(ctx context.Context, userID, tenantID uint, creditAmount int64, orderNo string) error {
+	return s.creditUserBalance(ctx, userID, tenantID, creditAmount, orderNo, "mock")
 }
 
 // recordAuditLog 记录支付操作的审计日志

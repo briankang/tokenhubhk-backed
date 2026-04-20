@@ -1,0 +1,10 @@
+{
+  "_description": "cmapi00064402 (jmhlcx) 主接口成功响应 — POST /exchange-rate/convert with fromCode=USD&toCode=CNY&money=1",
+  "data": {
+    "money": "6.8095"
+  },
+  "msg": "成功",
+  "success": true,
+  "code": 200,
+  "taskNo": "507706989209647401353906"
+}

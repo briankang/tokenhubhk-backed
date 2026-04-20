@@ -1,0 +1,86 @@
+# 供应商官方定价基准（人工维护，每季度更新）
+#
+# last_verified: 2026-04-19
+# sources:
+#   - 阿里云百炼: https://help.aliyun.com/zh/model-studio/model-pricing
+#   - 火山引擎:   https://www.volcengine.com/docs/82379/1544106 + 1544681
+#   - 百度千帆:   https://cloud.baidu.com/doc/qianfan-docs/s/Jm8r1826a
+#   - 腾讯混元:   https://cloud.tencent.com/document/product/1729/97731 + 105925
+#
+# 字段说明：
+#   input/output  —— 官方原价（元/百万 tokens；对图片/视频/音频按各自单位）
+#   unit          —— pricing_unit（per_million_tokens / per_image / per_second / per_10k_characters / per_hour）
+#   model_type    —— LLM / VLM / Vision / Embedding / ImageGeneration / VideoGeneration / TTS / ASR / Rerank
+#   tier_count    —— 期望的阶梯数量（主力 LLM 通常 2-3 档，单阶梯模型省略）
+#   cache_mech    —— 缓存机制（both / auto / explicit / none）
+#   free: true    —— 免费模型，input/output 应为 0
+
+aliyun:
+  qwen-max:
+    input: 2.4
+    output: 9.6
+    cache_mech: both
+  qwen3-max:
+    input: 2.5
+    output: 10
+    tier_count: 2
+    cache_mech: both
+  qwen-plus:
+    input: 0.8
+    tier_count: 2
+    cache_mech: both
+  qwen-vl-max:
+    input: 1.6
+    output: 4
+    cache_mech: both
+  qwen3-vl-plus:
+    input: 1.0
+    tier_count: 2
+  qwen-image-2.0-pro:
+    input: 0.5
+    unit: per_image
+    model_type: ImageGeneration
+  qwen-image-2.0:
+    input: 0.2
+    unit: per_image
+    model_type: ImageGeneration
+  # TTS / ASR 的 unit 校验（不校验精确价格，因为 paraformer 价格是小数点后 5 位）
+  cosyvoice-v3.5-plus:
+    unit: per_10k_characters
+    model_type: TTS
+  paraformer-v2:
+    unit: per_second
+    model_type: ASR
+
+volcengine:
+  # 注意：火山 API 返回的 ID 格式为 doubao-1-5-pro-32k-250115（连字符替代点号）
+  # 此处仅校验基础字段；阶梯验证通过独立的 tier 测试覆盖
+  doubao-1-5-lite-32k-250115:
+    cache_mech: auto
+    tier_count: 1  # 最简档
+  doubao-seed-2-0-pro:
+    cache_mech: auto
+
+qianfan:
+  ernie-5.0:
+    input: 6
+    output: 24
+    tier_count: 2
+    cache_mech: both
+  ernie-3.5-128k:
+    input: 0.8
+    output: 2
+    tier_count: 2
+    cache_mech: both
+
+hunyuan:
+  # 混元官方无缓存 SKU，所有模型 cache_mech=none
+  hunyuan-turbos-latest:
+    cache_mech: none
+  hunyuan-pro:
+    cache_mech: none
+  hunyuan-t1-latest:
+    cache_mech: none
+  hunyuan-embedding:
+    cache_mech: none
+    model_type: Embedding

@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -38,6 +39,8 @@ type createSupplierReq struct {
 	OutputPricePerM float64 `json:"output_price_per_m"`                                   // 输出tokens官网价格（每百万tokens）
 	Discount        float64 `json:"discount"`                                             // 折扣比例
 	Status          string  `json:"status"`                                               // 状态: active / inactive / maintenance
+	PricingURL      string  `json:"pricing_url"`                                          // 官方定价文档 URL（v3.5）
+	PricingURLs     []model.PricingURLEntry `json:"pricing_urls,omitempty"`                 // 多页定价配置（v3.5）
 }
 
 // updateSupplierReq 更新供应商请求体
@@ -52,7 +55,9 @@ type updateSupplierReq struct {
 	InputPricePerM  *float64 `json:"input_price_per_m"`
 	OutputPricePerM *float64 `json:"output_price_per_m"`
 	Discount        *float64 `json:"discount"`
-	Status          string  `json:"status" binding:"omitempty,oneof=active inactive maintenance"`
+	Status          string   `json:"status" binding:"omitempty,oneof=active inactive maintenance"`
+	PricingURL      *string                   `json:"pricing_url"`                 // 官方定价文档 URL（v3.5，可置空串清除）
+	PricingURLs     []model.PricingURLEntry   `json:"pricing_urls,omitempty"`      // 多页定价配置（v3.5）
 }
 
 // List handles GET /api/v1/admin/suppliers
@@ -93,6 +98,14 @@ func (h *SupplierHandler) Create(c *gin.Context) {
 		OutputPricePerM: req.OutputPricePerM,
 		Discount:        req.Discount,
 		Status:          req.Status,
+		PricingURL:      req.PricingURL,
+	}
+
+	// PricingURLs 多页定价配置 → JSON 序列化
+	if len(req.PricingURLs) > 0 {
+		if b, err := json.Marshal(req.PricingURLs); err == nil {
+			supplier.PricingURLs = model.JSON(b)
+		}
 	}
 
 	// 设置默认值
@@ -179,6 +192,15 @@ func (h *SupplierHandler) Update(c *gin.Context) {
 	}
 	if req.Status != "" {
 		updates["status"] = req.Status
+	}
+	if req.PricingURL != nil {
+		// 允许置空串清除（不同于省略该字段）
+		updates["pricing_url"] = *req.PricingURL
+	}
+	if req.PricingURLs != nil {
+		if b, err := json.Marshal(req.PricingURLs); err == nil {
+			updates["pricing_urls"] = model.JSON(b)
+		}
 	}
 
 	if err := h.svc.Update(c.Request.Context(), uint(id), updates); err != nil {

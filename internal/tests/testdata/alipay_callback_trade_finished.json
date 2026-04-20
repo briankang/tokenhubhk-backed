@@ -1,0 +1,21 @@
+{
+  "_description": "支付宝 TRADE_FINISHED 异步通知（订单已完结，不可退款状态，常在退款完成后触发）",
+  "charset": "utf-8",
+  "gmt_create": "2026-04-17 03:17:00",
+  "gmt_payment": "2026-04-17 03:17:05",
+  "notify_time": "2026-04-17 03:17:06",
+  "subject": "账户充值 ¥50",
+  "sign": "MOCK_RSA2_SIGNATURE_PLACEHOLDER_finished",
+  "invoice_amount": "50.00",
+  "version": "1.0",
+  "notify_id": "2026041700222220340000008",
+  "notify_type": "trade_status_sync",
+  "out_trade_no": "ORD-2026041703170008",
+  "total_amount": "50.00",
+  "trade_status": "TRADE_FINISHED",
+  "trade_no": "2026041722001417980510000008",
+  "auth_app_id": "2021000000000000",
+  "app_id": "2021000000000000",
+  "sign_type": "RSA2",
+  "seller_id": "2088000000000000"
+}

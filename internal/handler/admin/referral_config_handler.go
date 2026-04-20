@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"tokenhub-server/internal/middleware"
+	auditmw "tokenhub-server/internal/middleware/audit"
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 	"tokenhub-server/internal/service/referral"
@@ -46,6 +47,9 @@ func (h *ReferralConfigHandler) UpdateConfig(c *gin.Context) {
 		response.Error(c, http.StatusInternalServerError, errcode.ErrInternal)
 		return
 	}
+
+	// 审计日志：记录修改前的旧值（中间件会写入 audit_logs.old_value）
+	auditmw.SetOldValue(c, cfg)
 
 	var req struct {
 		// v3.1 核心字段

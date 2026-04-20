@@ -1,0 +1,26 @@
+{
+  "_description": "PayPal V2 Capture API — PAYMENT.CAPTURE.COMPLETED（2024+ 主流格式，resource.custom_id 含业务订单号）",
+  "id": "WH-CAPTURE-2X571456732412346",
+  "event_version": "1.0",
+  "create_time": "2026-04-17T03:17:00.000Z",
+  "resource_type": "capture",
+  "event_type": "PAYMENT.CAPTURE.COMPLETED",
+  "summary": "Payment capture completed for $100.00 USD",
+  "resource": {
+    "id": "5XE89203BZ563460W",
+    "status": "COMPLETED",
+    "custom_id": "ORD-2026041703170006",
+    "invoice_id": "INV-2026041703170006",
+    "amount": {
+      "value": "100.00",
+      "currency_code": "USD"
+    },
+    "final_capture": true,
+    "seller_protection": {
+      "status": "ELIGIBLE"
+    },
+    "create_time": "2026-04-17T03:16:00Z",
+    "update_time": "2026-04-17T03:17:00Z"
+  },
+  "links": []
+}

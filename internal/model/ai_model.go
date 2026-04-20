@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // PricingUnit 计费单位常量
 // 8 种计费单位覆盖 LLM、图像、视频、语音合成、语音识别、Embedding、Rerank 等 AI 模型类别
@@ -72,6 +75,7 @@ type AIModel struct {
 	Variant          string `gorm:"type:varchar(50);default:''" json:"variant,omitempty"`      // 变体/质量档（如 1024x1024、hd、low-latency），同一模型不同 variant 独立定价
 	PriceTiers       JSON   `gorm:"type:json" json:"price_tiers,omitempty"`                    // 阶梯价格配置（供应商原始数据，JSON 格式的 PriceTiersData）
 	ExtraParams      JSON   `gorm:"type:json" json:"extra_params,omitempty"`                  // 自定义参数（传递给上游供应商的额外参数，如 enable_thinking）
+	VideoPricingConfig JSON `gorm:"type:json" json:"video_pricing_config,omitempty"`          // 视频生成模型特殊计价配置（仅 VideoGeneration 类型使用，JSON 格式的 VideoPricingConfig）
 
 	// --- 缓存定价字段 ---
 	// cache_mechanism: 缓存机制类型
@@ -98,4 +102,21 @@ type AIModel struct {
 // TableName 指定 AI 模型表名
 func (AIModel) TableName() string {
 	return "ai_models"
+}
+
+// RequiresStream 返回该模型是否要求强制流式（如 MiniMax Pro 系列）
+func (m *AIModel) RequiresStream() bool {
+	if len(m.Features) == 0 {
+		return false
+	}
+	var feats map[string]interface{}
+	if err := json.Unmarshal([]byte(m.Features), &feats); err != nil {
+		return false
+	}
+	v, ok := feats["requires_stream"]
+	if !ok {
+		return false
+	}
+	b, isBool := v.(bool)
+	return isBool && b
 }

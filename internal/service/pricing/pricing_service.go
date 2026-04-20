@@ -3,6 +3,7 @@ package pricing
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"gorm.io/gorm"
 
@@ -58,6 +59,8 @@ func (s *PricingService) SetModelPricing(ctx context.Context, pricing *model.Mod
 	}
 
 	s.calculator.InvalidateCache(ctx, pricing.ModelID, nil)
+	// 配置售价后自动恢复被 NeedsSellPrice 标签禁用的模型
+	s.autoEnableIfNeedsSellPrice(ctx, pricing.ModelID)
 	return nil
 }
 
@@ -129,6 +132,8 @@ func (s *PricingService) UpdateModelPricing(ctx context.Context, id uint, pricin
 	}
 
 	s.calculator.InvalidateCache(ctx, existing.ModelID, nil)
+	// 更新售价后同样自动恢复被 NeedsSellPrice 标签禁用的模型
+	s.autoEnableIfNeedsSellPrice(ctx, existing.ModelID)
 	return nil
 }
 
@@ -149,6 +154,37 @@ func (s *PricingService) DeleteModelPricing(ctx context.Context, id uint) error 
 	}
 	s.calculator.InvalidateCache(ctx, existing.ModelID, nil)
 	return nil
+}
+
+// autoEnableIfNeedsSellPrice 若模型因未配置售价（NeedsSellPrice 标签）而被停用，
+// 在售价配置完成后自动恢复 is_active=true 并移除该标签。
+// 仅影响因缺少售价被禁用的模型，不会影响因其他原因（能力测试失败、管理员手动禁用）停用的模型。
+func (s *PricingService) autoEnableIfNeedsSellPrice(ctx context.Context, modelID uint) {
+	var m model.AIModel
+	if err := s.db.WithContext(ctx).Select("id, is_active, tags").First(&m, modelID).Error; err != nil {
+		return
+	}
+	if m.IsActive || !strings.Contains(m.Tags, "NeedsSellPrice") {
+		return
+	}
+	newTags := removePricingTag(m.Tags, "NeedsSellPrice")
+	s.db.WithContext(ctx).Table("ai_models").Where("id = ?", modelID).
+		Updates(map[string]interface{}{"is_active": true, "tags": newTags})
+}
+
+// removePricingTag 从逗号分隔的标签字符串中移除指定标签
+func removePricingTag(tags, tag string) string {
+	if tags == "" {
+		return ""
+	}
+	parts := strings.Split(tags, ",")
+	result := parts[:0]
+	for _, t := range parts {
+		if strings.TrimSpace(t) != tag {
+			result = append(result, t)
+		}
+	}
+	return strings.Join(result, ",")
 }
 
 // ---- AgentLevelDiscount CRUD ----

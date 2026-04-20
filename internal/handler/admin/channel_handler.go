@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	auditmw "tokenhub-server/internal/middleware/audit"
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
@@ -144,10 +145,22 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 		return
 	}
 
+	// 审计：记录修改前的渠道快照
+	if old, gerr := h.svc.GetByID(c.Request.Context(), uint(id)); gerr == nil && old != nil {
+		auditmw.SetOldValue(c, old)
+	}
+
 	var updates map[string]interface{}
 	if err := c.ShouldBindJSON(&updates); err != nil {
 		response.Error(c, http.StatusBadRequest, errcode.ErrBadRequest)
 		return
+	}
+	// 空值保护：APIKey 在 GET 响应中被 json:"-" 过滤，前端无法回显；
+	// 若 payload 中 api_key 为空字符串，视为"保留已有 Key"，不覆盖数据库
+	if v, ok := updates["api_key"]; ok {
+		if s, isStr := v.(string); isStr && s == "" {
+			delete(updates, "api_key")
+		}
 	}
 
 	if err := h.svc.Update(c.Request.Context(), uint(id), updates); err != nil {

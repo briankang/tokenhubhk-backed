@@ -1,0 +1,24 @@
+{
+  "_description": "cmapi00063890 (smkjzgyhss) 备用接口成功响应 — GET /exchange_rate/realtime?code=USD（中国银行实时汇率，100 外币折算人民币）",
+  "msg": "成功",
+  "success": true,
+  "code": 200,
+  "data": {
+    "orderNo": "8av7htyysf4hzutnf2",
+    "listSize": 1,
+    "list": [
+      {
+        "hui_in": "680.95",
+        "code": "USD",
+        "zhesuan": "686.22",
+        "hui_out": "683.82",
+        "name": "美元",
+        "chao_out": "683.82",
+        "chao_in": "680.95",
+        "time": "05:30:00",
+        "day": "2026-04-18"
+      }
+    ],
+    "ret_code": "0"
+  }
+}

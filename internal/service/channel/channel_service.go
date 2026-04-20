@@ -130,6 +130,13 @@ func (s *ChannelService) Update(ctx context.Context, id uint, updates map[string
 	delete(updates, "id")
 	delete(updates, "created_at")
 
+	// 移除空的 api_key，防止清空现有值
+	if apiKey, ok := updates["api_key"]; ok {
+		if apiKey == "" {
+			delete(updates, "api_key")
+		}
+	}
+
 	lock, err := pkgredis.Lock(ctx, fmt.Sprintf("channel:update:%d", id), 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("failed to acquire lock: %w", err)

@@ -67,16 +67,20 @@ func (h *PaymentHandler) Create(c *gin.Context) {
 	tenantID, _ := c.Get("tenantId")
 	clientIP := c.ClientIP()
 
-	result, err := h.svc.CreatePayment(
+	// v3.2: 优先走带多账号路由的新路径（内部自动 fallback 到 CreatePayment）
+	result, err := h.svc.CreatePaymentWithRouting(
 		c.Request.Context(),
-		userID.(uint),
-		tenantID.(uint),
-		req.Gateway,
-		req.Amount,
-		req.Currency,
-		req.Subject,
-		req.ReturnURL,
-		clientIP,
+		paymentsvc.CreatePaymentWithRoutingInput{
+			UserID:    userID.(uint),
+			TenantID:  tenantID.(uint),
+			Gateway:   req.Gateway,
+			Amount:    req.Amount,
+			Currency:  req.Currency,
+			Region:    "", // 未来可从 IP 或 Header 推导
+			Subject:   req.Subject,
+			ReturnURL: req.ReturnURL,
+			ClientIP:  clientIP,
+		},
 	)
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrPaymentFailed.Code, err.Error())

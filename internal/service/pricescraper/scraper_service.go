@@ -28,6 +28,11 @@ type Scraper interface {
 	ScrapePrices(ctx context.Context) (*ScrapedPriceData, error)
 }
 
+// KeySetter 可选接口：支持动态注入 API Key（优先于环境变量）
+type KeySetter interface {
+	SetAPIKey(key string)
+}
+
 // ScrapedPriceData 爬取结果
 type ScrapedPriceData struct {
 	SupplierID   uint           `json:"supplier_id"`
@@ -73,6 +78,10 @@ type ScrapedModel struct {
 	CacheExplicitInputPrice    float64 `json:"cache_explicit_input_price"`   // 显式缓存命中价（both模式专用）
 	CacheWritePrice            float64 `json:"cache_write_price"`            // 缓存写入价，元/百万Token
 	CacheStoragePrice          float64 `json:"cache_storage_price"`          // 缓存存储价，元/百万Token/小时
+	CacheSource                string  `json:"cache_source,omitempty"`       // 缓存价来源：scraped（从 HTML 解析）/derived（算法派生）
+
+	// 视频生成模型特殊计价配置（仅 VideoGeneration 使用）
+	VideoPricingConfig *model.VideoPricingConfig `json:"video_pricing_config,omitempty"`
 }
 
 // PriceDiffItem 价格差异项
@@ -101,6 +110,9 @@ type PriceDiffItem struct {
 	CacheExplicitInputPriceRMB float64 `json:"cache_explicit_input_price_rmb,omitempty"`
 	CacheWritePriceRMB         float64 `json:"cache_write_price_rmb,omitempty"`
 	CacheStoragePriceRMB       float64 `json:"cache_storage_price_rmb,omitempty"`
+
+	// 视频生成模型特殊计价配置
+	VideoPricingConfig *model.VideoPricingConfig `json:"video_pricing_config,omitempty"`
 }
 
 // PriceDiffResult 完整差异结果
@@ -136,6 +148,9 @@ type PriceUpdateRequest struct {
 	CacheExplicitInputPriceRMB float64 `json:"cache_explicit_input_price_rmb,omitempty"`
 	CacheWritePriceRMB         float64 `json:"cache_write_price_rmb,omitempty"`
 	CacheStoragePriceRMB       float64 `json:"cache_storage_price_rmb,omitempty"`
+
+	// 视频生成模型特殊计价配置
+	VideoPricingConfig *model.VideoPricingConfig `json:"video_pricing_config,omitempty"`
 }
 
 // ApplyResult 应用价格更新的结果
@@ -214,6 +229,14 @@ func (s *PriceScraperService) ScrapeAndPreview(ctx context.Context, supplierID u
 		return nil, fmt.Errorf("未找到供应商 [%s] 对应的爬虫，当前支持: 火山引擎, 阿里云", supplier.Name)
 	}
 
+	// 从渠道配置注入 API Key（覆盖环境变量，解决未配置环境变量时 401 的问题）
+	if ks, ok := scraper.(KeySetter); ok {
+		if key := s.lookupChannelAPIKey(supplierID); key != "" {
+			ks.SetAPIKey(key)
+			log.Debug("使用渠道配置的 API Key", zap.String("scraper", scraperKey))
+		}
+	}
+
 	log.Info("开始爬取价格",
 		zap.Uint("supplier_id", supplierID),
 		zap.String("supplier_name", supplier.Name),
@@ -225,6 +248,12 @@ func (s *PriceScraperService) ScrapeAndPreview(ctx context.Context, supplierID u
 		return nil, fmt.Errorf("爬取失败: %w", err)
 	}
 	scrapedData.SupplierID = supplierID
+
+	// 3.1 SourceURL 优先级：supplier.pricing_url > 爬虫内置 URL
+	// 管理员在供应商管理页配置的定价 URL 最高优先级，保证入库数据与 UI 展示一致
+	if strings.TrimSpace(supplier.PricingURL) != "" {
+		scrapedData.SourceURL = supplier.PricingURL
+	}
 
 	// 4. 验证价格数据
 	validationErrors := ValidateScrapedData(scrapedData)
@@ -347,39 +376,70 @@ func (s *PriceScraperService) ApplyPrices(ctx context.Context, supplierID uint, 
 					updateFields["variant"] = u.Variant
 				}
 
-				// 更新缓存定价字段（如果有）
-				if u.SupportsCache {
+				// 更新缓存定价字段
+				// v3.5：当 scraper 明确指明不支持缓存时强制清零（修正旧数据）
+				// 规则：仅 LLM/VLM/Vision 且按 per_million_tokens 计费的模型才允许启用缓存
+				cacheEligible := (u.ModelType == "LLM" || u.ModelType == "VLM" || u.ModelType == "Vision") &&
+					(u.PricingUnit == "" || u.PricingUnit == PricingUnitPerMillionTokens)
+
+				if u.SupportsCache && cacheEligible {
 					updateFields["supports_cache"] = true
-				}
-				if u.CacheMechanism != "" {
-					updateFields["cache_mechanism"] = u.CacheMechanism
-				}
-				if u.CacheMinTokens > 0 {
-					updateFields["cache_min_tokens"] = u.CacheMinTokens
-				}
-				if u.CacheInputPriceRMB > 0 {
-					updateFields["cache_input_price_rmb"] = u.CacheInputPriceRMB
-				}
-				if u.CacheExplicitInputPriceRMB > 0 {
-					updateFields["cache_explicit_input_price_rmb"] = u.CacheExplicitInputPriceRMB
-				}
-				if u.CacheWritePriceRMB > 0 {
-					updateFields["cache_write_price_rmb"] = u.CacheWritePriceRMB
-				}
-				if u.CacheStoragePriceRMB > 0 {
-					updateFields["cache_storage_price_rmb"] = u.CacheStoragePriceRMB
+					if u.CacheMechanism != "" {
+						updateFields["cache_mechanism"] = u.CacheMechanism
+					}
+					if u.CacheMinTokens > 0 {
+						updateFields["cache_min_tokens"] = u.CacheMinTokens
+					}
+					if u.CacheInputPriceRMB > 0 {
+						updateFields["cache_input_price_rmb"] = u.CacheInputPriceRMB
+					}
+					if u.CacheExplicitInputPriceRMB > 0 {
+						updateFields["cache_explicit_input_price_rmb"] = u.CacheExplicitInputPriceRMB
+					}
+					if u.CacheWritePriceRMB > 0 {
+						updateFields["cache_write_price_rmb"] = u.CacheWritePriceRMB
+					}
+					if u.CacheStoragePriceRMB > 0 {
+						updateFields["cache_storage_price_rmb"] = u.CacheStoragePriceRMB
+					}
+				} else if !cacheEligible {
+					// 非 LLM/VLM 类型或非 Token 单位 → 强制清零（修正旧 seed 数据）
+					updateFields["supports_cache"] = false
+					updateFields["cache_mechanism"] = "none"
+					updateFields["cache_min_tokens"] = 0
+					updateFields["cache_input_price_rmb"] = 0
+					updateFields["cache_explicit_input_price_rmb"] = 0
+					updateFields["cache_write_price_rmb"] = 0
+					updateFields["cache_storage_price_rmb"] = 0
 				}
 
-				// 更新阶梯价格（如果有）
-			if len(u.PriceTiers) > 0 {
+				// 更新阶梯价格（有显式阶梯用原值；无则注入默认阶梯兜底）
+			tiersToWrite := u.PriceTiers
+			if len(tiersToWrite) == 0 && (u.InputCostRMB > 0 || u.OutputCostRMB > 0) {
+				tiersToWrite = []model.PriceTier{model.DefaultTier(u.InputCostRMB, u.OutputCostRMB)}
+			}
+			if len(tiersToWrite) > 0 {
+				// 归一化 + 排序
+				for i := range tiersToWrite {
+					tiersToWrite[i].Normalize()
+				}
+				model.SortTiers(tiersToWrite)
 				tiersData := model.PriceTiersData{
-					Tiers:     u.PriceTiers,
+					Tiers:     tiersToWrite,
 					Currency:  "CNY",
 					UpdatedAt: time.Now(),
 				}
 				tiersJSON, err := json.Marshal(tiersData)
 				if err == nil {
 					updateFields["price_tiers"] = tiersJSON
+				}
+			}
+
+			// 更新视频定价配置（如果有）
+			if u.VideoPricingConfig != nil {
+				vcJSON, err := json.Marshal(u.VideoPricingConfig)
+				if err == nil {
+					updateFields["video_pricing_config"] = vcJSON
 				}
 			}
 
@@ -469,6 +529,19 @@ func (s *PriceScraperService) GetSyncLogs(ctx context.Context, supplierID uint, 
 	return logs, total, nil
 }
 
+// lookupChannelAPIKey 查询供应商下状态为 active 且 api_key 非空的渠道，返回第一个 API Key
+// 用于在爬取前动态注入渠道配置的密钥，替代环境变量方式
+func (s *PriceScraperService) lookupChannelAPIKey(supplierID uint) string {
+	var ch model.Channel
+	err := s.db.Select("api_key").
+		Where("supplier_id = ? AND status = 'active' AND api_key != ''", supplierID).
+		Order("id ASC").First(&ch).Error
+	if err != nil {
+		return ""
+	}
+	return ch.APIKey
+}
+
 // =====================================================
 // 内部辅助方法
 // =====================================================
@@ -544,8 +617,54 @@ func (s *PriceScraperService) buildDiffResult(supplier model.Supplier, scraped *
 	// 异常检测阈值（50%）
 	anomalyThreshold := 0.5
 
+	// 两阶段匹配：
+	// 阶段 1 — 精确匹配占位：被精确命中的 DB 模型放入 usedIDs，避免后续泛型 fan-out 重复覆盖
+	// 阶段 2 — 泛型前缀 fan-out：一条泛型爬取项（如 "doubao-pro"）展开到所有未被占用的
+	//        DB 变体（doubao-pro-32k-240515 / doubao-pro-4k-240515 / ...），每个生成独立 diff item
+	// 这样避免以前"一对一最佳前缀匹配"只给单个变体赋价的 bug
+	usedIDs := make(map[uint]bool, len(existingModels))
+
+	// 阶段 1：精确匹配优先，占位 DB 模型
+	type pendingItem struct {
+		sm       ScrapedModel
+		matches  []model.AIModel // 已匹配 DB 记录；空表示等阶段 2 做 fan-out
+		genericK string           // 阶段 2 要 fan-out 的泛型 key
+	}
+	pending := make([]pendingItem, 0, len(scraped.Models))
 	for _, sm := range scraped.Models {
-		item := PriceDiffItem{
+		scrapedLower := strings.ToLower(sm.ModelName)
+		if m, ok := modelMap[scrapedLower]; ok {
+			usedIDs[m.ID] = true
+			pending = append(pending, pendingItem{sm: sm, matches: []model.AIModel{m}})
+		} else {
+			// 标记为待 fan-out
+			pending = append(pending, pendingItem{sm: sm, genericK: scrapedLower})
+		}
+	}
+
+	// 阶段 2：对未精确命中的项做前缀 fan-out（返回 matches 为空则视为新增）
+	for i := range pending {
+		p := &pending[i]
+		if len(p.matches) > 0 || p.genericK == "" {
+			continue
+		}
+		for key, m := range modelMap {
+			if usedIDs[m.ID] {
+				continue
+			}
+			// 前缀匹配：scraped 名称 + "-" 是 DB 模型名前缀
+			// 例如 scraped "doubao-pro" 可 fan-out 到 "doubao-pro-32k", "doubao-pro-32k-240515" 等
+			if strings.HasPrefix(key, p.genericK+"-") {
+				p.matches = append(p.matches, m)
+				usedIDs[m.ID] = true
+			}
+		}
+	}
+
+	// 阶段 3：为每个 (scraped, matched_db_model) 组合生成 diff item
+	for _, p := range pending {
+		sm := p.sm
+		baseItem := PriceDiffItem{
 			ModelName:    sm.ModelName,
 			NewInputRMB:  sm.InputPrice,
 			NewOutputRMB: sm.OutputPrice,
@@ -553,7 +672,6 @@ func (s *PriceScraperService) buildDiffResult(supplier model.Supplier, scraped *
 			PricingUnit:  sm.PricingUnit,
 			ModelType:    sm.ModelType,
 			Warnings:     sm.Warnings,
-			// 透传缓存定价字段，供前端构建 PriceUpdateRequest 时使用
 			SupportsCache:              sm.SupportsCache,
 			CacheMechanism:             sm.CacheMechanism,
 			CacheMinTokens:             sm.CacheMinTokens,
@@ -561,60 +679,69 @@ func (s *PriceScraperService) buildDiffResult(supplier model.Supplier, scraped *
 			CacheExplicitInputPriceRMB: sm.CacheExplicitInputPrice,
 			CacheWritePriceRMB:         sm.CacheWritePrice,
 			CacheStoragePriceRMB:       sm.CacheStoragePrice,
+			VideoPricingConfig:         sm.VideoPricingConfig,
+		}
+		if baseItem.PricingUnit == "" {
+			baseItem.PricingUnit = PricingUnitPerMillionTokens
+		}
+		baseItem.ActualInputRMB = roundFloat(sm.InputPrice*discount, 4)
+		baseItem.ActualOutputRMB = roundFloat(sm.OutputPrice*discount, 4)
+
+		if len(p.matches) == 0 {
+			// 新模型（数据库中不存在），标记为有变更
+			item := baseItem
+			item.HasChanges = true
+			item.Warnings = append(item.Warnings, "新模型，数据库中暂无匹配记录")
+			if item.HasChanges {
+				result.ChangedCount++
+			}
+			if len(item.Warnings) > 0 {
+				result.WarningCount++
+			}
+			result.Items = append(result.Items, item)
+			continue
 		}
 
-		// 默认计费单位
-		if item.PricingUnit == "" {
-			item.PricingUnit = PricingUnitPerMillionTokens
-		}
-
-		// 计算折扣后实际价格
-		item.ActualInputRMB = roundFloat(sm.InputPrice*discount, 4)
-		item.ActualOutputRMB = roundFloat(sm.OutputPrice*discount, 4)
-
-		// 查找匹配的现有模型（精确匹配 + 前缀匹配）
-		existing, ok := findMatchingModel(sm.ModelName, modelMap)
-		if ok {
+		// fan-out：每个匹配的 DB 模型生成一个 diff item
+		for _, existing := range p.matches {
+			item := baseItem
+			// 泛型 fan-out 时保留 DB 的真实 model_name，前端展示更清晰
+			if len(p.matches) > 1 || !strings.EqualFold(existing.ModelName, sm.ModelName) {
+				item.ModelName = existing.ModelName
+			}
 			item.ModelID = existing.ID
 			item.CurrentInputRMB = existing.InputCostRMB
 			item.CurrentOutputRMB = existing.OutputCostRMB
 
-			// 计算输入价格变动比率
 			if existing.InputCostRMB > 0 {
 				item.InputChangeRatio = roundFloat((item.ActualInputRMB-existing.InputCostRMB)/existing.InputCostRMB, 4)
 			}
-
-			// 计算输出价格变动比率
 			if existing.OutputCostRMB > 0 {
 				item.OutputChangeRatio = roundFloat((item.ActualOutputRMB-existing.OutputCostRMB)/existing.OutputCostRMB, 4)
 			}
 
-			// 检测是否有实质变更（容差 0.0001）
 			inputDiff := math.Abs(item.ActualInputRMB - existing.InputCostRMB)
 			outputDiff := math.Abs(item.ActualOutputRMB - existing.OutputCostRMB)
 			item.HasChanges = inputDiff > 0.0001 || outputDiff > 0.0001
+			if !item.HasChanges && hasTierStructureChange(existing.PriceTiers, item.PriceTiers) {
+				item.HasChanges = true
+			}
 
-			// 异常检测
 			if isAnomaly, _, warning := DetectAnomalies(existing.InputCostRMB, item.ActualInputRMB, anomalyThreshold); isAnomaly {
 				item.Warnings = append(item.Warnings, "输入价格: "+warning)
 			}
 			if isAnomaly, _, warning := DetectAnomalies(existing.OutputCostRMB, item.ActualOutputRMB, anomalyThreshold); isAnomaly {
 				item.Warnings = append(item.Warnings, "输出价格: "+warning)
 			}
-		} else {
-			// 新模型（数据库中不存在），标记为有变更
-			item.HasChanges = true
-			item.Warnings = append(item.Warnings, "新模型，数据库中暂无匹配记录")
-		}
 
-		if item.HasChanges {
-			result.ChangedCount++
+			if item.HasChanges {
+				result.ChangedCount++
+			}
+			if len(item.Warnings) > 0 {
+				result.WarningCount++
+			}
+			result.Items = append(result.Items, item)
 		}
-		if len(item.Warnings) > 0 {
-			result.WarningCount++
-		}
-
-		result.Items = append(result.Items, item)
 	}
 
 	return result, nil
@@ -626,23 +753,54 @@ func roundFloat(val float64, precision int) float64 {
 	return math.Round(val*ratio) / ratio
 }
 
-// findMatchingModel 在 modelMap 中查找匹配的模型
-// 策略：1. 精确匹配  2. 前缀匹配（爬取名称为 DB 模型名的前缀）
-// 例如：爬取 "doubao-embedding-large-text"，DB 中有 "doubao-embedding-large-text-240915"
+// hasTierStructureChange 判断爬虫返回的阶梯结构是否与数据库现有值不同
+// 检测：阶梯数量差异，或阶梯的价格 / 区间边界差异
+func hasTierStructureChange(dbTiersRaw model.JSON, scrapedTiers []model.PriceTier) bool {
+	// DB 无阶梯，爬虫返回 >1 个阶梯 → 有变更
+	if len(dbTiersRaw) == 0 || string(dbTiersRaw) == "null" {
+		return len(scrapedTiers) > 1
+	}
+	var dbData model.PriceTiersData
+	if err := json.Unmarshal(dbTiersRaw, &dbData); err != nil {
+		return true // 解析失败视为变更（保守策略）
+	}
+	if len(dbData.Tiers) != len(scrapedTiers) {
+		return true
+	}
+	// 同长度 → 逐阶梯对比价格和边界
+	for i := range scrapedTiers {
+		if math.Abs(dbData.Tiers[i].InputPrice-scrapedTiers[i].InputPrice) > 0.0001 ||
+			math.Abs(dbData.Tiers[i].OutputPrice-scrapedTiers[i].OutputPrice) > 0.0001 {
+			return true
+		}
+		// 边界对比
+		dbMax := int64(-1)
+		if dbData.Tiers[i].InputMax != nil {
+			dbMax = *dbData.Tiers[i].InputMax
+		}
+		scrapedMax := int64(-1)
+		if scrapedTiers[i].InputMax != nil {
+			scrapedMax = *scrapedTiers[i].InputMax
+		}
+		if dbData.Tiers[i].InputMin != scrapedTiers[i].InputMin || dbMax != scrapedMax {
+			return true
+		}
+	}
+	return false
+}
+
+// findMatchingModel 已弃用：v3.6 起 buildDiffResult 使用两阶段匹配（精确占位 + 泛型 fan-out）
+// 保留此函数仅为兼容旧测试；新代码不要使用
+// Deprecated: use two-phase matching in buildDiffResult
 func findMatchingModel(scrapedName string, modelMap map[string]model.AIModel) (model.AIModel, bool) {
 	scrapedLower := strings.ToLower(scrapedName)
-
-	// 1. 精确匹配
 	if m, ok := modelMap[scrapedLower]; ok {
 		return m, true
 	}
-
-	// 2. 前缀匹配：选择名称最新（版本号最大）的模型
 	var bestMatch model.AIModel
 	bestKey := ""
 	for key, m := range modelMap {
 		if strings.HasPrefix(key, scrapedLower+"-") {
-			// 选择 key 字典序最大的（通常版本日期越大 = 越新）
 			if bestKey == "" || key > bestKey {
 				bestMatch = m
 				bestKey = key
@@ -652,7 +810,6 @@ func findMatchingModel(scrapedName string, modelMap map[string]model.AIModel) (m
 	if bestKey != "" {
 		return bestMatch, true
 	}
-
 	return model.AIModel{}, false
 }
 
@@ -691,6 +848,14 @@ func (s *PriceScraperService) insertNewModel(tx *gorm.DB, supplierID uint, suppl
 	// 带日期后缀（如 qwen-max-1201）默认停用
 	isActive := !hasDatedSuffix(modelName)
 
+	// 定价策略：免费模型打 Free 标签，缺价模型默认停用并打 NeedsPricing 标签
+	isFree := IsFreeModel(modelName, u.InputCostRMB, u.OutputCostRMB)
+	priceMissing := IsPriceMissing(modelName, pricingUnit, modelType, u.InputCostRMB, u.OutputCostRMB)
+	if priceMissing {
+		isActive = false
+	}
+	tags := AugmentTagsForPricing(inferTagsForScraper(modelName, supplierCode), isFree, priceMissing)
+
 	now := time.Now()
 	newModel := &model.AIModel{
 		CategoryID:    defaultCategoryID,
@@ -707,7 +872,7 @@ func (s *PriceScraperService) insertNewModel(tx *gorm.DB, supplierID uint, suppl
 		OutputCostRMB: u.OutputCostRMB,
 		Currency:      "CREDIT", // 与现有模型默认值保持一致
 		LastSyncedAt:  &now,
-		Tags:          inferTagsForScraper(modelName, supplierCode),
+		Tags:          tags,
 	}
 
 	// 缓存定价字段

@@ -209,7 +209,7 @@ func (s *ReferralService) GetConfig(ctx context.Context) (*model.ReferralConfig,
 		L1CommissionRate:     0.10,
 		L2CommissionRate:     0.05,
 		L3CommissionRate:     0.02,
-		MinWithdrawAmount:    10,
+		MinWithdrawAmount:    1000000,
 		IsActive:             true,
 	}
 	if err := s.db.WithContext(ctx).Create(&cfg).Error; err != nil {

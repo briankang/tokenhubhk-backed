@@ -2,96 +2,76 @@ package middleware
 
 import (
 	"context"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 
-	"tokenhub-server/internal/database"
-	"tokenhub-server/internal/model"
-	"tokenhub-server/internal/pkg/redis"
-	"tokenhub-server/internal/service/permission"
+	permissionsvc "tokenhub-server/internal/service/permission"
 )
 
-// DataScope 数据权限中间件，计算当前用户可见的租户子树并写入上下文
-// ADMIN 可见所有数据，代理商只能看到自己及子租户的数据
-// 使用 Redis 缓存租户子树（TTL 10min）
+// DataScope 数据权限中间件（v4.0 重构版）
+// 依赖 LoadSubjectPerms 已写入的 effectiveDataScope；按 policy.Type 分发：
+//   - all            → dataScopeAll=true（管理员类）
+//   - own_tenant     → visibleTenantIDs=[user.TenantID]
+//   - custom_tenants → visibleTenantIDs=policy.TenantIDs
+//   - own_only       → dataScopeOwnOnly=true（UserScope 按 user_id 过滤）
+//
+// 原 AGENT_* 子树 BFS 逻辑已随代理商模块下线而移除。
 func DataScope() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		role, exists := c.Get("role")
+		// 从 LoadSubjectPerms 注入的 context 键读取
+		scopeAny, exists := c.Get(ctxKeyEffectiveScope)
 		if !exists {
+			// 未注入 SubjectPerms（例如公开接口） → 直接放行
 			c.Next()
 			return
 		}
-		roleStr, _ := role.(string)
-
-		// ADMIN 可见所有数据
-		if roleStr == "ADMIN" {
-			c.Set("dataScopeAll", true)
-			ctx := c.Request.Context()
-			ctx = context.WithValue(ctx, "dataScopeAll", true)
-			c.Request = c.Request.WithContext(ctx)
+		policy, ok := scopeAny.(permissionsvc.DataScopePolicy)
+		if !ok {
 			c.Next()
 			return
 		}
 
-		tenantID, exists := c.Get("tenantId")
-		if !exists {
-			c.Next()
-			return
-		}
-		tid, ok := tenantID.(uint)
-		if !ok || tid == 0 {
-			c.Next()
-			return
-		}
-
-		// 计算可见租户 ID 列表（自身 + 所有子租户），使用 Redis 缓存
-		visibleIDs := getSubtreeIDsCached(c.Request.Context(), tid)
-		c.Set("visibleTenantIDs", visibleIDs)
-
-		// 写入 request context 供 Service 层使用
 		ctx := c.Request.Context()
-		ctx = context.WithValue(ctx, "visibleTenantIDs", visibleIDs)
-		ctx = context.WithValue(ctx, "dataScopeAll", false)
+		switch policy.Type {
+		case permissionsvc.DataScopeAll:
+			c.Set("dataScopeAll", true)
+			ctx = context.WithValue(ctx, "dataScopeAll", true)
+		case permissionsvc.DataScopeCustomTenants:
+			c.Set("visibleTenantIDs", policy.TenantIDs)
+			ctx = context.WithValue(ctx, "visibleTenantIDs", policy.TenantIDs)
+			ctx = context.WithValue(ctx, "dataScopeAll", false)
+		case permissionsvc.DataScopeOwnTenant:
+			tid := readTenantID(c)
+			visible := []uint{}
+			if tid != 0 {
+				visible = []uint{tid}
+			}
+			c.Set("visibleTenantIDs", visible)
+			ctx = context.WithValue(ctx, "visibleTenantIDs", visible)
+			ctx = context.WithValue(ctx, "dataScopeAll", false)
+		case permissionsvc.DataScopeOwnOnly:
+			c.Set("dataScopeOwnOnly", true)
+			ctx = context.WithValue(ctx, "dataScopeOwnOnly", true)
+			ctx = context.WithValue(ctx, "dataScopeAll", false)
+		default:
+			// 未知类型，保守起见按 own_only 处理
+			c.Set("dataScopeOwnOnly", true)
+			ctx = context.WithValue(ctx, "dataScopeOwnOnly", true)
+		}
 		c.Request = c.Request.WithContext(ctx)
-
 		c.Next()
 	}
 }
 
-// getSubtreeIDsCached 使用权限服务的缓存 BFS 获取租户子树 ID
-// 当 Redis 不可用时降级为直接 DB 查询
-func getSubtreeIDsCached(ctx context.Context, rootID uint) []uint {
-	if database.DB == nil {
-		return []uint{rootID}
+func readTenantID(c *gin.Context) uint {
+	v, ok := c.Get("tenantId")
+	if !ok {
+		return 0
 	}
-
-	// 尝试使用 Redis 缓存版本
-	ids, err := permission.GetVisibleTenantIDs(ctx, database.DB, redis.Client, rootID)
-	if err == nil && len(ids) > 0 {
-		return ids
+	if tid, ok := v.(uint); ok {
+		return tid
 	}
-
-	// 降级: 直接递归查询（无缓存）
-	return getSubtreeIDs(rootID)
-}
-
-// getSubtreeIDs 通过递归 DB 查询获取租户 ID 及其所有后代 ID
-func getSubtreeIDs(rootID uint) []uint {
-	ids := []uint{rootID}
-	if database.DB == nil {
-		return ids
-	}
-
-	var children []model.Tenant
-	if err := database.DB.Select("id").Where("parent_id = ?", rootID).Find(&children).Error; err != nil {
-		return ids
-	}
-
-	for _, child := range children {
-		ids = append(ids, getSubtreeIDs(child.ID)...)
-	}
-	return ids
+	return 0
 }
 
 // GetVisibleTenantIDs 从上下文中获取可见租户 ID 列表
@@ -99,7 +79,7 @@ func getSubtreeIDs(rootID uint) []uint {
 func GetVisibleTenantIDs(c *gin.Context) ([]uint, bool) {
 	if all, exists := c.Get("dataScopeAll"); exists {
 		if isAll, ok := all.(bool); ok && isAll {
-			return nil, true // nil means all tenants visible
+			return nil, true
 		}
 	}
 	if ids, exists := c.Get("visibleTenantIDs"); exists {
@@ -108,9 +88,4 @@ func GetVisibleTenantIDs(c *gin.Context) ([]uint, bool) {
 		}
 	}
 	return []uint{}, false
-}
-
-// IsAgentRole 检查角色是否为代理商角色 (AGENT_L1/L2/L3)
-func IsAgentRole(role string) bool {
-	return strings.HasPrefix(role, "AGENT_L")
 }

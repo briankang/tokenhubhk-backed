@@ -14,6 +14,7 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"go.uber.org/zap"
 
+	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/logger"
 )
 
@@ -40,6 +41,13 @@ type VolcengineScraper struct {
 	apiKey     string
 	browserMgr *BrowserManager
 	httpClient *http.Client
+}
+
+// SetAPIKey 动态更新 API Key（优先使用渠道配置的 Key）
+func (s *VolcengineScraper) SetAPIKey(key string) {
+	if key != "" {
+		s.apiKey = key
+	}
 }
 
 // NewVolcengineScraper 创建火山引擎爬虫实例
@@ -116,9 +124,25 @@ func (s *VolcengineScraper) ScrapePrices(ctx context.Context) (*ScrapedPriceData
 	defer browserCancel()
 	priceMap, err := s.scrapePrices(browserCtx)
 	if err != nil {
-		log.Warn("浏览器爬取价格失败，仅返回 API 模型列表（无价格）", zap.Error(err))
-		// 降级：只返回 API 模型列表但无价格
-		return s.apiModelsToScrapedData(apiModels), nil
+		log.Warn("浏览器爬取价格失败，使用补充价格数据作为降级方案", zap.Error(err))
+		// 降级：将 API 模型与补充价格数据（视频/图片/Embedding/LLM 基准价）匹配
+		// 比直接返回无价格列表更有价值，确保 doubao-pro/lite/1.5 等主力模型能拿到基准价
+		fallbackModels := s.matchModelsWithPrices(apiModels, make(map[string]ScrapedModel))
+		if len(fallbackModels) == 0 {
+			log.Warn("补充价格也未能匹配，返回空模型列表（不写 DB）")
+			return &ScrapedPriceData{
+				SupplierName: volcengineSupplierName,
+				FetchedAt:    time.Now(),
+				Models:       nil,
+				SourceURL:    volcenginePriceURL,
+			}, nil
+		}
+		return &ScrapedPriceData{
+			SupplierName: volcengineSupplierName,
+			FetchedAt:    time.Now(),
+			Models:       fallbackModels,
+			SourceURL:    volcenginePriceURL,
+		}, nil
 	}
 	log.Info("浏览器爬取火山引擎价格成功", zap.Int("price_entries", len(priceMap)))
 
@@ -405,20 +429,66 @@ func inferModelTypeAndUnit(api volcAPIModel) (modelType, pricingUnit string) {
 func getVolcengineSupplementaryPrices() map[string]ScrapedModel {
 	prices := map[string]ScrapedModel{
 		// ============ 视频生成模型 (Seedance) — 元/百万tokens ============
+		// Seedance 2.0 / 2.0 Fast 带"有输入视频 vs 无输入视频"双档定价 + 输出时长最低 Token 下限
+		// 详见 https://www.volcengine.com/docs/82379/1544106
 		"doubao-seedance-2.0": {
-			ModelName: "doubao-seedance-2.0", DisplayName: "Seedance 2.0（不含视频输入）",
+			ModelName: "doubao-seedance-2.0", DisplayName: "Seedance 2.0",
 			InputPrice: 46.0, OutputPrice: 0, Currency: "CNY",
 			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
+			PriceTiers: []model.PriceTier{
+				// 无视频输入：46 元/百万tokens（单维度阶梯按输入 token 数粗粒度）
+				{Name: "无视频输入", InputMin: 0, InputMinExclusive: true, OutputMin: 0, OutputMinExclusive: true, InputPrice: 46.0, OutputPrice: 0},
+			},
+			VideoPricingConfig: &model.VideoPricingConfig{
+				RequireInputVideo:  true,
+				HasInputVideoPrice: 28.0,
+				NoInputVideoPrice:  46.0,
+				MinTokensRules: []model.VideoMinTokenRule{
+					// 参考 Seedance 2.0 官方最低Token表
+					{OutputDurationSec: 5.0, MinTokens: 116508},
+					{OutputDurationSec: 10.0, MinTokens: 233016},
+				},
+			},
+		},
+		"doubao-seedance-2.0-fast": {
+			ModelName: "doubao-seedance-2.0-fast", DisplayName: "Seedance 2.0 Fast",
+			InputPrice: 20.0, OutputPrice: 0, Currency: "CNY",
+			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
+			PriceTiers: []model.PriceTier{
+				{Name: "无视频输入", InputMin: 0, InputMinExclusive: true, OutputMin: 0, OutputMinExclusive: true, InputPrice: 20.0, OutputPrice: 0},
+			},
+			VideoPricingConfig: &model.VideoPricingConfig{
+				RequireInputVideo:  true,
+				HasInputVideoPrice: 12.0,
+				NoInputVideoPrice:  20.0,
+				MinTokensRules: []model.VideoMinTokenRule{
+					{OutputDurationSec: 5.0, MinTokens: 116508},
+					{OutputDurationSec: 10.0, MinTokens: 233016},
+				},
+			},
 		},
 		"doubao-seedance-2.0-video-input": {
 			ModelName: "doubao-seedance-2.0-video-input", DisplayName: "Seedance 2.0（含视频输入）",
 			InputPrice: 28.0, OutputPrice: 0, Currency: "CNY",
 			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
+			VideoPricingConfig: &model.VideoPricingConfig{
+				RequireInputVideo:  true,
+				HasInputVideoPrice: 28.0,
+				MinTokensRules: []model.VideoMinTokenRule{
+					{OutputDurationSec: 5.0, MinTokens: 116508},
+					{OutputDurationSec: 10.0, MinTokens: 233016},
+				},
+			},
 		},
 		"doubao-seedance-1.5-pro": {
 			ModelName: "doubao-seedance-1.5-pro", DisplayName: "Seedance 1.5 Pro",
 			InputPrice: 15.0, OutputPrice: 0, Currency: "CNY",
 			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
+			VideoPricingConfig: &model.VideoPricingConfig{
+				SupportDraft:    true,
+				DraftCoefSilent: 0.7,
+				DraftCoefAudio:  0.6,
+			},
 		},
 		"doubao-seedance-1.0-pro": {
 			ModelName: "doubao-seedance-1.0-pro", DisplayName: "Seedance 1.0 Pro",
@@ -504,6 +574,107 @@ func getVolcengineSupplementaryPrices() map[string]ScrapedModel {
 			ModelType: "ASR", PricingUnit: PricingUnitPerHour,
 		},
 	}
+
+	// ============ LLM / VLM 主力模型阶梯备用价格（2026-04 官网价）============
+	// 用途：浏览器爬取失败时的降级保底数据，确保 doubao 主力模型不丢价格。
+	// 阶梯边界基于官方计费规则：按单次请求的输入上下文 token 数分段计费。
+	// 来源：https://www.volcengine.com/docs/82379/1544106
+	//
+	// 注意：这些价格会被浏览器成功爬取的结果覆盖，仅作 fallback 使用。
+	i64 := func(v int64) *int64 { return &v } // 辅助函数：取 int64 指针
+
+	llmPrices := map[string]ScrapedModel{
+		// ---- doubao-pro 系列（上下文 ≤32k / >32k 阶梯）----
+		// prefix "doubao-pro-" 可匹配 doubao-pro-4k/32k/128k/256k 等所有变体
+		"doubao-pro": {
+			ModelName: "doubao-pro", DisplayName: "Doubao Pro",
+			InputPrice: 0.8, OutputPrice: 2.0, Currency: "CNY",
+			ModelType: "LLM", PricingUnit: PricingUnitPerMillionTokens,
+			PriceTiers: []model.PriceTier{
+				{Name: "≤32k上下文", InputMax: i64(32000), InputPrice: 0.8, OutputPrice: 2.0},
+				{Name: ">32k上下文", InputMin: 32000, InputMinExclusive: true, InputPrice: 5.0, OutputPrice: 9.0},
+			},
+		},
+		// ---- doubao-lite 系列 ----
+		"doubao-lite": {
+			ModelName: "doubao-lite", DisplayName: "Doubao Lite",
+			InputPrice: 0.3, OutputPrice: 0.6, Currency: "CNY",
+			ModelType: "LLM", PricingUnit: PricingUnitPerMillionTokens,
+			PriceTiers: []model.PriceTier{
+				{Name: "≤32k上下文", InputMax: i64(32000), InputPrice: 0.3, OutputPrice: 0.6},
+				{Name: ">32k上下文", InputMin: 32000, InputMinExclusive: true, InputPrice: 0.8, OutputPrice: 0.6},
+			},
+		},
+		// ---- doubao-1.5-pro 系列 ----
+		// API 返回 ID 格式：doubao-1-5-pro-32k-xxxxx → 标准化后 doubao-1.5-pro-32k
+		// prefix "doubao-1.5-pro-" 可匹配所有变体
+		"doubao-1.5-pro": {
+			ModelName: "doubao-1.5-pro", DisplayName: "Doubao 1.5 Pro",
+			InputPrice: 0.45, OutputPrice: 1.0, Currency: "CNY",
+			ModelType: "LLM", PricingUnit: PricingUnitPerMillionTokens,
+			PriceTiers: []model.PriceTier{
+				{Name: "≤32k上下文", InputMax: i64(32000), InputPrice: 0.45, OutputPrice: 1.0},
+				{Name: ">32k上下文", InputMin: 32000, InputMinExclusive: true, InputPrice: 3.0, OutputPrice: 9.0},
+			},
+		},
+		// ---- doubao-1.5-lite 系列（无阶梯，超低价）----
+		"doubao-1.5-lite": {
+			ModelName: "doubao-1.5-lite", DisplayName: "Doubao 1.5 Lite",
+			InputPrice: 0.2, OutputPrice: 0.3, Currency: "CNY",
+			ModelType: "LLM", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		// ---- doubao-1.5-vision 系列（VLM）----
+		"doubao-1.5-vision": {
+			ModelName: "doubao-1.5-vision", DisplayName: "Doubao 1.5 Vision",
+			InputPrice: 0.3, OutputPrice: 0.3, Currency: "CNY",
+			ModelType: "VLM", PricingUnit: PricingUnitPerMillionTokens,
+			PriceTiers: []model.PriceTier{
+				{Name: "≤32k上下文", InputMax: i64(32000), InputPrice: 0.3, OutputPrice: 0.3},
+				{Name: ">32k上下文", InputMin: 32000, InputMinExclusive: true, InputPrice: 1.0, OutputPrice: 1.0},
+			},
+		},
+		// ---- doubao-character 系列（角色扮演，同 pro 价格）----
+		"doubao-character": {
+			ModelName: "doubao-character", DisplayName: "Doubao Character",
+			InputPrice: 0.8, OutputPrice: 2.0, Currency: "CNY",
+			ModelType: "LLM", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		// ---- doubao-thinking-pro（深度思考，高价）----
+		"doubao-thinking-pro": {
+			ModelName: "doubao-thinking-pro", DisplayName: "Doubao Thinking Pro",
+			InputPrice: 4.0, OutputPrice: 16.0, Currency: "CNY",
+			ModelType: "LLM", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		// ---- doubao-seed-2.0 系列（VLM，旗舰多模态）----
+		"doubao-seed-2.0": {
+			ModelName: "doubao-seed-2.0", DisplayName: "Doubao Seed 2.0",
+			InputPrice: 3.0, OutputPrice: 9.0, Currency: "CNY",
+			ModelType: "VLM", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		"doubao-seed-2.0-pro": {
+			ModelName: "doubao-seed-2.0-pro", DisplayName: "Doubao Seed 2.0 Pro",
+			InputPrice: 3.0, OutputPrice: 9.0, Currency: "CNY",
+			ModelType: "VLM", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		"doubao-seed-2.0-lite": {
+			ModelName: "doubao-seed-2.0-lite", DisplayName: "Doubao Seed 2.0 Lite",
+			InputPrice: 0.3, OutputPrice: 0.9, Currency: "CNY",
+			ModelType: "VLM", PricingUnit: PricingUnitPerMillionTokens,
+		},
+		// ---- doubao-pro-m（MoE 架构）----
+		"doubao-pro-m": {
+			ModelName: "doubao-pro-m", DisplayName: "Doubao Pro M",
+			InputPrice: 0.45, OutputPrice: 1.0, Currency: "CNY",
+			ModelType: "LLM", PricingUnit: PricingUnitPerMillionTokens,
+		},
+	}
+
+	for k, v := range llmPrices {
+		if _, exists := prices[k]; !exists {
+			prices[k] = v
+		}
+	}
+
 	return prices
 }
 

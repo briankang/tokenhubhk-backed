@@ -33,6 +33,7 @@ func (h *PaymentConfigHandler) Register(rg *gin.RouterGroup) {
 		pg.GET("/providers", h.GetAllProviders)
 		pg.PUT("/providers/:type", h.UpdateProvider)
 		pg.PATCH("/providers/:type/toggle", h.ToggleProvider)
+		pg.POST("/providers/:type/test", h.TestProvider)
 
 		// 银行账号管理
 		pg.GET("/bank-accounts", h.GetAllBankAccounts)

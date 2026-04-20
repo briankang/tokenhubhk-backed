@@ -1,0 +1,11 @@
+{
+  "_description": "支付宝签名错误场景（sign 为错误值，VerifyCallback 应返回 error）",
+  "charset": "utf-8",
+  "sign": "INVALID_SIGNATURE_SHOULD_FAIL_VERIFICATION",
+  "out_trade_no": "ORD-2026041703170002",
+  "total_amount": "50.00",
+  "trade_status": "TRADE_SUCCESS",
+  "trade_no": "2026041722001417980510000002",
+  "app_id": "2021000000000000",
+  "sign_type": "RSA2"
+}

@@ -17,6 +17,11 @@ type AuditLog struct {
 	RequestID  string `gorm:"type:varchar(64);index" json:"request_id"`      // 请求 ID
 	OperatorID uint   `gorm:"index" json:"operator_id"`                      // 操作人ID（管理员）
 	Remark     string `gorm:"type:text" json:"remark"`                       // 备注
+	Menu       string `gorm:"type:varchar(50);index" json:"menu"`            // 菜单（按路由映射推导，如 "用户管理"）
+	Feature    string `gorm:"type:varchar(100);index" json:"feature"`        // 功能（按路由映射推导，如 "更新用户"）
+	Method     string `gorm:"type:varchar(10)" json:"method"`                // HTTP 方法
+	Path       string `gorm:"type:varchar(255)" json:"path"`                 // HTTP 路径模板
+	StatusCode int    `gorm:"index" json:"status_code"`                      // 响应状态码
 }
 
 // TableName 指定审计日志表名
@@ -28,6 +33,9 @@ func (AuditLog) TableName() string {
 type AuditLogQuery struct {
 	Action     string
 	OperatorID uint
+	Menu       string
+	Feature    string
+	Resource   string
 	StartDate  time.Time
 	EndDate    time.Time
 	Page       int

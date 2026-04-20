@@ -7,12 +7,13 @@ import "time"
 
 // 任务类型常量
 const (
-	TaskBatchCheck    = "batch_check"    // 模型批量检测
-	TaskModelSync     = "model_sync"     // 模型按渠道同步
-	TaskModelSyncAll  = "model_sync_all" // 模型全量同步
-	TaskPriceScrape   = "price_scrape"   // 价格爬虫预览/应用
-	TaskRouteRefresh  = "route_refresh"  // 默认路由刷新
-	TaskScanOffline   = "scan_offline"   // 全量下线模型扫描
+	TaskBatchCheck     = "batch_check"     // 模型批量检测
+	TaskModelSync      = "model_sync"      // 模型按渠道同步
+	TaskModelSyncAll   = "model_sync_all"  // 模型全量同步
+	TaskPriceScrape    = "price_scrape"    // 价格爬虫预览/应用
+	TaskRouteRefresh   = "route_refresh"   // 默认路由刷新
+	TaskScanOffline    = "scan_offline"    // 全量下线模型扫描
+	TaskCapabilityTest = "capability_test" // 模型能力参数组合测试
 )
 
 // 任务状态常量
@@ -68,4 +69,13 @@ type ModelSyncPayload struct {
 type PriceScrapePayload struct {
 	SupplierCode string `json:"supplier_code"`
 	AutoApply    bool   `json:"auto_apply"` // 是否自动应用价格
+}
+
+// CapabilityTestPayload 能力测试参数
+type CapabilityTestPayload struct {
+	TaskID               uint   `json:"task_id"`
+	ModelIDs             []uint `json:"model_ids"`
+	CaseIDs              []uint `json:"case_ids"`                // 空=所有 enabled
+	AutoApplySuggestions bool   `json:"auto_apply_suggestions"` // 完成后自动应用建议
+	SkipKnownDisabled    bool   `json:"skip_known_disabled"`    // 跳过已确认不可用的能力
 }

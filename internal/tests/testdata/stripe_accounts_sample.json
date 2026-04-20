@@ -1,0 +1,39 @@
+{
+  "_description": "Stripe 多账号配置样本（70/30 权重路由，用于测试数据种子）",
+  "accounts": [
+    {
+      "provider_type": "STRIPE",
+      "account_name": "Stripe US 主账号",
+      "is_active": true,
+      "is_sandbox": true,
+      "weight": 70,
+      "priority": 0,
+      "supported_currencies": "USD,EUR",
+      "supported_regions": "US,CA",
+      "config": {
+        "publishable_key": "pk_test_51MockStripeUSMain1234567890",
+        "secret_key": "sk_test_51MockStripeUSMain0987654321",
+        "webhook_secret": "whsec_mock_us_main_abcdef",
+        "currency": "usd",
+        "success_url": "https://tokenhubhk.com/balance?status=success",
+        "cancel_url": "https://tokenhubhk.com/checkout?status=cancel"
+      }
+    },
+    {
+      "provider_type": "STRIPE",
+      "account_name": "Stripe EU 副账号",
+      "is_active": true,
+      "is_sandbox": true,
+      "weight": 30,
+      "priority": 0,
+      "supported_currencies": "USD,EUR,GBP",
+      "supported_regions": "EU,UK",
+      "config": {
+        "publishable_key": "pk_test_51MockStripeEUSecondary",
+        "secret_key": "sk_test_51MockStripeEUSecondary",
+        "webhook_secret": "whsec_mock_eu_secondary",
+        "currency": "eur"
+      }
+    }
+  ]
+}

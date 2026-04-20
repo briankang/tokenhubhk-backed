@@ -49,10 +49,10 @@ type TokenPair struct {
 }
 
 // Claims JWT 令牌的声明信息
+// v4.0: Role 字段已移除，权限由 user_roles 表承载
 type Claims struct {
-	UserID   uint   `json:"user_id"`
-	TenantID uint   `json:"tenant_id"`
-	Role     string `json:"role"`
+	UserID   uint `json:"user_id"`
+	TenantID uint `json:"tenant_id"`
 	jwt.RegisteredClaims
 }
 
@@ -135,13 +135,17 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest) (*mode
 		Email:        req.Email,
 		PasswordHash: string(hash),
 		Name:         req.Name,
-		Role:         "USER",
 		IsActive:     true,
 		Language:     "en",
 	}
 
 	if err := s.db.WithContext(ctx).Create(user).Error; err != nil {
 		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+
+	// v4.0: 为新用户分配 USER 角色（RBAC 系统）
+	if err := s.assignDefaultUserRole(ctx, user.ID); err != nil {
+		return nil, fmt.Errorf("failed to assign default role: %w", err)
 	}
 
 	// 初始化用户余额（默认免费额度）
@@ -323,7 +327,6 @@ func (s *AuthService) generateTokenPair(user *model.User) (*TokenPair, error) {
 	accessClaims := &Claims{
 		UserID:   user.ID,
 		TenantID: user.TenantID,
-		Role:     user.Role,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(now.Add(accessTokenExpiry)),
 			IssuedAt:  jwt.NewNumericDate(now),

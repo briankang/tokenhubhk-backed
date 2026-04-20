@@ -2,12 +2,14 @@ package admin
 
 import (
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	auditmw "tokenhub-server/internal/middleware/audit"
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
@@ -54,6 +56,17 @@ func (h *MiscHandler) ListAuditLogs(c *gin.Context) {
 		query.Action = action
 	}
 
+	// 菜单 / 功能 / 资源 过滤（v3.3 新增）
+	if menu := c.Query("menu"); menu != "" {
+		query.Menu = menu
+	}
+	if feature := c.Query("feature"); feature != "" {
+		query.Feature = feature
+	}
+	if resource := c.Query("resource"); resource != "" {
+		query.Resource = resource
+	}
+
 	// operator_id 过滤
 	if operatorID := c.Query("operator_id"); operatorID != "" {
 		if oid, err := strconv.ParseUint(operatorID, 10, 64); err == nil && oid > 0 {
@@ -81,6 +94,14 @@ func (h *MiscHandler) ListAuditLogs(c *gin.Context) {
 	}
 
 	response.PageResult(c, logs, total, page, pageSize)
+}
+
+// ListAuditMenus 返回审计日志可用的菜单列表 GET /api/v1/admin/audit-logs/menus
+// 数据来自审计中间件 routeMap，前端筛选下拉框使用，避免前端硬编码
+func (h *MiscHandler) ListAuditMenus(c *gin.Context) {
+	menus := auditmw.AllMenus()
+	sort.Strings(menus)
+	response.Success(c, gin.H{"menus": menus})
 }
 
 // DailyStats 获取每日统计数据 GET /api/v1/admin/stats/daily

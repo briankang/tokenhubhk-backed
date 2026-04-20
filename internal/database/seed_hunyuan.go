@@ -7,7 +7,6 @@ import (
 	"gorm.io/gorm"
 
 	"tokenhub-server/internal/model"
-	"tokenhub-server/internal/pkg/credits"
 	"tokenhub-server/internal/pkg/logger"
 )
 
@@ -104,7 +103,7 @@ func RunSeedHunyuan(db *gorm.DB) {
 	}
 	modelDefs := []modelDef{
 		// 通用对话系列
-		{"hunyuan_chat", "hunyuan-lite", "Hunyuan Lite", 0, 0, 4096, 262144, "LLM", "Tencent,Free"},
+		{"hunyuan_chat", "hunyuan-lite", "Hunyuan Lite", 0, 0, 4096, 262144, "LLM", "Tencent,Free,免费"},
 		{"hunyuan_chat", "hunyuan-standard", "Hunyuan Standard", 4.5, 5, 4096, 32768, "LLM", "Tencent"},
 		{"hunyuan_chat", "hunyuan-standard-256k", "Hunyuan Standard 256K", 15, 60, 4096, 262144, "LLM", "Tencent,LongContext"},
 		{"hunyuan_chat", "hunyuan-pro", "Hunyuan Pro", 30, 100, 4096, 32768, "LLM", "Tencent"},
@@ -122,106 +121,35 @@ func RunSeedHunyuan(db *gorm.DB) {
 		// 多模态视觉
 		{"hunyuan_vision", "hunyuan-vision", "Hunyuan Vision", 18, 22, 4096, 8192, "VLM", "Tencent,Vision"},
 		{"hunyuan_vision", "hunyuan-turbo-vision", "Hunyuan Turbo Vision", 40, 80, 4096, 8192, "VLM", "Tencent,Vision"},
+		{"hunyuan_vision", "hunyuan-standard-vision", "Hunyuan Standard Vision", 8, 12, 4096, 8192, "VLM", "Tencent,Vision"},
+		{"hunyuan_vision", "hunyuan-lite-vision", "Hunyuan Lite Vision", 0, 0, 4096, 8192, "VLM", "Tencent,Vision,Free,免费"},
+		{"hunyuan_vision", "hunyuan-turbos-vision", "Hunyuan TurboS Vision", 3, 9, 4096, 8192, "VLM", "Tencent,Vision"},
+
+		// 新一代 TurboS 系列（性价比旗舰）
+		{"hunyuan_chat", "hunyuan-turbos", "Hunyuan TurboS", 0.8, 2, 4096, 32768, "LLM", "Tencent,TurboS"},
+		{"hunyuan_chat", "hunyuan-turbos-latest", "Hunyuan TurboS Latest", 0.8, 2, 4096, 32768, "LLM", "Tencent,TurboS"},
+
+		// T1 深度推理系列（对标 DeepSeek-R1）
+		{"hunyuan_chat", "hunyuan-t1-latest", "Hunyuan T1 Latest", 1, 4, 4096, 64000, "LLM", "Tencent,Reasoning,T1"},
+
+		// 翻译专用
+		{"hunyuan_chat", "hunyuan-translation", "Hunyuan Translation", 15, 15, 4096, 32768, "LLM", "Tencent,Translation"},
+		{"hunyuan_chat", "hunyuan-translation-lite", "Hunyuan Translation Lite", 5, 5, 4096, 32768, "LLM", "Tencent,Translation"},
+
+		// 长上下文扩展
+		{"hunyuan_chat", "hunyuan-large-longcontext", "Hunyuan Large LongContext", 6, 18, 4096, 262144, "LLM", "Tencent,LongContext"},
+
+		// 开源系列（官方 API 免费）
+		{"hunyuan_chat", "hunyuan-7b", "Hunyuan 7B (Open Source)", 0, 0, 4096, 32768, "LLM", "Tencent,OpenSource,Free,免费"},
+		{"hunyuan_chat", "hunyuan-a13b", "Hunyuan A13B (Open Source)", 0, 0, 4096, 32768, "LLM", "Tencent,OpenSource,Free,免费"},
 	}
 
-	createdModels := 0
-	for _, md := range modelDefs {
-		catID, ok := catIDMap[md.CategoryCode]
-		if !ok {
-			var cat model.ModelCategory
-			if findErr := db.Where("code = ?", md.CategoryCode).First(&cat).Error; findErr != nil {
-				log.Warn("seed_hunyuan: 分类未找到，跳过模型",
-					zap.String("category", md.CategoryCode),
-					zap.String("model", md.ModelName))
-				continue
-			}
-			catID = cat.ID
-		}
+	// 模型创建已禁用：交由 auto-discovery（DiscoveryService.SyncFromChannel）从混元 API 拉取
+	// 避免硬编码模型与官方实际模型列表/价格漂移
+	_ = catIDMap // 分类仍创建，供后续 auto-discovery 关联
+	log.Info("seed_hunyuan: 模型创建已禁用，等待 auto-discovery 同步")
 
-		var existing model.AIModel
-		if findErr := db.Where("supplier_id = ? AND model_name = ?",
-			hunyuanSup.ID, md.ModelName).First(&existing).Error; findErr == nil {
-			// 已存在：更新价格 + 上线
-			db.Model(&model.AIModel{}).Where("id = ?", existing.ID).Updates(map[string]interface{}{
-				"input_cost_rmb":         md.InputPriceM,
-				"output_cost_rmb":        md.OutputPriceM,
-				"input_price_per_token":  credits.RMBToCredits(md.InputPriceM / 1e6),
-				"output_price_per_token": credits.RMBToCredits(md.OutputPriceM / 1e6),
-				"context_window":         md.ContextWin,
-				"max_tokens":             md.MaxTokens,
-				"status":                 "online",
-				"is_active":              true,
-			})
-			continue
-		}
-
-		aim := model.AIModel{
-			CategoryID:          catID,
-			SupplierID:          hunyuanSup.ID,
-			ModelName:           md.ModelName,
-			DisplayName:         md.DisplayName,
-			IsActive:            true,
-			Status:              "online",
-			MaxTokens:           md.MaxTokens,
-			ContextWindow:       md.ContextWin,
-			InputPricePerToken:  credits.RMBToCredits(md.InputPriceM / 1e6),
-			OutputPricePerToken: credits.RMBToCredits(md.OutputPriceM / 1e6),
-			InputCostRMB:        md.InputPriceM,
-			OutputCostRMB:       md.OutputPriceM,
-			Currency:            "CREDIT",
-			ModelType:           md.ModelType,
-			PricingUnit:         "per_million_tokens",
-			Source:              "seed",
-			Tags:                md.Tags,
-		}
-		if createErr := db.Create(&aim).Error; createErr != nil {
-			log.Error("seed_hunyuan: 创建模型失败",
-				zap.String("model", md.ModelName), zap.Error(createErr))
-			continue
-		}
-
-		// 创建对应的 ModelPricing 记录（加价 30%）
-		inputPriceMRmb := md.InputPriceM * 1.3
-		outputPriceMRmb := md.OutputPriceM * 1.3
-		mp := model.ModelPricing{
-			ModelID:             aim.ID,
-			InputPricePerToken:  credits.RMBToCredits(inputPriceMRmb / 1e6),
-			InputPriceRMB:       inputPriceMRmb,
-			OutputPricePerToken: credits.RMBToCredits(outputPriceMRmb / 1e6),
-			OutputPriceRMB:      outputPriceMRmb,
-			Currency:            "CREDIT",
-		}
-		db.Create(&mp)
-
-		createdModels++
-	}
-	log.Info("seed_hunyuan: 模型种子完成", zap.Int("created", createdModels))
-
-	// ---- 4. 模板渠道（未激活）----
-	var templateCh model.Channel
-	if db.Where("name = ?", "腾讯混元 模板渠道").First(&templateCh).Error != nil {
-		modelsJSON, _ := json.Marshal([]string{})
-		templateCh = model.Channel{
-			Name:           "腾讯混元 模板渠道",
-			SupplierID:     hunyuanSup.ID,
-			Type:           "openai",
-			Endpoint:       "https://api.hunyuan.cloud.tencent.com/v1",
-			APIKey:         "",
-			Models:         modelsJSON,
-			Weight:         1,
-			Priority:       0,
-			Status:         "inactive",
-			MaxConcurrency: 100,
-			QPM:            60,
-		}
-		if createErr := db.Create(&templateCh).Error; createErr != nil {
-			log.Error("seed_hunyuan: 创建模板渠道失败", zap.Error(createErr))
-		} else {
-			log.Info("seed_hunyuan: 创建模板渠道成功")
-		}
-	}
-
-	// ---- 5. 真实渠道（已激活）----
+	// ---- 4. 真实渠道（已激活）----
 	allModelNames := make([]string, 0, len(modelDefs))
 	for _, md := range modelDefs {
 		allModelNames = append(allModelNames, md.ModelName)

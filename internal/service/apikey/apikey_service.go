@@ -513,6 +513,17 @@ func (s *ApiKeyService) RevealKey(ctx context.Context, id uint, userID uint) (st
 	return plainKey, nil
 }
 
+// EncryptValue 暴露加密能力供其他 service 复用（使用同一 AES-256-GCM 密钥）。
+// 用于 AI 客服自动发现 Admin API Key 后，以密文形式缓存到 system_configs。
+func (s *ApiKeyService) EncryptValue(plain string) (string, error) {
+	return s.encryptKey(plain)
+}
+
+// DecryptValue 暴露解密能力供其他 service 复用。
+func (s *ApiKeyService) DecryptValue(cipherText string) (string, error) {
+	return s.decryptKey(cipherText)
+}
+
 // getFromCache 从 Redis 缓存获取值
 func (s *ApiKeyService) getFromCache(ctx context.Context, key string, dest interface{}) error {
 	if s.redis == nil {

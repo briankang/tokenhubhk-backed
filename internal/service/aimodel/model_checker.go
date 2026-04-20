@@ -916,6 +916,18 @@ func (mc *ModelChecker) checkSingleModel(ctx context.Context, aiModel model.AIMo
 	if effectiveType == "" {
 		effectiveType = inferModelTypeByName(aiModel.ModelName)
 	}
+	// 1.1 名称强信号覆盖：DB 中 model_type 可能被错误设置为 LLM/VLM/Vision（历史数据或
+	// 模型同步时推断失误），导致 Embedding/TTS/ASR/Rerank/Translation/Image/Video 被错
+	// 误发送到 Chat Completions 端点产生 400/404 误判失败。若名称命中非 chat 类型的
+	// 强信号模式，优先使用推断值。参考 docs/batch_check_analysis_2026_04_17.md。
+	if effectiveType == "LLM" || effectiveType == "VLM" || effectiveType == "Vision" {
+		inferred := inferModelTypeByName(aiModel.ModelName)
+		switch inferred {
+		case "Embedding", "TextToSpeech", "SpeechRecognition", "Rerank", "Translation",
+			"ImageGeneration", "VideoGeneration":
+			effectiveType = inferred
+		}
+	}
 
 	// 2. 按类型分发
 	// 注意：数据库实际存储的 ModelType 值在 internal/model/ai_model.go 定义为
@@ -948,6 +960,12 @@ func (mc *ModelChecker) checkSingleModel(ctx context.Context, aiModel model.AIMo
 		// 通用 Audio 类型（既不是纯 TTS 也不是纯 ASR）跳过
 		base.Available = true
 		base.Error = "跳过 Audio 模型（暂不支持自动检测）"
+		return base
+	case "Translation":
+		// 翻译模型（如 doubao-seed-translation）使用专用 API 格式（源语言/目标语言字段），
+		// 不适合通过 Chat Completions 端点自动探测，标记为可用跳过。
+		base.Available = true
+		base.Error = "跳过 Translation 模型（需专用 API 参数，暂不支持自动检测）"
 		return base
 	}
 
@@ -1204,6 +1222,10 @@ func (mc *ModelChecker) checkDashScopeImage(ctx context.Context, route channelRo
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// 按字节截断时，向前退到合法 UTF-8 字符边界，避免截断多字节中文字符导致 DB 写入失败
+	for n > 0 && (s[n]&0xC0) == 0x80 {
+		n--
 	}
 	return s[:n]
 }

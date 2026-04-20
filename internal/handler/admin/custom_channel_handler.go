@@ -628,7 +628,8 @@ func (h *CustomChannelHandler) RefreshDefault(c *gin.Context) {
 		}
 	}()
 
-	c.JSON(http.StatusAccepted, gin.H{
+	// 使用标准响应包装器，前端 api 客户端依赖 {code, message, data} 格式
+	response.Success(c, gin.H{
 		"job_id":     job.ID,
 		"status":     job.Status,
 		"started_at": job.StartedAt,
@@ -640,9 +641,9 @@ func (h *CustomChannelHandler) RefreshDefault(c *gin.Context) {
 func (h *CustomChannelHandler) GetRefreshStatus(c *gin.Context) {
 	job := loadCurrentRefreshJob()
 	if job == nil {
-		c.JSON(http.StatusOK, gin.H{"job": nil, "message": "尚未执行过路由刷新"})
+		response.Success(c, gin.H{"job": nil, "message": "尚未执行过路由刷新"})
 		return
 	}
 	snap := job.Snapshot()
-	c.JSON(http.StatusOK, gin.H{"job": snap})
+	response.Success(c, gin.H{"job": snap})
 }

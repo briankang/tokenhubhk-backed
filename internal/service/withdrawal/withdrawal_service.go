@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	goredis "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
@@ -15,6 +16,36 @@ import (
 	"tokenhub-server/internal/service/balance"
 )
 
+// EventSink 抽象事件日志写入（避免循环依赖 payment 包）
+type EventSink interface {
+	LogWithdrawalEvent(ctx context.Context, evt WithdrawalEvent)
+}
+
+// WithdrawalEvent 提现事件
+type WithdrawalEvent struct {
+	WithdrawID uint64
+	UserID     uint64
+	EventType  string
+	ActorType  string
+	ActorID    *uint64
+	IP         string
+	Payload    interface{}
+	Success    bool
+	ErrorMsg   string
+}
+
+// FuncEventSink 通过函数适配 EventSink 接口
+type FuncEventSink struct {
+	F func(ctx context.Context, evt WithdrawalEvent)
+}
+
+// LogWithdrawalEvent 实现 EventSink 接口
+func (f FuncEventSink) LogWithdrawalEvent(ctx context.Context, evt WithdrawalEvent) {
+	if f.F != nil {
+		f.F(ctx, evt)
+	}
+}
+
 // Service 佣金提现 + 自动结算服务
 // v3.1 职责:
 //  1. AutoSettleAndCredit — 定时把 N 天前的 PENDING 佣金变 SETTLED 并入账到用户 Balance
@@ -22,13 +53,33 @@ import (
 //  3. Approve / Reject / MarkPaid — 管理员审核
 //  4. 拒绝时自动回退用户余额
 type Service struct {
-	db      *gorm.DB
-	balance *balance.BalanceService
+	db        *gorm.DB
+	balance   *balance.BalanceService
+	redis     *goredis.Client // 可选：用于 24h pending 锁 + 每日限额
+	eventSink EventSink       // 可选：事件日志写入器
 }
 
 // NewService 创建提现服务
 func NewService(db *gorm.DB, balanceSvc *balance.BalanceService) *Service {
 	return &Service{db: db, balance: balanceSvc}
+}
+
+// SetRedis 注入 Redis（支持防刷锁）
+func (s *Service) SetRedis(r *goredis.Client) {
+	s.redis = r
+}
+
+// SetEventSink 注入事件日志器
+func (s *Service) SetEventSink(sink EventSink) {
+	s.eventSink = sink
+}
+
+// logEvent 非阻塞写事件日志
+func (s *Service) logEvent(ctx context.Context, evt WithdrawalEvent) {
+	if s.eventSink == nil {
+		return
+	}
+	go s.eventSink.LogWithdrawalEvent(context.Background(), evt)
 }
 
 // ---------- 自动结算 ----------
@@ -173,6 +224,15 @@ func (s *Service) CreateWithdrawal(ctx context.Context, userID uint, amountCredi
 	}
 
 	var req model.WithdrawalRequest
+	// 防刷：24h 内同用户仅允许 1 笔 pending（Redis SETNX）
+	if s.redis != nil {
+		lockKey := fmt.Sprintf("withdrawal:pending:user:%d", userID)
+		ok, _ := s.redis.SetNX(ctx, lockKey, "1", 24*time.Hour).Result()
+		if !ok {
+			return nil, errors.New("another pending withdrawal exists, please wait")
+		}
+	}
+
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 冻结余额(行锁)
 		res := tx.Model(&model.UserBalance{}).
@@ -212,9 +272,150 @@ func (s *Service) CreateWithdrawal(ctx context.Context, userID uint, amountCredi
 		return tx.Create(br).Error
 	})
 	if err != nil {
+		// 事务失败时释放 Redis pending 锁
+		if s.redis != nil {
+			_ = s.redis.Del(ctx, fmt.Sprintf("withdrawal:pending:user:%d", userID)).Err()
+		}
+		return nil, err
+	}
+
+	// 写事件日志
+	s.logEvent(ctx, WithdrawalEvent{
+		WithdrawID: uint64(req.ID),
+		UserID:     uint64(userID),
+		EventType:  "withdrawal.requested",
+		ActorType:  "user",
+		Payload: map[string]interface{}{
+			"amount_credits": amountCredits,
+			"amount_rmb":     req.Amount,
+			"bank_info":      bankInfo,
+		},
+		Success: true,
+	})
+	return &req, nil
+}
+
+// CancelByUser 用户主动取消 pending 的提现申请（退还余额）
+func (s *Service) CancelByUser(ctx context.Context, id, userID uint) error {
+	var req model.WithdrawalRequest
+	if err := s.db.WithContext(ctx).First(&req, id).Error; err != nil {
+		return fmt.Errorf("withdrawal not found: %w", err)
+	}
+	if req.UserID != userID {
+		return errors.New("not owner")
+	}
+	if req.Status != "PENDING" {
+		return fmt.Errorf("cannot cancel withdrawal in status %s", req.Status)
+	}
+	refundCredits := credits.RMBToCredits(req.Amount)
+
+	var ub model.UserBalance
+	if err := s.db.WithContext(ctx).Where("user_id = ?", userID).First(&ub).Error; err != nil {
+		return fmt.Errorf("load user balance: %w", err)
+	}
+
+	now := time.Now()
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.WithdrawalRequest{}).Where("id = ?", req.ID).Updates(map[string]interface{}{
+			"status":       "CANCELLED",
+			"admin_remark": "user cancelled",
+			"processed_at": &now,
+		}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.UserBalance{}).Where("user_id = ?", userID).Updates(map[string]interface{}{
+			"balance":     gorm.Expr("balance + ?", refundCredits),
+			"balance_rmb": gorm.Expr("balance_rmb + ?", req.Amount),
+		}).Error; err != nil {
+			return err
+		}
+		br := &model.BalanceRecord{
+			UserID:    userID,
+			TenantID:  ub.TenantID,
+			Type:      "WITHDRAW_REFUND",
+			Amount:    refundCredits,
+			AmountRMB: req.Amount,
+			Remark:    "用户取消提现",
+			RelatedID: fmt.Sprintf("wd:%d", req.ID),
+		}
+		return tx.Create(br).Error
+	})
+	if err != nil {
+		return err
+	}
+	// 释放 pending 锁
+	if s.redis != nil {
+		_ = s.redis.Del(ctx, fmt.Sprintf("withdrawal:pending:user:%d", userID)).Err()
+	}
+	s.logEvent(ctx, WithdrawalEvent{
+		WithdrawID: uint64(req.ID),
+		UserID:     uint64(userID),
+		EventType:  "withdrawal.cancelled",
+		ActorType:  "user",
+		Success:    true,
+	})
+	return nil
+}
+
+// BatchApprove 批量通过
+func (s *Service) BatchApprove(ctx context.Context, ids []uint, adminID uint, remark string) (okIDs, failedIDs []uint) {
+	for _, id := range ids {
+		if err := s.Approve(ctx, id, adminID, remark); err != nil {
+			failedIDs = append(failedIDs, id)
+			logger.L.Warn("batch approve withdrawal failed", zap.Uint("id", id), zap.Error(err))
+		} else {
+			okIDs = append(okIDs, id)
+		}
+	}
+	return
+}
+
+// BatchReject 批量拒绝
+func (s *Service) BatchReject(ctx context.Context, ids []uint, adminID uint, reason string) (okIDs, failedIDs []uint) {
+	for _, id := range ids {
+		if err := s.Reject(ctx, id, adminID, reason); err != nil {
+			failedIDs = append(failedIDs, id)
+		} else {
+			okIDs = append(okIDs, id)
+		}
+	}
+	return
+}
+
+// GetByID 获取单条提现申请
+func (s *Service) GetByID(ctx context.Context, id uint) (*model.WithdrawalRequest, error) {
+	var req model.WithdrawalRequest
+	if err := s.db.WithContext(ctx).First(&req, id).Error; err != nil {
 		return nil, err
 	}
 	return &req, nil
+}
+
+// Stats 提现统计（管理员）
+type WithdrawStats struct {
+	Pending      int64   `json:"pending"`
+	Approved     int64   `json:"approved"`
+	CompletedMtd int64   `json:"completed_mtd"`
+	RejectedMtd  int64   `json:"rejected_mtd"`
+	AmountMtd    float64 `json:"amount_mtd"`
+}
+
+// GetStats 提现统计
+func (s *Service) GetStats(ctx context.Context) (*WithdrawStats, error) {
+	stats := &WithdrawStats{}
+	s.db.WithContext(ctx).Model(&model.WithdrawalRequest{}).Where("status = ?", "PENDING").Count(&stats.Pending)
+	s.db.WithContext(ctx).Model(&model.WithdrawalRequest{}).Where("status = ?", "APPROVED").Count(&stats.Approved)
+	monthStart := time.Date(time.Now().Year(), time.Now().Month(), 1, 0, 0, 0, 0, time.Local)
+	s.db.WithContext(ctx).Model(&model.WithdrawalRequest{}).
+		Where("status = ? AND processed_at >= ?", "COMPLETED", monthStart).Count(&stats.CompletedMtd)
+	s.db.WithContext(ctx).Model(&model.WithdrawalRequest{}).
+		Where("status = ? AND processed_at >= ?", "REJECTED", monthStart).Count(&stats.RejectedMtd)
+	var amt float64
+	s.db.WithContext(ctx).Model(&model.WithdrawalRequest{}).
+		Where("status = ? AND processed_at >= ?", "COMPLETED", monthStart).
+		Select("COALESCE(SUM(amount), 0)").Scan(&amt)
+	stats.AmountMtd = amt
+	return stats, nil
 }
 
 // ListUserWithdrawals 用户分页查询自己的提现记录
@@ -271,12 +472,25 @@ func (s *Service) Approve(ctx context.Context, id, adminID uint, remark string) 
 		return fmt.Errorf("cannot approve withdrawal in status %s", req.Status)
 	}
 	now := time.Now()
-	return s.db.WithContext(ctx).Model(&model.WithdrawalRequest{}).Where("id = ?", req.ID).Updates(map[string]interface{}{
+	if err := s.db.WithContext(ctx).Model(&model.WithdrawalRequest{}).Where("id = ?", req.ID).Updates(map[string]interface{}{
 		"status":       "APPROVED",
 		"admin_id":     adminID,
 		"admin_remark": remark,
 		"processed_at": &now,
-	}).Error
+	}).Error; err != nil {
+		return err
+	}
+	aid := uint64(adminID)
+	s.logEvent(ctx, WithdrawalEvent{
+		WithdrawID: uint64(req.ID),
+		UserID:     uint64(req.UserID),
+		EventType:  "withdrawal.approved",
+		ActorType:  "admin",
+		ActorID:    &aid,
+		Payload:    map[string]interface{}{"remark": remark},
+		Success:    true,
+	})
+	return nil
 }
 
 // Reject 审核拒绝,同时回退用户被冻结的余额
@@ -297,7 +511,7 @@ func (s *Service) Reject(ctx context.Context, id, adminID uint, reason string) e
 	}
 
 	now := time.Now()
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&model.WithdrawalRequest{}).Where("id = ?", req.ID).Updates(map[string]interface{}{
 			"status":       "REJECTED",
 			"admin_id":     adminID,
@@ -325,6 +539,24 @@ func (s *Service) Reject(ctx context.Context, id, adminID uint, reason string) e
 		}
 		return tx.Create(br).Error
 	})
+	if err != nil {
+		return err
+	}
+	// 释放 pending 锁
+	if s.redis != nil {
+		_ = s.redis.Del(ctx, fmt.Sprintf("withdrawal:pending:user:%d", req.UserID)).Err()
+	}
+	aid := uint64(adminID)
+	s.logEvent(ctx, WithdrawalEvent{
+		WithdrawID: uint64(req.ID),
+		UserID:     uint64(req.UserID),
+		EventType:  "withdrawal.rejected",
+		ActorType:  "admin",
+		ActorID:    &aid,
+		Payload:    map[string]interface{}{"reason": reason},
+		Success:    true,
+	})
+	return nil
 }
 
 // MarkPaid 标记已打款(APPROVED → COMPLETED),记录 bankTxnID 到 admin_remark
@@ -341,10 +573,27 @@ func (s *Service) MarkPaid(ctx context.Context, id, adminID uint, bankTxnID stri
 	if bankTxnID != "" {
 		remark = fmt.Sprintf("%s | txn:%s", remark, bankTxnID)
 	}
-	return s.db.WithContext(ctx).Model(&model.WithdrawalRequest{}).Where("id = ?", req.ID).Updates(map[string]interface{}{
+	if err := s.db.WithContext(ctx).Model(&model.WithdrawalRequest{}).Where("id = ?", req.ID).Updates(map[string]interface{}{
 		"status":       "COMPLETED",
 		"admin_id":     adminID,
 		"admin_remark": remark,
 		"processed_at": &now,
-	}).Error
+	}).Error; err != nil {
+		return err
+	}
+	// 释放 pending 锁
+	if s.redis != nil {
+		_ = s.redis.Del(ctx, fmt.Sprintf("withdrawal:pending:user:%d", req.UserID)).Err()
+	}
+	aid := uint64(adminID)
+	s.logEvent(ctx, WithdrawalEvent{
+		WithdrawID: uint64(req.ID),
+		UserID:     uint64(req.UserID),
+		EventType:  "withdrawal.paid",
+		ActorType:  "admin",
+		ActorID:    &aid,
+		Payload:    map[string]interface{}{"bank_txn_id": bankTxnID},
+		Success:    true,
+	})
+	return nil
 }

@@ -2,11 +2,13 @@ package admin_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/mysql"
@@ -48,7 +50,7 @@ func TestAdminUpdateReferralConfig_Success(t *testing.T) {
 
 	// 创建 handler
 	refSvc := referral.NewReferralService(db)
-	handler := admin.NewReferralConfigAdminHandler(refSvc)
+	handler := admin.NewReferralConfigHandler(refSvc)
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -108,7 +110,7 @@ func TestAdminUpdateReferralConfig_ValidationFails(t *testing.T) {
 	}
 
 	refSvc := referral.NewReferralService(db)
-	handler := admin.NewReferralConfigAdminHandler(refSvc)
+	handler := admin.NewReferralConfigHandler(refSvc)
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -230,7 +232,7 @@ func TestAdminUpdateQuotaConfig_Success(t *testing.T) {
 
 	// 创建 handler
 	balSvc := balance.NewBalanceService(db, nil)
-	handler := admin.NewQuotaConfigAdminHandler(balSvc)
+	handler := admin.NewQuotaHandler(balSvc)
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -312,8 +314,8 @@ func TestConfigUpdate_AffectsNewCommissions(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	// 创建用户
-	db.Create(&model.User{BaseModel: model.BaseModel{ID: inviterID}, TenantID: 1, Username: "inviter810001", Email: "inviter810001@test.com", Password: "hash"})
-	db.Create(&model.User{BaseModel: model.BaseModel{ID: inviteeID}, TenantID: 1, Username: "invitee810002", Email: "invitee810002@test.com", Password: "hash"})
+	db.Create(&model.User{BaseModel: model.BaseModel{ID: inviterID}, TenantID: 1, Name: "inviter810001", Email: "inviter810001@test.com", PasswordHash: "hash"})
+	db.Create(&model.User{BaseModel: model.BaseModel{ID: inviteeID}, TenantID: 1, Name: "invitee810002", Email: "invitee810002@test.com", PasswordHash: "hash"})
 
 	// 创建已解锁的归因
 	now := time.Now()

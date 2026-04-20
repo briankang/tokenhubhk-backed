@@ -30,11 +30,11 @@ import (
 	pkgredis "tokenhub-server/internal/pkg/redis"
 	"tokenhub-server/internal/router"
 	aimodelsvc "tokenhub-server/internal/service/aimodel"
-	"tokenhub-server/internal/service/balance"
+	auditsvc "tokenhub-server/internal/service/audit"
 	channelsvc "tokenhub-server/internal/service/channel"
 	memberSvc "tokenhub-server/internal/service/member"
 	"tokenhub-server/internal/service/modeldiscovery"
-	"tokenhub-server/internal/service/pricescraper"
+	reportSvc "tokenhub-server/internal/service/report"
 	"tokenhub-server/internal/taskqueue"
 )
 
@@ -97,8 +97,16 @@ func runWorker() {
 	})
 	engine.GET("/metrics", metrics.Handler(database.DB, pkgredis.Client, "worker"))
 
-	// 启动 Scheduler
-	scheduler := createScheduler()
+	// 创建共享服务实例
+	modelChecker := aimodelsvc.NewModelChecker(database.DB)
+	capTester := aimodelsvc.NewCapabilityTester(database.DB, modelChecker)
+
+	// 初始化全局审计服务（Worker 角色虽然不接收 HTTP 写请求，
+	// 但 Scheduler 的 audit_cleanup 任务依赖此服务清理 audit_logs 表）
+	auditsvc.InitDefault(database.DB, context.Background())
+
+	// 启动 Scheduler（注入 capabilityTester 用于新模型自动触发）
+	scheduler := createScheduler(capTester)
 	scheduler.Start()
 	defer scheduler.Stop()
 	logger.L.Info("worker scheduler started")
@@ -110,7 +118,7 @@ func runWorker() {
 	}
 	hostname, _ := os.Hostname()
 	consumer := taskqueue.NewConsumer(pkgredis.Client, signingKey, "worker-"+hostname)
-	registerTaskHandlers(consumer)
+	registerTaskHandlers(consumer, capTester)
 	consumerCtx, consumerCancel := context.WithCancel(context.Background())
 	defer consumerCancel()
 	go consumer.Start(consumerCtx)
@@ -120,11 +128,15 @@ func runWorker() {
 }
 
 // registerTaskHandlers 注册 Worker 的异步任务处理函数，接入实际业务服务
-func registerTaskHandlers(consumer *taskqueue.Consumer) {
+// capTester 由 runWorker 创建并共享，避免重复初始化
+func registerTaskHandlers(consumer *taskqueue.Consumer, capTester *aimodelsvc.CapabilityTester) {
 	db := database.DB
 
 	modelChecker := aimodelsvc.NewModelChecker(db)
 	discoverySvc := modeldiscovery.NewDiscoveryService(db)
+	if capTester == nil {
+		capTester = aimodelsvc.NewCapabilityTester(db, modelChecker)
+	}
 
 	// 模型批量检测 — 接入 ModelChecker.BatchCheck()
 	consumer.RegisterHandler(taskqueue.TaskBatchCheck, func(ctx context.Context, payload string, progress taskqueue.ProgressReporter) error {
@@ -252,6 +264,44 @@ func registerTaskHandlers(consumer *taskqueue.Consumer) {
 		progress.ReportData(taskqueue.StatusCompleted, 100, "扫描完成", results)
 		return nil
 	})
+
+	// 能力测试 — 接入 CapabilityTester.RunTests()
+	consumer.RegisterHandler(taskqueue.TaskCapabilityTest, func(ctx context.Context, payload string, progress taskqueue.ProgressReporter) error {
+		var params taskqueue.CapabilityTestPayload
+		if err := json.Unmarshal([]byte(payload), &params); err != nil {
+			return fmt.Errorf("解析参数失败: %w", err)
+		}
+		progress.Report(taskqueue.StatusRunning, 5, "启动能力测试...")
+
+		progressCh := make(chan aimodelsvc.CapabilityTestProgress, 100)
+		var runErr error
+		go func() {
+			runErr = capTester.RunTests(ctx, aimodelsvc.RunTestsInput{
+				TaskID:               params.TaskID,
+				ModelIDs:             params.ModelIDs,
+				CaseIDs:              params.CaseIDs,
+				AutoApplySuggestions: params.AutoApplySuggestions,
+				SkipKnownDisabled:    params.SkipKnownDisabled,
+			}, progressCh)
+		}()
+
+		for p := range progressCh {
+			pct := 0
+			if p.Total > 0 {
+				pct = p.Completed * 95 / p.Total
+			}
+			progress.Report(taskqueue.StatusRunning, 5+pct,
+				fmt.Sprintf("已测试 %d/%d，通过 %d，失败 %d，跳过 %d，回归 %d",
+					p.Completed, p.Total, p.Passed, p.Failed, p.Skipped, p.Regression))
+		}
+
+		if runErr != nil {
+			return runErr
+		}
+
+		progress.Report(taskqueue.StatusCompleted, 100, "能力测试完成")
+		return nil
+	})
 }
 
 // runMonolith 运行全功能单体模式（向后兼容 cmd/server/main.go）
@@ -275,15 +325,20 @@ func runMonolith() {
 }
 
 // createScheduler 创建并配置定时任务调度器
-func createScheduler() *cron.Scheduler {
+// capTester 不为 nil 时注入，用于新模型同步后自动触发能力测试
+func createScheduler(capTester ...*aimodelsvc.CapabilityTester) *cron.Scheduler {
 	memberLevelSvc := memberSvc.NewMemberLevelService(database.DB, pkgredis.Client)
-	balanceSvc := balance.NewBalanceService(database.DB, pkgredis.Client)
 	discoverySvc := modeldiscovery.NewDiscoveryService(database.DB)
-	scraperSvc := pricescraper.NewPriceScraperService(database.DB)
-	return cron.NewScheduler(database.DB, pkgredis.Client, memberLevelSvc, balanceSvc,
+	userDailyAggSvc := reportSvc.NewUserDailyAggService(database.DB)
+	opts := []cron.SchedulerOption{
 		cron.WithDiscoveryService(discoverySvc),
-		cron.WithPriceScraperService(scraperSvc),
-	)
+		cron.WithAuditService(auditsvc.Default),
+		cron.WithUserDailyAggService(userDailyAggSvc),
+	}
+	if len(capTester) > 0 && capTester[0] != nil {
+		opts = append(opts, cron.WithCapabilityTester(capTester[0]))
+	}
+	return cron.NewScheduler(database.DB, pkgredis.Client, memberLevelSvc, opts...)
 }
 
 // startServer 启动 HTTP 服务器并等待优雅关闭
@@ -320,6 +375,9 @@ func startServer(engine *gin.Engine, writeTimeout time.Duration) {
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.L.Error("server forced to shutdown", zap.Error(err))
 	}
+
+	// 关闭审计日志异步队列（drain 剩余日志再退出）
+	auditsvc.ShutdownDefault()
 
 	logger.L.Info("server exited gracefully")
 }

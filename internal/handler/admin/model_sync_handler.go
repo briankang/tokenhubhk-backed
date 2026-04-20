@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 
@@ -201,8 +202,16 @@ func (h *ModelSyncHandler) ListChannelModels(c *gin.Context) {
 	}
 
 	// 按标准模型ID筛选
+	// - 默认 LIKE 模糊匹配（兼容主表搜索框的输入）
+	// - 当 exact=1/true 时使用精确匹配（编辑弹窗场景，避免"qwen-coder-plus"误命中
+	//   "qwen-coder-plus-latest"/"qwen-coder-plus-1106" 等同前缀变体）
 	if standardModelID := c.Query("standard_model_id"); standardModelID != "" {
-		query = query.Where("standard_model_id LIKE ?", "%"+standardModelID+"%")
+		exact := c.Query("exact")
+		if exact == "1" || exact == "true" {
+			query = query.Where("standard_model_id = ?", standardModelID)
+		} else {
+			query = query.Where("standard_model_id LIKE ?", "%"+standardModelID+"%")
+		}
 	}
 
 	// 按来源筛选
@@ -331,12 +340,25 @@ func (h *ModelSyncHandler) UpdateChannelModel(c *gin.Context) {
 
 // BatchUpdateSellingPrice 批量修改模型售价
 // PUT /api/v1/admin/models/batch-selling-price
-// 请求体: { "ids": [1,2,3], "discount": 0.9 }
-// discount: 基于官方成本价的折扣比例，如 0.9 表示9折，0.85 表示85折
+// 请求体:
+//
+//	{
+//	  "ids": [1,2,3],
+//	  "discount": 0.9,                 // 基于成本价的折扣比例
+//	  "apply_cache": true,             // 可选：同步调整缓存价
+//	  "cache_implicit_ratio": 0.2,     // 隐式缓存命中价 = cost * 此比例
+//	  "cache_explicit_ratio": 0.1,     // 显式缓存命中价（both/explicit 模式）
+//	  "cache_write_ratio": 1.25        // 显式缓存写入价
+//	}
 func (h *ModelSyncHandler) BatchUpdateSellingPrice(c *gin.Context) {
 	var req struct {
-		IDs      []uint  `json:"ids" binding:"required,min=1"`
-		Discount float64 `json:"discount" binding:"required,gt=0,lte=10"`
+		IDs                []uint  `json:"ids" binding:"required,min=1"`
+		Discount           float64 `json:"discount" binding:"required,gt=0,lte=10"`
+		ApplyCache         bool    `json:"apply_cache"`
+		CacheImplicitRatio float64 `json:"cache_implicit_ratio"`
+		CacheExplicitRatio float64 `json:"cache_explicit_ratio"`
+		CacheWriteRatio    float64 `json:"cache_write_ratio"`
+		ApplyTiers         bool    `json:"apply_tiers"` // 同步按 discount 调整阶梯售价（selling_price = tier_cost × discount）
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
@@ -352,6 +374,8 @@ func (h *ModelSyncHandler) BatchUpdateSellingPrice(c *gin.Context) {
 
 	updated := 0
 	skipped := 0
+	cacheUpdated := 0
+	tiersUpdated := 0
 	for _, m := range models {
 		// 跳过成本价为0的模型，避免创建无意义的0元售价记录
 		if m.InputCostRMB == 0 && m.OutputCostRMB == 0 {
@@ -378,32 +402,77 @@ func (h *ModelSyncHandler) BatchUpdateSellingPrice(c *gin.Context) {
 			h.db.Save(&pricing)
 		}
 		updated++
+
+		// 可选：同步调整缓存价（仅对支持缓存的模型生效）
+		if req.ApplyCache && m.SupportsCache && m.InputCostRMB > 0 {
+			cacheUpdates := map[string]interface{}{}
+			if req.CacheImplicitRatio > 0 {
+				cacheUpdates["cache_input_price_rmb"] = math.Round(m.InputCostRMB*req.CacheImplicitRatio*1000000) / 1000000
+			}
+			// explicit/both 模式才更新显式价与写入价
+			if m.CacheMechanism == "both" || m.CacheMechanism == "explicit" {
+				if req.CacheExplicitRatio > 0 {
+					cacheUpdates["cache_explicit_input_price_rmb"] = math.Round(m.InputCostRMB*req.CacheExplicitRatio*1000000) / 1000000
+				}
+				if req.CacheWriteRatio > 0 {
+					cacheUpdates["cache_write_price_rmb"] = math.Round(m.InputCostRMB*req.CacheWriteRatio*1000000) / 1000000
+				}
+			}
+			if len(cacheUpdates) > 0 {
+				if err := h.db.Model(&model.AIModel{}).Where("id = ?", m.ID).Updates(cacheUpdates).Error; err == nil {
+					cacheUpdated++
+				}
+			}
+		}
+
+		// 可选：按 discount 同步调整阶梯售价 selling_price = tier_cost × discount
+		if req.ApplyTiers && len(m.PriceTiers) > 0 {
+			var data model.PriceTiersData
+			if err := json.Unmarshal(m.PriceTiers, &data); err == nil && len(data.Tiers) > 0 {
+				for i := range data.Tiers {
+					sin := math.Round(data.Tiers[i].InputPrice*req.Discount*1000000) / 1000000
+					sout := math.Round(data.Tiers[i].OutputPrice*req.Discount*1000000) / 1000000
+					data.Tiers[i].SellingInputPrice = &sin
+					data.Tiers[i].SellingOutputPrice = &sout
+				}
+				if bs, err := json.Marshal(data); err == nil {
+					if err := h.db.Model(&model.AIModel{}).Where("id = ?", m.ID).Update("price_tiers", model.JSON(bs)).Error; err == nil {
+						tiersUpdated++
+					}
+				}
+			}
+		}
 	}
 
 	invalidatePublicModelsCache()
 	response.Success(c, gin.H{
-		"message": "批量售价更新成功",
-		"updated": updated,
-		"skipped": skipped,
+		"message":       "批量售价更新成功",
+		"updated":       updated,
+		"skipped":       skipped,
+		"cache_updated": cacheUpdated,
+		"tiers_updated": tiersUpdated,
 	})
 }
 
 // FillSellingPrices 一键补全售价
 // POST /api/v1/admin/models/fill-selling-prices
-// 请求体: { "discount": 0.9 } — 可选，默认0.9（9折）
-// 为所有有成本价但无有效售价的模型自动创建 ModelPricing 记录
+// 请求体: { "discount": 0.9, "apply_cache": true, "cache_implicit_ratio": 0.2, ... }
+// 为所有有成本价但缺失售价/缓存价/阶梯售价的模型自动补全（已手工配置的不会被覆盖）
 func (h *ModelSyncHandler) FillSellingPrices(c *gin.Context) {
 	var req struct {
-		Discount float64 `json:"discount"`
+		Discount           float64 `json:"discount"`
+		ApplyCache         bool    `json:"apply_cache"`
+		CacheImplicitRatio float64 `json:"cache_implicit_ratio"`
+		CacheExplicitRatio float64 `json:"cache_explicit_ratio"`
+		CacheWriteRatio    float64 `json:"cache_write_ratio"`
+		ApplyTiers         bool    `json:"apply_tiers"`
 	}
 	_ = c.ShouldBindJSON(&req)
 	if req.Discount <= 0 || req.Discount > 10 {
 		req.Discount = 0.9
 	}
 
-	// 查找有成本价但无有效售价的模型：
-	// 1) 无 ModelPricing 记录
-	// 2) 有 ModelPricing 记录但 input_price_rmb = 0 且 output_price_rmb = 0
+	// 查找有成本价的模型；后续按基础售价/缓存/阶梯三条独立判定分别补全
 	var models []model.AIModel
 	err := h.db.
 		Where("(input_cost_rmb > 0 OR output_cost_rmb > 0)").
@@ -416,44 +485,147 @@ func (h *ModelSyncHandler) FillSellingPrices(c *gin.Context) {
 
 	created := 0
 	updated := 0
+	cacheUpdated := 0
+	tiersUpdated := 0
+	// 详细统计：帮助用户理解为什么 0/0
+	priceAlreadyFilled := 0
+	cacheCandidates := 0
+	cacheAlreadyFilled := 0
+	cacheNotSupported := 0
+	tiersCandidates := 0
+	tiersAlreadyFilled := 0
+	tiersNone := 0
+	// 样本：每类最多记录 5 个被更新的模型名
+	samplesPrice := []string{}
+	samplesCache := []string{}
+	samplesTiers := []string{}
+	addSample := func(list *[]string, name string) {
+		if len(*list) < 5 {
+			*list = append(*list, name)
+		}
+	}
 	for _, m := range models {
+		// ── 1) 基础售价补全 ──
 		needsFill := m.Pricing == nil ||
 			(m.Pricing.InputPriceRMB == 0 && m.Pricing.OutputPriceRMB == 0)
 		if !needsFill {
-			continue
+			priceAlreadyFilled++
+		}
+		if needsFill {
+			sellingInputRMB := float64(int(m.InputCostRMB*req.Discount*10000+0.5)) / 10000
+			sellingOutputRMB := float64(int(m.OutputCostRMB*req.Discount*10000+0.5)) / 10000
+
+			if m.Pricing == nil {
+				pricing := model.ModelPricing{
+					ModelID:             m.ID,
+					InputPriceRMB:       sellingInputRMB,
+					InputPricePerToken:  int64(sellingInputRMB * 10000),
+					OutputPriceRMB:      sellingOutputRMB,
+					OutputPricePerToken: int64(sellingOutputRMB * 10000),
+				}
+				h.db.Create(&pricing)
+				created++
+				addSample(&samplesPrice, m.ModelName)
+			} else {
+				m.Pricing.InputPriceRMB = sellingInputRMB
+				m.Pricing.InputPricePerToken = int64(sellingInputRMB * 10000)
+				m.Pricing.OutputPriceRMB = sellingOutputRMB
+				m.Pricing.OutputPricePerToken = int64(sellingOutputRMB * 10000)
+				h.db.Save(m.Pricing)
+				updated++
+				addSample(&samplesPrice, m.ModelName)
+			}
 		}
 
-		sellingInputRMB := float64(int(m.InputCostRMB*req.Discount*10000+0.5)) / 10000
-		sellingOutputRMB := float64(int(m.OutputCostRMB*req.Discount*10000+0.5)) / 10000
-
-		if m.Pricing == nil {
-			// 创建新记录
-			pricing := model.ModelPricing{
-				ModelID:             m.ID,
-				InputPriceRMB:       sellingInputRMB,
-				InputPricePerToken:  int64(sellingInputRMB * 10000),
-				OutputPriceRMB:      sellingOutputRMB,
-				OutputPricePerToken: int64(sellingOutputRMB * 10000),
+		// ── 2) 缓存价补全（仅当三个缓存价全为 0，避免覆盖管理员已配置的） ──
+		if req.ApplyCache {
+			if !m.SupportsCache {
+				cacheNotSupported++
+			} else if m.InputCostRMB > 0 {
+				cacheCandidates++
+				allEmpty := m.CacheInputPriceRMB == 0 && m.CacheExplicitInputPriceRMB == 0 && m.CacheWritePriceRMB == 0
+				if !allEmpty {
+					cacheAlreadyFilled++
+				} else {
+					cacheUpdates := map[string]interface{}{}
+					if req.CacheImplicitRatio > 0 {
+						cacheUpdates["cache_input_price_rmb"] = math.Round(m.InputCostRMB*req.CacheImplicitRatio*1000000) / 1000000
+					}
+					if m.CacheMechanism == "both" || m.CacheMechanism == "explicit" {
+						if req.CacheExplicitRatio > 0 {
+							cacheUpdates["cache_explicit_input_price_rmb"] = math.Round(m.InputCostRMB*req.CacheExplicitRatio*1000000) / 1000000
+						}
+						if req.CacheWriteRatio > 0 {
+							cacheUpdates["cache_write_price_rmb"] = math.Round(m.InputCostRMB*req.CacheWriteRatio*1000000) / 1000000
+						}
+					}
+					if len(cacheUpdates) > 0 {
+						if err := h.db.Model(&model.AIModel{}).Where("id = ?", m.ID).Updates(cacheUpdates).Error; err == nil {
+							cacheUpdated++
+							addSample(&samplesCache, m.ModelName)
+						}
+					}
+				}
 			}
-			h.db.Create(&pricing)
-			created++
-		} else {
-			// 更新已有的0值记录
-			m.Pricing.InputPriceRMB = sellingInputRMB
-			m.Pricing.InputPricePerToken = int64(sellingInputRMB * 10000)
-			m.Pricing.OutputPriceRMB = sellingOutputRMB
-			m.Pricing.OutputPricePerToken = int64(sellingOutputRMB * 10000)
-			h.db.Save(m.Pricing)
-			updated++
+		}
+
+		// ── 3) 阶梯售价补全（仅当所有 tier 都未设 selling，避免覆盖已手工配置的档位） ──
+		if req.ApplyTiers {
+			if len(m.PriceTiers) == 0 {
+				tiersNone++
+			} else {
+				var data model.PriceTiersData
+				if err := json.Unmarshal(m.PriceTiers, &data); err == nil && len(data.Tiers) > 0 {
+					tiersCandidates++
+					allEmpty := true
+					for _, t := range data.Tiers {
+						if t.SellingInputPrice != nil || t.SellingOutputPrice != nil {
+							allEmpty = false
+							break
+						}
+					}
+					if !allEmpty {
+						tiersAlreadyFilled++
+					} else {
+						for i := range data.Tiers {
+							sin := math.Round(data.Tiers[i].InputPrice*req.Discount*1000000) / 1000000
+							sout := math.Round(data.Tiers[i].OutputPrice*req.Discount*1000000) / 1000000
+							data.Tiers[i].SellingInputPrice = &sin
+							data.Tiers[i].SellingOutputPrice = &sout
+						}
+						if bs, err := json.Marshal(data); err == nil {
+							if err := h.db.Model(&model.AIModel{}).Where("id = ?", m.ID).Update("price_tiers", model.JSON(bs)).Error; err == nil {
+								tiersUpdated++
+								addSample(&samplesTiers, m.ModelName)
+							}
+						}
+					}
+				} else {
+					tiersNone++
+				}
+			}
 		}
 	}
 
 	invalidatePublicModelsCache()
 	response.Success(c, gin.H{
-		"message":  fmt.Sprintf("售价补全完成：新建 %d 条，更新 %d 条", created, updated),
-		"created":  created,
-		"updated":  updated,
-		"discount": req.Discount,
+		"message":              fmt.Sprintf("补全完成：售价 新建%d/更新%d，缓存 %d，阶梯 %d", created, updated, cacheUpdated, tiersUpdated),
+		"discount":             req.Discount,
+		"total_candidates":     len(models),
+		"created":              created,
+		"updated":              updated,
+		"cache_updated":        cacheUpdated,
+		"tiers_updated":        tiersUpdated,
+		"price_already_filled": priceAlreadyFilled,
+		"cache_candidates":     cacheCandidates,
+		"cache_already_filled": cacheAlreadyFilled,
+		"cache_not_supported":  cacheNotSupported,
+		"tiers_candidates":     tiersCandidates,
+		"tiers_already_filled": tiersAlreadyFilled,
+		"tiers_none":           tiersNone,
+		"samples_price":        samplesPrice,
+		"samples_cache":        samplesCache,
+		"samples_tiers":        samplesTiers,
 	})
 }
 

@@ -1,0 +1,18 @@
+{
+  "_description": "PayPal 账号配置样本（沙箱，用于测试数据种子）",
+  "provider_type": "PAYPAL",
+  "account_name": "PayPal 主账号",
+  "is_active": true,
+  "is_sandbox": true,
+  "weight": 100,
+  "priority": 0,
+  "supported_currencies": "USD,EUR,GBP,HKD",
+  "config": {
+    "client_id": "AblxxxxEABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
+    "client_secret": "EmxxxxEABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
+    "webhook_id": "3XY44955XF432341J",
+    "mode": "sandbox",
+    "return_url": "https://tokenhubhk.com/balance?status=success",
+    "cancel_url": "https://tokenhubhk.com/checkout?status=cancel"
+  }
+}

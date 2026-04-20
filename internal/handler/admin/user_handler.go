@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	auditmw "tokenhub-server/internal/middleware/audit"
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 	usersvc "tokenhub-server/internal/service/user"
@@ -62,6 +63,11 @@ func (h *UserHandler) Update(c *gin.Context) {
 	if err != nil || id == 0 {
 		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
 		return
+	}
+
+	// 审计：记录修改前的用户快照（中间件会写入 audit_logs.old_value）
+	if oldUser, gerr := h.svc.GetByID(c.Request.Context(), uint(id)); gerr == nil && oldUser != nil {
+		auditmw.SetOldValue(c, oldUser)
 	}
 
 	var updates map[string]interface{}

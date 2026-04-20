@@ -407,6 +407,18 @@ func (s *TaskService) ApplyTaskPrices(taskID uint, modelIDs []uint) (*pricescrap
 			InputCostRMB:  item.ActualInputRMB,
 			OutputCostRMB: item.ActualOutputRMB,
 			PriceTiers:    item.PriceTiers,
+			// v3.5：透传元数据字段，让 ApplyPrices 能正确更新 pricing_unit/model_type
+			// 并据此判断缓存类型过滤（LLM/VLM 才能启用 cache）
+			PricingUnit:                item.PricingUnit,
+			ModelType:                  item.ModelType,
+			SupportsCache:              item.SupportsCache,
+			CacheMechanism:             item.CacheMechanism,
+			CacheMinTokens:             item.CacheMinTokens,
+			CacheInputPriceRMB:         item.CacheInputPriceRMB,
+			CacheExplicitInputPriceRMB: item.CacheExplicitInputPriceRMB,
+			CacheWritePriceRMB:         item.CacheWritePriceRMB,
+			CacheStoragePriceRMB:       item.CacheStoragePriceRMB,
+			VideoPricingConfig:         item.VideoPricingConfig,
 		})
 	}
 

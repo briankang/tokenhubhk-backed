@@ -1,7 +1,9 @@
 package database
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -18,7 +20,35 @@ import (
 // DB 全局 GORM 数据库实例
 var DB *gorm.DB
 
-// Init 初始化 GORM MySQL 连接并执行自动迁移
+// logInfo / logWarn / logError 小工具：logger 为 nil 时也不 panic
+func logInfo(logger *zap.Logger, msg string, fields ...zap.Field) {
+	if logger != nil {
+		logger.Info(msg, fields...)
+	}
+}
+func logError(logger *zap.Logger, msg string, fields ...zap.Field) {
+	if logger != nil {
+		logger.Error(msg, fields...)
+	}
+}
+
+// CurrentSchemaVersion 当前代码期望的数据库 schema 版本。
+// 每次有破坏性 schema 变更（新增/修改表结构、字段类型变更）时递增。
+// 管理员可通过 POST /api/v1/admin/system/migrate 触发升级脚本。
+const CurrentSchemaVersion = "v5.1.0"
+
+// schemaVersionKey system_configs 表中存储版本号的 key
+const schemaVersionKey = "schema_version"
+
+// Init 初始化 GORM MySQL 连接 —— **仅建立连接，不做任何 schema 变更 / 种子写入**。
+//
+// 启动时只做必要的事情：TCP 预检 → GORM 连接 → Ping → 连接池配置 → schema_version 只读校验。
+//
+// 所有 schema 迁移 / 种子数据的写入均通过以下渠道触发：
+//   - 首次部署：安装向导 POST /api/v1/setup/import-seed 调用 RunSchemaInit + RunAllSeeds
+//   - 版本升级：管理员接口 POST /api/v1/admin/system/migrate
+//   - CLI 工具（未来扩展）
+//
 // 参数:
 //   - cfg: 数据库配置
 //   - logger: Zap 日志实例
@@ -28,19 +58,49 @@ func Init(cfg config.DatabaseConfig, logger *zap.Logger) error {
 		return fmt.Errorf("database DSN is empty")
 	}
 
+	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	logInfo(logger, "database: starting init",
+		zap.String("host", cfg.Host),
+		zap.Int("port", cfg.Port),
+		zap.String("user", cfg.User),
+		zap.String("dbname", cfg.DBName),
+	)
+
+	// Step 1: TCP 预检（5s 超时）
+	logInfo(logger, "database: tcp preflight", zap.String("addr", addr))
+	tcpStart := time.Now()
+	conn, tcpErr := net.DialTimeout("tcp", addr, 5*time.Second)
+	if tcpErr != nil {
+		logError(logger, "database: tcp preflight FAILED",
+			zap.String("addr", addr),
+			zap.Error(tcpErr),
+			zap.String("hint", "检查 RDS 白名单是否放通 Pod IP 段（如 172.16.0.0/12），以及实例状态"),
+		)
+		return fmt.Errorf("database tcp preflight failed (%s): %w", addr, tcpErr)
+	}
+	_ = conn.Close()
+	logInfo(logger, "database: tcp preflight OK",
+		zap.String("addr", addr),
+		zap.Duration("cost", time.Since(tcpStart)),
+	)
+
 	logLevel := gormlogger.Warn
 	if cfg.Host == "" {
 		logLevel = gormlogger.Silent
 	}
 
+	// Step 2: gorm.Open（内部按需建连）
+	logInfo(logger, "database: gorm.Open")
 	var err error
 	DB, err = gorm.Open(mysql.Open(dsn), &gorm.Config{
 		Logger:                                   gormlogger.Default.LogMode(logLevel),
 		DisableForeignKeyConstraintWhenMigrating: true,
 	})
 	if err != nil {
+		logError(logger, "database: gorm.Open FAILED", zap.Error(err))
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
+	logInfo(logger, "database: gorm.Open OK")
 
 	// 注册连接初始化回调，确保每个新连接都使用 utf8mb4
 	DB.Callback().Create().Before("gorm:create").Register("set_charset", func(db *gorm.DB) {
@@ -55,8 +115,22 @@ func Init(cfg config.DatabaseConfig, logger *zap.Logger) error {
 
 	sqlDB, err := DB.DB()
 	if err != nil {
+		logError(logger, "database: get sql.DB FAILED", zap.Error(err))
 		return fmt.Errorf("failed to get underlying sql.DB: %w", err)
 	}
+
+	// Step 3: Ping 验证凭证 + 实际建连（5s 超时）
+	logInfo(logger, "database: ping (auth check)")
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if pingErr := sqlDB.PingContext(pingCtx); pingErr != nil {
+		logError(logger, "database: ping FAILED",
+			zap.Error(pingErr),
+			zap.String("hint", "若 TCP 通但 ping 失败：多半是账号密码错、账号没授权到 DB、或 RDS 实例未 Ready"),
+		)
+		return fmt.Errorf("database ping failed: %w", pingErr)
+	}
+	logInfo(logger, "database: ping OK")
 
 	// 立即设置当前连接的字符集
 	DB.Exec("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci")
@@ -65,42 +139,169 @@ func Init(cfg config.DatabaseConfig, logger *zap.Logger) error {
 	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
 	sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
 	sqlDB.SetConnMaxLifetime(time.Duration(cfg.ConnMaxLifetime) * time.Second)
-
-	if logger != nil {
-		logger.Info("database connected",
-			zap.String("host", cfg.Host),
-			zap.Int("port", cfg.Port),
-			zap.String("dbname", cfg.DBName),
-		)
+	// 空闲连接回收（2026-04-22 加固）：
+	//   防止 idle 连接被 RDS 侧主动关闭（默认 wait_timeout=28800s）后，
+	//   下次 handler 拿到"坏连接"导致 `invalid connection` / `bad connection` → 502。
+	//   5 分钟 < RDS wait_timeout，安全回收。
+	connMaxIdle := cfg.ConnMaxIdleTime
+	if connMaxIdle <= 0 {
+		connMaxIdle = 300 // 默认 5 分钟
 	}
+	sqlDB.SetConnMaxIdleTime(time.Duration(connMaxIdle) * time.Second)
+	logInfo(logger, "database: connected",
+		zap.Int("max_open", cfg.MaxOpenConns),
+		zap.Int("max_idle", cfg.MaxIdleConns),
+		zap.Int("conn_max_idle_time_sec", connMaxIdle),
+	)
 
-	// 自动迁移所有模型
-	// 先清理旧版 Prisma 遗留的外键和表
-	dropLegacyConstraints()
-	dropLegacyTables()
-	// 删除旧的模型佣金配置表（结构变更不兼容，需要重建）
-	dropOldModelCommissionTable()
-	// 删除 suppliers 表的旧唯一索引（code 列）-> 新的联合索引（code + access_type）
-	dropSupplierOldIndex()
-	if err := autoMigrate(); err != nil {
-		return fmt.Errorf("auto-migrate failed: %w", err)
-	}
-
-	// 初始化默认管理员用户和租户
-	if err := seedDefaults(); err != nil {
-		if logger != nil {
-			logger.Warn("seed defaults failed", zap.Error(err))
-		}
-	}
-
-	// 幂等写入模型标签种子数据（热卖/开源/优惠）
-	if err := seedModelLabels(); err != nil {
-		if logger != nil {
-			logger.Warn("seed model labels failed", zap.Error(err))
-		}
+	// 只读 schema_version 校验（不阻塞启动，仅在不匹配时告警）
+	// 表不存在 → 视为首次部署，提示走安装向导
+	// 表存在但版本落后 → 提示管理员触发升级接口
+	checkSchemaVersion(logger)
+	if err := ensureBillingCostUnitColumns(); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+func ensureBillingCostUnitColumns() error {
+	if DB == nil {
+		return nil
+	}
+	if err := ensureModelColumns(&model.ApiCallLog{}, []string{
+		"CostUnits",
+		"EstimatedCostUnits",
+		"FrozenUnits",
+		"ActualCostUnits",
+		"PlatformCostUnits",
+		"UnderCollectedUnits",
+	}); err != nil {
+		return err
+	}
+	return ensureModelColumns(&model.BillingReconciliationSnapshot{}, []string{
+		"ActualRevenueUnits",
+		"EstimatedCostUnits",
+		"EstimateVarianceCredits",
+		"EstimateVarianceUnits",
+		"FrozenUnits",
+		"UnderCollectedUnits",
+		"PlatformCostUnits",
+		"ExpiredFreezeUnits",
+		"OpenFrozenUnits",
+	})
+}
+
+func ensureModelColumns(dst interface{}, fields []string) error {
+	if !DB.Migrator().HasTable(dst) {
+		return nil
+	}
+	for _, field := range fields {
+		if DB.Migrator().HasColumn(dst, field) {
+			continue
+		}
+		if err := DB.Migrator().AddColumn(dst, field); err != nil {
+			return fmt.Errorf("add billing column %s failed: %w", field, err)
+		}
+	}
+	return nil
+}
+
+// checkSchemaVersion 只读检查 system_configs.schema_version 是否与当前代码版本匹配。
+// 失败不阻塞启动（已有部署可能根本没建表）；只记 WARN 日志指引运维。
+func checkSchemaVersion(logger *zap.Logger) {
+	// 防御：表不存在时直接返回（全新库，等待安装向导执行 RunSchemaInit）
+	if !DB.Migrator().HasTable(&model.SystemConfig{}) {
+		logInfo(logger, "database: system_configs table missing, awaiting setup wizard",
+			zap.String("expected_version", CurrentSchemaVersion))
+		return
+	}
+	var cfg model.SystemConfig
+	err := DB.Where("`key` = ?", schemaVersionKey).First(&cfg).Error
+	if err != nil {
+		logInfo(logger, "database: schema_version not set (first deployment?)",
+			zap.String("expected_version", CurrentSchemaVersion),
+			zap.String("hint", "首次部署请走 /api/v1/setup/import-seed；升级部署请调用 /api/v1/admin/system/migrate"),
+		)
+		return
+	}
+	if cfg.Value != CurrentSchemaVersion {
+		if logger != nil {
+			logger.Warn("database: schema version mismatch",
+				zap.String("db_version", cfg.Value),
+				zap.String("expected", CurrentSchemaVersion),
+				zap.String("hint", "管理员需调用 POST /api/v1/admin/system/migrate 触发 schema 升级"),
+			)
+		}
+		return
+	}
+	logInfo(logger, "database: schema version OK", zap.String("version", cfg.Value))
+}
+
+// RunSchemaInit 执行完整的 schema 初始化（清理遗留 + AutoMigrate 全部表）。
+//
+// 调用场景（均非启动路径）：
+//   - 安装向导：POST /api/v1/setup/import-seed
+//   - 管理员升级：POST /api/v1/admin/system/migrate
+//   - 本地 fresh-install 脚本
+//
+// 幂等保证：dropLegacy* 只删旧结构，AutoMigrate 只补字段不删字段。
+func RunSchemaInit(db *gorm.DB) error {
+	prevDB := DB
+	DB = db
+	defer func() { DB = prevDB }()
+
+	// 1. 清理旧版 Prisma 遗留的外键和表
+	dropLegacyConstraints()
+	dropLegacyTables()
+	// 2. 删除旧的模型佣金配置表（结构变更不兼容，需要重建）
+	dropOldModelCommissionTable()
+	// 3. 删除 suppliers 表的旧唯一索引（code 列）-> 新的联合索引（code + access_type）
+	dropSupplierOldIndex()
+	// 4. AutoMigrate 全部表
+	if err := autoMigrate(); err != nil {
+		return fmt.Errorf("auto-migrate failed: %w", err)
+	}
+	return nil
+}
+
+// MarkSchemaVersion 将当前代码的 schema 版本号写入 system_configs（upsert）。
+// 通常由 RunAllSeeds / 管理员迁移接口在完成 schema + seed 后调用。
+func MarkSchemaVersion(db *gorm.DB) error {
+	var existing model.SystemConfig
+	err := db.Where("`key` = ?", schemaVersionKey).First(&existing).Error
+	if err == gorm.ErrRecordNotFound {
+		return db.Create(&model.SystemConfig{
+			Key:   schemaVersionKey,
+			Value: CurrentSchemaVersion,
+		}).Error
+	}
+	if err != nil {
+		return err
+	}
+	if existing.Value == CurrentSchemaVersion {
+		return nil
+	}
+	existing.Value = CurrentSchemaVersion
+	return db.Save(&existing).Error
+}
+
+// SeedDefaults 对外暴露的管理员/平台租户种子函数。
+// 仅在 RunAllSeeds / 安装向导中调用，不再由 Init 自动触发。
+func SeedDefaults(db *gorm.DB) error {
+	prevDB := DB
+	DB = db
+	defer func() { DB = prevDB }()
+	return seedDefaults()
+}
+
+// SeedModelLabels 对外暴露的模型标签种子函数。
+// 仅在 RunAllSeeds / 安装向导中调用，不再由 Init 自动触发。
+func SeedModelLabels(db *gorm.DB) error {
+	prevDB := DB
+	DB = db
+	defer func() { DB = prevDB }()
+	return seedModelLabels()
 }
 
 // dropSupplierOldIndex 删除 suppliers 表的旧唯一索引（code 列）
@@ -225,6 +426,7 @@ func autoMigrate() error {
 		&model.ModelPricing{},
 		&model.AgentLevelDiscount{},
 		&model.AgentPricing{},
+		&model.UserModelDiscount{},
 		&model.ChannelLog{},
 		&model.DailyStats{},
 		&model.Orchestration{},
@@ -249,25 +451,29 @@ func autoMigrate() error {
 		&model.UserMemberProfile{},
 		&model.WithdrawalRequest{},
 		&model.ExchangeRate{},
-		&model.CustomChannel{},       // 自定义渠道
-		&model.CustomChannelRoute{},  // 自定义渠道路由规则
-		&model.CustomChannelAccess{}, // 自定义渠道访问控制
-		&model.ChannelModel{},        // 渠道-模型映射（标准模型名 <-> 供应商模型ID）
-		&model.PriceSyncLog{},        // 价格同步历史日志
-		&model.ModelCheckLog{},       // 模型可用性检测记录
-		&model.ModelCheckTask{},      // 模型检测后台任务
-		&model.CapabilityTestCase{},    // 能力测试用例模板（可复用）
-		&model.CapabilityTestTask{},    // 能力测试批量运行任务
-		&model.CapabilityTestResult{},  // 能力测试单条结果（model×case）
-		&model.CapabilityTestBaseline{}, // 能力测试回归基线
-		&model.BackgroundTask{},     // 后台异步任务
-		&model.ApiCallLog{},         // API 调用全链路日志
-		&model.PlatformParam{},      // 平台标准参数定义
-		&model.SupplierParamMapping{}, // 供应商参数映射
+		&model.CustomChannel{},                 // 自定义渠道
+		&model.CustomChannelRoute{},            // 自定义渠道路由规则
+		&model.CustomChannelAccess{},           // 自定义渠道访问控制
+		&model.ChannelModel{},                  // 渠道-模型映射（标准模型名 <-> 供应商模型ID）
+		&model.PriceSyncLog{},                  // 价格同步历史日志
+		&model.ModelCheckLog{},                 // 模型可用性检测记录
+		&model.ModelCheckTask{},                // 模型检测后台任务
+		&model.CapabilityTestCase{},            // 能力测试用例模板（可复用）
+		&model.CapabilityTestTask{},            // 能力测试批量运行任务
+		&model.CapabilityTestResult{},          // 能力测试单条结果（model×case）
+		&model.CapabilityTestBaseline{},        // 能力测试回归基线
+		&model.BackgroundTask{},                // 后台异步任务
+		&model.ApiCallLog{},                    // API 调用全链路日志
+		&model.BillingReconciliationSnapshot{}, // 每日扣费对账快照
+		&model.PlatformParam{},                 // 平台标准参数定义
+		&model.SupplierParamMapping{},          // 供应商参数映射
 
 		// --- v3.1 新增模型:邀请返佣 / 特殊加佣 / 风控 / 配置审计 ---
 		&model.ReferralAttribution{},    // 邀请归因快照
 		&model.UserCommissionOverride{}, // 特殊用户加佣配置
+		&model.CommissionRule{},         // 特殊返佣规则（用户×模型）
+		&model.CommissionRuleUser{},     // 规则-用户关联
+		&model.CommissionRuleModel{},    // 规则-模型关联
 		&model.RegistrationGuard{},      // 注册风控配置
 		&model.RegistrationEvent{},      // 注册行为审计日志
 		&model.EmailOTPToken{},          // 邮箱 OTP 验证码
@@ -281,8 +487,8 @@ func autoMigrate() error {
 		&model.UserAnnouncementRead{}, // 用户公告已读记录
 
 		// --- 模型 k:v 标签系统 ---
-		&model.ModelLabel{},       // 模型标签（热卖/开源/优惠等，支持自定义 k:v）
-		&model.LabelDictionary{},  // v3.5 标签字典（多语言 + 颜色 + 图标 + 排序权重）
+		&model.ModelLabel{},      // 模型标签（热卖/开源/优惠等，支持自定义 k:v）
+		&model.LabelDictionary{}, // v3.5 标签字典（多语言 + 颜色 + 图标 + 排序权重）
 
 		// --- v3.2 支付/订单/财务系统重构 ---
 		&model.ExchangeRateHistory{},    // 汇率历史快照（审计 + 降级 fallback）
@@ -312,6 +518,21 @@ func autoMigrate() error {
 		&model.Role{},           // 角色定义（内置 + 自定义）
 		&model.RolePermission{}, // 角色-权限关联
 		&model.UserRole{},       // 用户-角色关联
+
+		// --- 限流 429 事件审计 ---
+		&model.RateLimitEvent{},
+
+		// --- 用户认证行为日志（register/login/logout/refresh）---
+		&model.UserAuthLog{},
+
+		// --- 发票系统（v4.2 新增）---
+		&model.InvoiceRequest{},
+		&model.InvoiceTitle{},
+
+		// --- 邮件管理（v4.3 新增）---
+		&model.EmailProviderConfig{},
+		&model.EmailTemplate{},
+		&model.EmailSendLog{},
 	)
 }
 
@@ -325,12 +546,11 @@ func seedDefaults() error {
 	)
 
 	// 检查管理员用户是否已存在
-	var count int64
-	if err := DB.Model(&model.User{}).Where("email = ?", adminEmail).Count(&count).Error; err != nil {
+	var existing model.User
+	if err := DB.Where("email = ?", adminEmail).First(&existing).Error; err == nil {
+		return ensureDefaultAdminPasswordHash(DB, &existing, adminPass)
+	} else if err.Error() != "record not found" {
 		return fmt.Errorf("check admin user: %w", err)
-	}
-	if count > 0 {
-		return nil // already seeded
 	}
 
 	// 确保默认租户存在
@@ -353,7 +573,7 @@ func seedDefaults() error {
 	}
 
 	// 创建管理员用户
-	hash, err := bcrypt.GenerateFromPassword([]byte(adminPass), 12)
+	hash, err := bcrypt.GenerateFromPassword([]byte(clientPasswordHash(adminEmail, adminPass)), 12)
 	if err != nil {
 		return fmt.Errorf("hash admin password: %w", err)
 	}
@@ -363,13 +583,14 @@ func seedDefaults() error {
 		Email:        adminEmail,
 		PasswordHash: string(hash),
 		Name:         adminName,
-		Role:         "ADMIN",
 		IsActive:     true,
 		Language:     "en",
 	}
 	if err := DB.Create(&adminUser).Error; err != nil {
 		return fmt.Errorf("create admin user: %w", err)
 	}
+	// v4.0: 用户角色由 permission.Seed() 稍后回填（此时 roles 表可能尚未种子化，
+	// 无法在此直接插入 user_roles；permission.Seed 的 backfillUserRoles 会兜底）
 
 	// 创建默认自定义渠道（如果不存在 is_default=true 的记录）
 	var defaultChannelCount int64

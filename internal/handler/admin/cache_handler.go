@@ -2,7 +2,9 @@ package admin
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -10,6 +12,7 @@ import (
 	"tokenhub-server/internal/pkg/logger"
 	"tokenhub-server/internal/pkg/response"
 	cachesvc "tokenhub-server/internal/service/cache"
+	"tokenhub-server/internal/service/usercache"
 )
 
 // CacheHandler 缓存管理接口处理器（管理员专用）
@@ -30,6 +33,10 @@ func (h *CacheHandler) Register(rg *gin.RouterGroup) {
 		cache.POST("/clear-all", h.ClearAll)
 		cache.POST("/clear/:prefix", h.ClearByPrefix)
 		cache.POST("/clear-channel-routes", h.ClearChannelRouteCache)
+		cache.POST("/clear-user-cache", h.ClearUserCache)
+		cache.POST("/clear-stats-cache", h.ClearStatsCache)
+		cache.POST("/clear-public-cache", h.ClearPublicCache)
+		cache.POST("/clear-pricing-cache", h.ClearPricingCache)
 		cache.POST("/warm", h.Warm)
 		cache.GET("/stats", h.Stats)
 	}
@@ -120,6 +127,97 @@ func (h *CacheHandler) ClearChannelRouteCache(c *gin.Context) {
 		"deleted": totalDeleted,
 		"message": "渠道路由缓存已清除",
 	})
+}
+
+// ClearUserCache 清除用户维度缓存（profile/balance/apikeys/notif）
+// POST /api/v1/admin/cache/clear-user-cache?user_id=123
+// 不传 user_id 时清除全部用户的缓存。
+func (h *CacheHandler) ClearUserCache(c *gin.Context) {
+	ctx := c.Request.Context()
+	userIDStr := c.Query("user_id")
+
+	if userIDStr != "" {
+		uid, err := strconv.ParseUint(userIDStr, 10, 64)
+		if err != nil || uid == 0 {
+			response.ErrorMsg(c, http.StatusBadRequest, 40001, "user_id 无效")
+			return
+		}
+		usercache.InvalidateAll(ctx, uint(uid))
+		logger.L.Info("管理员清除单个用户缓存", zap.Uint64("user_id", uid))
+		response.Success(c, gin.H{"user_id": uid, "message": "用户缓存已清除"})
+		return
+	}
+
+	// 全量清理
+	deleted, err := usercache.InvalidatePatternAll(ctx)
+	if err != nil {
+		logger.L.Error("清除全部用户缓存失败", zap.Error(err))
+		response.ErrorMsg(c, http.StatusInternalServerError, 50001, "清除缓存失败: "+err.Error())
+		return
+	}
+
+	logger.L.Info("管理员清除全部用户缓存", zap.Int("deleted", deleted))
+	response.Success(c, gin.H{"deleted": deleted, "message": "全部用户缓存已清除"})
+}
+
+// ClearStatsCache 清除 admin:stats:* 共享报表缓存
+// POST /api/v1/admin/cache/clear-stats-cache
+func (h *CacheHandler) ClearStatsCache(c *gin.Context) {
+	ctx := c.Request.Context()
+	deleted, err := h.cacheSvc.DeleteByPattern(ctx, "admin:stats:*")
+	if err != nil {
+		logger.L.Error("清除统计缓存失败", zap.Error(err))
+		response.ErrorMsg(c, http.StatusInternalServerError, 50001, "清除缓存失败: "+err.Error())
+		return
+	}
+	logger.L.Info("管理员清除统计缓存", zap.Int64("deleted", deleted))
+	response.Success(c, gin.H{"deleted": deleted, "message": "统计报表缓存已清除"})
+}
+
+// ClearPublicCache 清除公开路由缓存（param-support / suppliers / channel-groups / cache_middleware 缓存）
+// POST /api/v1/admin/cache/clear-public-cache
+func (h *CacheHandler) ClearPublicCache(c *gin.Context) {
+	ctx := c.Request.Context()
+	var total int64
+	for _, pattern := range []string{"public:*", "cache:/api/v1/public/*"} {
+		d, err := h.cacheSvc.DeleteByPattern(ctx, pattern)
+		if err != nil {
+			logger.L.Error("清除公开缓存失败", zap.String("pattern", pattern), zap.Error(err))
+			continue
+		}
+		total += d
+	}
+	logger.L.Info("管理员清除公开缓存", zap.Int64("deleted", total))
+	response.Success(c, gin.H{"deleted": total, "message": "公开数据缓存已清除"})
+}
+
+// ClearPricingCache 清除定价缓存（pricing:*）
+// POST /api/v1/admin/cache/clear-pricing-cache?model_id=123
+// 不传 model_id 时清除所有定价缓存。
+func (h *CacheHandler) ClearPricingCache(c *gin.Context) {
+	ctx := c.Request.Context()
+	modelIDStr := c.Query("model_id")
+
+	pattern := "pricing:*"
+	if modelIDStr != "" {
+		mid, err := strconv.ParseUint(modelIDStr, 10, 64)
+		if err != nil || mid == 0 {
+			response.ErrorMsg(c, http.StatusBadRequest, 40001, "model_id 无效")
+			return
+		}
+		// 定价缓存 key 格式含 model_id 作为某一段，使用宽匹配
+		pattern = fmt.Sprintf("pricing:*:%d:*", mid)
+	}
+
+	deleted, err := h.cacheSvc.DeleteByPattern(ctx, pattern)
+	if err != nil {
+		logger.L.Error("清除定价缓存失败", zap.String("pattern", pattern), zap.Error(err))
+		response.ErrorMsg(c, http.StatusInternalServerError, 50001, "清除缓存失败: "+err.Error())
+		return
+	}
+
+	logger.L.Info("管理员清除定价缓存", zap.String("pattern", pattern), zap.Int64("deleted", deleted))
+	response.Success(c, gin.H{"pattern": pattern, "deleted": deleted, "message": "定价缓存已清除"})
 }
 
 // Warm 手动触发缓存预热

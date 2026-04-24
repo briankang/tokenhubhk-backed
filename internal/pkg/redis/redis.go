@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,21 +25,52 @@ type Config struct {
 }
 
 // Init 初始化全局Redis客户端
+// 分步诊断日志（输出到 stdout 便于 kubectl logs 排障）：
+//  1. 打印目标 addr + username 是否填充
+//  2. TCP 预检（5s 超时，避免 Dial 阶段无日志阻塞）
+//  3. NewClient（Ping 会触发实际建连 + AUTH）
+//  4. Ping 验证 username/password（5s 超时）
 func Init(cfg Config) error {
 	if cfg.Addr == "" {
 		return fmt.Errorf("redis addr is empty")
 	}
+
+	authMode := "AUTH password"
+	if cfg.Username != "" {
+		authMode = "ACL (username+password)"
+	}
+	fmt.Printf("redis: starting init addr=%s auth=%s db=%d\n", cfg.Addr, authMode, cfg.DB)
+
+	// Step 1: TCP 预检
+	fmt.Printf("redis: tcp preflight addr=%s\n", cfg.Addr)
+	tcpStart := time.Now()
+	conn, tcpErr := net.DialTimeout("tcp", cfg.Addr, 5*time.Second)
+	if tcpErr != nil {
+		fmt.Printf("redis: tcp preflight FAILED addr=%s err=%v (hint: 检查 Tair 白名单是否放通 Pod IP 段)\n", cfg.Addr, tcpErr)
+		return fmt.Errorf("redis tcp preflight failed (%s): %w", cfg.Addr, tcpErr)
+	}
+	_ = conn.Close()
+	fmt.Printf("redis: tcp preflight OK addr=%s cost=%v\n", cfg.Addr, time.Since(tcpStart))
+
+	// Step 2: NewClient
+	fmt.Println("redis: goredis.NewClient")
 	Client = goredis.NewClient(&goredis.Options{
 		Addr:     cfg.Addr,
 		Username: cfg.Username,
 		Password: cfg.Password,
 		DB:       cfg.DB,
 	})
+
+	// Step 3: Ping（触发实际建连 + AUTH）
+	fmt.Println("redis: ping (auth check)")
+	pingStart := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := Client.Ping(ctx).Err(); err != nil {
+		fmt.Printf("redis: ping FAILED err=%v (hint: TCP 通但 ping 失败多半是账号或密码错，或未设置 ACL 账号)\n", err)
 		return fmt.Errorf("redis ping failed: %w", err)
 	}
+	fmt.Printf("redis: ping OK cost=%v\n", time.Since(pingStart))
 	return nil
 }
 

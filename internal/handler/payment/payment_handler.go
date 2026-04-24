@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"tokenhub-server/internal/pkg/ctxutil"
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 	paymentsvc "tokenhub-server/internal/service/payment"
@@ -63,16 +64,19 @@ func (h *PaymentHandler) Create(c *gin.Context) {
 		return
 	}
 
-	userID, _ := c.Get("userId")
-	tenantID, _ := c.Get("tenantId")
+	uid, ok := ctxutil.MustUserID(c)
+	if !ok {
+		return
+	}
+	tid := ctxutil.TenantID(c)
 	clientIP := c.ClientIP()
 
 	// v3.2: 优先走带多账号路由的新路径（内部自动 fallback 到 CreatePayment）
 	result, err := h.svc.CreatePaymentWithRouting(
 		c.Request.Context(),
 		paymentsvc.CreatePaymentWithRoutingInput{
-			UserID:    userID.(uint),
-			TenantID:  tenantID.(uint),
+			UserID:    uid,
+			TenantID:  tid,
 			Gateway:   req.Gateway,
 			Amount:    req.Amount,
 			Currency:  req.Currency,
@@ -105,8 +109,11 @@ func (h *PaymentHandler) Query(c *gin.Context) {
 	}
 
 	// 验证订单是否属于当前请求用户
-	userID, _ := c.Get("userId")
-	if payment.UserID != userID.(uint) {
+	uid, ok := ctxutil.MustUserID(c)
+	if !ok {
+		return
+	}
+	if payment.UserID != uid {
 		response.Error(c, http.StatusForbidden, errcode.ErrPermissionDenied)
 		return
 	}
@@ -119,8 +126,11 @@ func (h *PaymentHandler) List(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 
-	userID, _ := c.Get("userId")
-	payments, total, err := h.svc.ListPayments(c.Request.Context(), userID.(uint), page, pageSize)
+	uid, ok := ctxutil.MustUserID(c)
+	if !ok {
+		return
+	}
+	payments, total, err := h.svc.ListPayments(c.Request.Context(), uid, page, pageSize)
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return
@@ -149,10 +159,13 @@ func (h *PaymentHandler) Refund(c *gin.Context) {
 		return
 	}
 
-	userID, _ := c.Get("userId")
+	uid, ok := ctxutil.MustUserID(c)
+	if !ok {
+		return
+	}
 	clientIP := c.ClientIP()
 
-	if err := h.svc.RefundPayment(c.Request.Context(), orderNo, req.Amount, req.Reason, clientIP, userID.(uint)); err != nil {
+	if err := h.svc.RefundPayment(c.Request.Context(), orderNo, req.Amount, req.Reason, clientIP, uid); err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrRefundFailed.Code, err.Error())
 		return
 	}

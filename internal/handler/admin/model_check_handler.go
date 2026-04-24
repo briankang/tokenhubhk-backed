@@ -11,6 +11,7 @@ import (
 
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
+	"tokenhub-server/internal/pkg/safego"
 	aimodelsvc "tokenhub-server/internal/service/aimodel"
 	"tokenhub-server/internal/taskqueue"
 )
@@ -55,10 +56,10 @@ func (h *ModelCheckHandler) BatchCheck(c *gin.Context) {
 	}
 	resultCh := make(chan checkResult, 1)
 
-	go func() {
+	safego.Go("model-check-batch-sse", func() {
 		results, err := h.checker.BatchCheck(c.Request.Context(), progressCh)
 		resultCh <- checkResult{results, err}
-	}()
+	})
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
@@ -157,10 +158,10 @@ func (h *ModelCheckHandler) Preview(c *gin.Context) {
 	}
 	resultCh := make(chan previewResult, 1)
 
-	go func() {
+	safego.Go("model-check-preview-sse", func() {
 		r, err := h.checker.BatchCheckPreview(c.Request.Context(), progressCh)
 		resultCh <- previewResult{r, err}
-	}()
+	})
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {

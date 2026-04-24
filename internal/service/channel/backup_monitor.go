@@ -14,6 +14,7 @@ import (
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/logger"
 	pkgredis "tokenhub-server/internal/pkg/redis"
+	"tokenhub-server/internal/pkg/safego"
 )
 
 // SwitchRuleType 备份切换规则类型
@@ -57,7 +58,7 @@ func NewBackupMonitor(db *gorm.DB, redis *goredis.Client, backupSvc *BackupServi
 func (m *BackupMonitor) Start(ctx context.Context) {
 	m.logger.Info("starting backup monitor")
 
-	go func() {
+	safego.Go("backup-monitor", func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 
@@ -67,10 +68,10 @@ func (m *BackupMonitor) Start(ctx context.Context) {
 				m.logger.Info("backup monitor stopped")
 				return
 			case <-ticker.C:
-				m.EvaluateRules(ctx)
+				safego.Run("backup-monitor-tick", func() { m.EvaluateRules(ctx) })
 			}
 		}
-	}()
+	})
 }
 
 // RecordMetric 记录请求指标到 Redis 滑动窗口，每次请求完成后调用

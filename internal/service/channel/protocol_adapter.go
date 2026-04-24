@@ -21,16 +21,25 @@ type ProviderRequest struct {
 //   - openai_chat: 标准 OpenAI 格式，POST {Endpoint}/chat/completions
 //   - openai_responses: OpenAI Responses API，POST {Endpoint}/responses
 //   - anthropic: Anthropic Claude API，POST {Endpoint}/v1/messages，x-api-key 鉴权
+//   - google_gemini: Google Gemini 原生，POST {Endpoint}（Endpoint 含 {MODEL} 占位符，用 model 参数替换）
 //   - custom: 自定义协议，POST {Endpoint}/{ApiPath}
 //
+// model 参数可选：若 Endpoint / ApiPath 中含 {MODEL} 占位符，会被替换为此值；
+// 无占位符时 model 被忽略（兼容不需要在 URL 中注入模型名的协议）。
+//
 // 返回: 目标URL、请求头、是否需要转换请求体
-func BuildProviderRequest(ch *model.Channel) *ProviderRequest {
+func BuildProviderRequest(ch *model.Channel, modelOpt ...string) *ProviderRequest {
 	pr := &ProviderRequest{
 		Headers: make(map[string]string),
 	}
 
+	modelName := ""
+	if len(modelOpt) > 0 {
+		modelName = modelOpt[0]
+	}
+
 	// ========== 构建 URL ==========
-	pr.TargetURL = buildTargetURL(ch)
+	pr.TargetURL = buildTargetURL(ch, modelName)
 
 	// ========== 构建鉴权头 ==========
 	buildAuthHeaders(ch, pr.Headers)
@@ -51,23 +60,44 @@ func BuildProviderRequest(ch *model.Channel) *ProviderRequest {
 }
 
 // buildTargetURL 根据协议配置构建目标请求URL
-// 如果 Channel.ApiPath 非空则使用自定义路径，否则按协议默认路径
-func buildTargetURL(ch *model.Channel) string {
+//
+// URL 构建规则（按优先级）：
+//  1. 如果 endpoint 或 apiPath 中含 {MODEL} 占位符，用 modelName 替换（Gemini 原生协议专用）
+//  2. 如果 ApiProtocol == "google_gemini"：直接使用 endpoint（模板），流式调用时自动将 :generateContent 替换为 :streamGenerateContent
+//  3. 如果 Channel.ApiPath 非空，追加到 endpoint 末尾
+//  4. 否则按协议枚举使用默认路径（/chat/completions, /v1/messages, /responses）
+//
+// modelName 用于 {MODEL} 占位符替换，空字符串时占位符不替换（可能产生非法 URL，需调用方保证）。
+func buildTargetURL(ch *model.Channel, modelName string) string {
 	endpoint := strings.TrimRight(ch.Endpoint, "/")
+	// 保留末尾斜杠为空但 endpoint 本身含 ":generateContent" 等非斜杠结尾的情况
+	rawEndpoint := ch.Endpoint
 
-	// 如果配置了自定义 API 路径，优先使用
+	protocol := ch.ApiProtocol
+	if protocol == "" {
+		protocol = "openai_chat"
+	}
+
+	// google_gemini 协议：直接使用 endpoint（含 {MODEL} 占位符），不追加任何默认路径
+	if protocol == "google_gemini" {
+		url := rawEndpoint
+		if modelName != "" {
+			url = strings.ReplaceAll(url, "{MODEL}", modelName)
+		}
+		return url
+	}
+
+	// 自定义路径优先：支持 {MODEL} 占位符
 	if ch.ApiPath != "" {
 		apiPath := ch.ApiPath
 		if !strings.HasPrefix(apiPath, "/") {
 			apiPath = "/" + apiPath
 		}
-		return endpoint + apiPath
-	}
-
-	// 按协议类型使用默认路径
-	protocol := ch.ApiProtocol
-	if protocol == "" {
-		protocol = "openai_chat"
+		full := endpoint + apiPath
+		if modelName != "" {
+			full = strings.ReplaceAll(full, "{MODEL}", modelName)
+		}
+		return full
 	}
 
 	switch protocol {
@@ -78,8 +108,11 @@ func buildTargetURL(ch *model.Channel) string {
 	case "anthropic":
 		return endpoint + "/v1/messages"
 	case "custom":
-		// 自定义协议必须配置 ApiPath，否则使用根路径
-		return endpoint
+		// 自定义协议：ApiPath 空时直接用 endpoint（全量 URL 场景）
+		if modelName != "" {
+			return strings.ReplaceAll(rawEndpoint, "{MODEL}", modelName)
+		}
+		return rawEndpoint
 	default:
 		return endpoint + "/chat/completions"
 	}
@@ -116,7 +149,13 @@ func buildAuthHeaders(ch *model.Channel, headers map[string]string) {
 	// Anthropic 协议需要额外的版本头
 	protocol := ch.ApiProtocol
 	if protocol == "anthropic" {
-		headers["anthropic-version"] = "2023-06-01"
+		// 若 CustomParams.headers 已指定 anthropic-version，尊重管理员配置；否则使用默认值
+		if _, exists := headers["anthropic-version"]; !exists {
+			headers["anthropic-version"] = "2023-06-01"
+		}
+		headers["Content-Type"] = "application/json"
+	}
+	if protocol == "google_gemini" {
 		headers["Content-Type"] = "application/json"
 	}
 }
@@ -179,6 +218,8 @@ func ProtocolInfo(protocol string) string {
 		return "OpenAI Responses API (/responses)"
 	case "anthropic":
 		return "Anthropic Claude (/v1/messages)"
+	case "google_gemini":
+		return "Google Gemini 原生 (v1beta/models/{MODEL}:generateContent)"
 	case "custom":
 		return "自定义协议"
 	default:

@@ -17,12 +17,14 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/middleware"
+	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/logger"
+	pkgredis "tokenhub-server/internal/pkg/redis"
 	"tokenhub-server/internal/provider"
 	"tokenhub-server/internal/service/apikey"
 	balancesvc "tokenhub-server/internal/service/balance"
+	billingsvc "tokenhub-server/internal/service/billing"
 	channelsvc "tokenhub-server/internal/service/channel"
 	codingsvc "tokenhub-server/internal/service/coding"
 	"tokenhub-server/internal/service/parammapping"
@@ -39,6 +41,7 @@ type CompletionsHandler struct {
 	pricingCalc    *pricing.PricingCalculator
 	apiKeySvc      *apikey.ApiKeyService
 	balanceSvc     *balancesvc.BalanceService
+	billingSvc     *billingsvc.Service
 	commissionCalc *referralsvc.CommissionCalculator
 	paramSvc       *parammapping.ParamMappingService
 	tpmLimiter     *middleware.TPMLimiter
@@ -64,6 +67,7 @@ func NewCompletionsHandler(
 		pricingCalc:    pricingCalc,
 		apiKeySvc:      apiKeySvc,
 		balanceSvc:     balSvc,
+		billingSvc:     billingsvc.NewService(db, pricingCalc, balSvc),
 		commissionCalc: commCalc,
 		paramSvc:       paramSvc,
 		tpmLimiter:     tpmLimiter,
@@ -136,23 +140,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 	// 提取用户请求中的扩展参数（非标准 OpenAI 字段）
 	var rawMap map[string]json.RawMessage
 	json.Unmarshal(rawBody, &rawMap)
-	standardFields := map[string]bool{
-		"model": true, "messages": true, "max_tokens": true, "temperature": true,
-		"top_p": true, "stream": true, "stream_options": true, "stop": true,
-		"n": true, "presence_penalty": true, "frequency_penalty": true,
-		"logit_bias": true, "user": true, "seed": true, "tools": true,
-		"tool_choice": true, "response_format": true, "logprobs": true,
-		"top_logprobs": true,
-	}
-	userExtraParams := make(map[string]interface{})
-	for k, v := range rawMap {
-		if !standardFields[k] {
-			var val interface{}
-			if json.Unmarshal(v, &val) == nil {
-				userExtraParams[k] = val
-			}
-		}
-	}
+	userExtraParams := extractChatExtraParams(rawMap)
 
 	if len(req.Messages) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -162,6 +150,46 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 			},
 		})
 		return
+	}
+
+	// 步骤 2.15：思考模式检测（阿里云 qwen3.x-plus / deepseek-r1 / qwq 等）
+	// 用于后续扣费环节按思考模式计价（若模型有 output_cost_thinking_rmb > 0）以及 ApiCallLog 审计
+	thinkingMode := false
+	if v, ok := userExtraParams["enable_thinking"]; ok {
+		if b, isBool := v.(bool); isBool && b {
+			thinkingMode = true
+		}
+	}
+	// 部分 qwen3 / doubao 等模型用 thinking / reasoning / extra_body 等字段
+	if !thinkingMode {
+		for _, k := range []string{"thinking", "reasoning", "reasoning_effort"} {
+			if v, ok := userExtraParams[k]; ok {
+				switch val := v.(type) {
+				case bool:
+					if val {
+						thinkingMode = true
+					}
+				case map[string]interface{}:
+					// {"thinking": {"enabled": true}} 或 {"thinking": {"type": "enabled"}}
+					if en, ok := val["enabled"].(bool); ok && en {
+						thinkingMode = true
+					}
+					if t, ok := val["type"].(string); ok && (t == "enabled" || t == "auto") {
+						thinkingMode = true
+					}
+				case string:
+					if val != "" && val != "none" && val != "disabled" && val != "off" {
+						thinkingMode = true
+					}
+				}
+				if thinkingMode {
+					break
+				}
+			}
+		}
+	}
+	if thinkingMode {
+		c.Set("thinking_mode", true)
 	}
 
 	// 步骤 2.2：模型元信息前置守卫
@@ -183,6 +211,20 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 			})
 			return
 		}
+
+		// v5.1: 免费层模型限制 —— Free 用户仅能调用 IsFreeTier=true 的模型
+		isPaid, _ := c.Get("isPaidUser")
+		if isPaidBool, ok := isPaid.(bool); ok && !isPaidBool && !meta.IsFreeTier {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": gin.H{
+					"message": fmt.Sprintf("Model %s is a premium model. Please recharge at least ¥10 to unlock all models.", req.Model),
+					"type":    "access_denied",
+					"code":    "premium_model_only",
+				},
+			})
+			return
+		}
+
 		if !isChatCompatibleModelType(meta.ModelType) {
 			hint := endpointHintForModelType(meta.ModelType)
 			h.logger.Warn("v1 chat: non-chat model type rejected",
@@ -193,6 +235,20 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 					"message": fmt.Sprintf("Model %s has type %q which is not supported on /v1/chat/completions; please use %s", req.Model, meta.ModelType, hint),
 					"type":    "invalid_request_error",
 					"code":    "unsupported_model_type",
+				},
+			})
+			return
+		}
+
+		if missing := meta.MissingRequiredFeatures(requiredChatFeatureKeys(&req, rawMap, thinkingMode)); len(missing) > 0 {
+			h.logger.Warn("v1 chat: model capability rejected",
+				zap.String("model", req.Model),
+				zap.Strings("missing_features", missing))
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": gin.H{
+					"message": fmt.Sprintf("Model %s does not support required capabilities: %s", req.Model, strings.Join(missing, ", ")),
+					"type":    "invalid_request_error",
+					"code":    "unsupported_model_capability",
 				},
 			})
 			return
@@ -277,7 +333,43 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 			zap.String("model", req.Model), zap.Error(err))
 	}
 
-	// 步骤3：Failover 重试循环（最多尝试 maxRetries 个不同渠道）
+	// 步骤3：并发计数与限速锁定 (v5.1: 记录并发到反滥用计数器)
+	freezeID := ""
+	if h.billingSvc != nil {
+		freeze, fErr := h.billingSvc.FreezeUsage(c.Request.Context(), billingsvc.UsageRequest{
+			RequestID:    requestID,
+			UserID:       keyInfo.UserID,
+			TenantID:     keyInfo.TenantID,
+			ModelName:    req.Model,
+			Usage:        estimateChatRequestUsage(&req),
+			ThinkingMode: c.GetBool("thinking_mode"),
+		})
+		if fErr != nil {
+			c.JSON(http.StatusPaymentRequired, gin.H{
+				"error": gin.H{
+					"message": "Insufficient balance",
+					"type":    "insufficient_quota",
+					"code":    "insufficient_quota",
+				},
+			})
+			return
+		}
+		if freeze != nil && freeze.FreezeID != "" {
+			freezeID = freeze.FreezeID
+			c.Set("billing_freeze_id", freezeID)
+			c.Set("estimated_cost_credits", freeze.EstimatedCostCredits)
+			c.Set("estimated_cost_units", freeze.EstimatedCostUnits)
+		}
+	}
+
+	concKey := fmt.Sprintf("abuse:conc:%d", keyInfo.UserID)
+	if pkgredis.Client != nil {
+		pkgredis.Client.Incr(c.Request.Context(), concKey)
+		pkgredis.Client.Expire(c.Request.Context(), concKey, 120*time.Second) // 安全 TTL
+		defer pkgredis.Client.Decr(c.Request.Context(), concKey)
+	}
+
+	// 步骤4：Failover 重试循环（最多尝试 maxRetries 个不同渠道）
 	const maxRetries = 3
 	customChannelID := keyInfo.CustomChannelID
 	var excludeChannelIDs []uint
@@ -423,7 +515,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 				if sseResult != nil && sseResult.Usage != nil && sseResult.Usage.TotalTokens > 0 {
 					partialCost, partialCostRMB, _ = h.calculateAndDeductCostWithErr(c, req.Model, keyInfo, *sseResult.Usage, requestID)
 					if h.commissionCalc != nil && partialCost > 0 {
-						h.commissionCalc.CalculateCommissionsAsync(keyInfo.UserID, keyInfo.TenantID, partialCost)
+						h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, partialCost, req.Model)
 					}
 					if h.tpmLimiter != nil {
 						h.tpmLimiter.RecordTPM(c.Request.Context(), keyInfo.UserID, sseResult.Usage.TotalTokens)
@@ -435,6 +527,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 						zap.String("request_id", requestID),
 						zap.Int64("cost_credits", partialCost))
 				} else {
+					h.releaseBillingFreeze(c, freezeID)
 					h.recordLog(ch.ID, chatReq.Model, keyInfo, requestID, 0, 0, int(latency), 500, writeErr.Error())
 				}
 				callLog.ChannelID = ch.ID
@@ -471,7 +564,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 						usage.PromptTokens, usage.CompletionTokens, int(latency), 200, warnMsg)
 					cost, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, *usage, requestID)
 					if h.commissionCalc != nil && cost > 0 {
-						h.commissionCalc.CalculateCommissionsAsync(keyInfo.UserID, keyInfo.TenantID, cost)
+						h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, cost, req.Model)
 					}
 					callLog.PromptTokens = usage.PromptTokens
 					callLog.CompletionTokens = usage.CompletionTokens
@@ -486,8 +579,11 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 						h.tpmLimiter.RecordTPM(c.Request.Context(), keyInfo.UserID, usage.TotalTokens)
 					}
 				} else if warnMsg != "" {
+					h.releaseBillingFreeze(c, freezeID)
 					// 无 usage 但有 thinking-only 警告，仍写入一条日志
 					h.recordLog(ch.ID, chatReq.Model, keyInfo, requestID, 0, 0, int(latency), 200, warnMsg)
+				} else {
+					h.releaseBillingFreeze(c, freezeID)
 				}
 				callLog.ChannelID = ch.ID
 				callLog.ActualModel = chatReq.Model
@@ -532,7 +628,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 		}(req.Model)
 		cost, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, resp.Usage, requestID)
 		if h.commissionCalc != nil && cost > 0 {
-			h.commissionCalc.CalculateCommissionsAsync(keyInfo.UserID, keyInfo.TenantID, cost)
+			h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, cost, req.Model)
 		}
 		// 记录实际 TPM 消耗
 		if h.tpmLimiter != nil && resp.Usage.TotalTokens > 0 {
@@ -586,6 +682,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 	h.recordApiCallLog(callLog)
 
 	c.Header("X-Request-ID", requestID)
+	h.releaseBillingFreeze(c, freezeID)
 	c.JSON(http.StatusBadGateway, gin.H{
 		"error": gin.H{
 			"message": "All upstream channels failed for model: " + req.Model,
@@ -629,7 +726,7 @@ func (h *CompletionsHandler) handleChat(
 	// 计算费用并扣减余额（返回积分 int64）
 	cost, _ := h.calculateAndDeductCost(c, req.Model, keyInfo, resp.Usage, requestID)
 	if h.commissionCalc != nil && cost > 0 {
-		h.commissionCalc.CalculateCommissionsAsync(keyInfo.UserID, keyInfo.TenantID, cost)
+		h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, cost, req.Model)
 	}
 
 	c.JSON(http.StatusOK, resp)
@@ -649,6 +746,7 @@ func (h *CompletionsHandler) handleStreamChat(
 	reader, err := p.StreamChat(c.Request.Context(), req)
 	if err != nil {
 		latency := time.Since(start).Milliseconds()
+		h.releaseBillingFreeze(c, h.billingFreezeID(c))
 		h.recordLog(ch.ID, req.Model, keyInfo, requestID, 0, 0, int(latency), 500, err.Error())
 		// 使用带错误分类的记录：timeout / canceled / 4xx 不计入熔断
 		h.channelRouter.RecordResultWithError(ch.ID, err, 0, int(latency))
@@ -668,6 +766,9 @@ func (h *CompletionsHandler) handleStreamChat(
 	if err != nil {
 		// 使用带错误分类的记录：客户端主动断开不应触发熔断
 		h.channelRouter.RecordResultWithError(ch.ID, err, 0, int(latency))
+		if sseResult == nil || sseResult.Usage == nil || sseResult.Usage.TotalTokens <= 0 {
+			h.releaseBillingFreeze(c, h.billingFreezeID(c))
+		}
 		h.recordLog(ch.ID, req.Model, keyInfo, requestID, 0, 0, int(latency), 500, err.Error())
 		return
 	}
@@ -686,10 +787,13 @@ func (h *CompletionsHandler) handleStreamChat(
 			usage.PromptTokens, usage.CompletionTokens, int(latency), 200, warnMsg)
 		cost, _ := h.calculateAndDeductCost(c, req.Model, keyInfo, *usage, requestID)
 		if h.commissionCalc != nil && cost > 0 {
-			h.commissionCalc.CalculateCommissionsAsync(keyInfo.UserID, keyInfo.TenantID, cost)
+			h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, cost, req.Model)
 		}
 	} else if warnMsg != "" {
+		h.releaseBillingFreeze(c, h.billingFreezeID(c))
 		h.recordLog(ch.ID, req.Model, keyInfo, requestID, 0, 0, int(latency), 200, warnMsg)
+	} else {
+		h.releaseBillingFreeze(c, h.billingFreezeID(c))
 	}
 }
 
@@ -755,11 +859,39 @@ func (h *CompletionsHandler) FIMCompletions(c *gin.Context) {
 	start := time.Now()
 
 	// 选择 Coding 渠道
+	freezeID := ""
+	if h.billingSvc != nil {
+		freeze, fErr := h.billingSvc.FreezeUsage(c.Request.Context(), billingsvc.UsageRequest{
+			RequestID: requestID,
+			UserID:    keyInfo.UserID,
+			TenantID:  keyInfo.TenantID,
+			ModelName: req.Model,
+			Usage:     estimateFIMRequestUsage(&req),
+		})
+		if fErr != nil {
+			c.JSON(http.StatusPaymentRequired, gin.H{
+				"error": gin.H{
+					"message": "Insufficient balance",
+					"type":    "insufficient_quota",
+					"code":    "insufficient_quota",
+				},
+			})
+			return
+		}
+		if freeze != nil && freeze.FreezeID != "" {
+			freezeID = freeze.FreezeID
+			c.Set("billing_freeze_id", freezeID)
+			c.Set("estimated_cost_credits", freeze.EstimatedCostCredits)
+			c.Set("estimated_cost_units", freeze.EstimatedCostUnits)
+		}
+	}
+
 	ch, err := h.codingSvc.SelectCodingChannel(c.Request.Context(), req.Model)
 	if err != nil {
 		// 尝试通过通用渠道路由选择
 		result, err2 := h.channelRouter.SelectChannel(c.Request.Context(), req.Model, keyInfo.CustomChannelID, keyInfo.UserID)
 		if err2 != nil {
+			h.releaseBillingFreeze(c, freezeID)
 			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"error": gin.H{
 					"message": "No available channel for model: " + req.Model,
@@ -807,6 +939,7 @@ func (h *CompletionsHandler) FIMCompletions(c *gin.Context) {
 	latency := time.Since(start).Milliseconds()
 
 	if err != nil {
+		h.releaseBillingFreeze(c, freezeID)
 		h.recordLog(ch.ID, req.Model, keyInfo, requestID, 0, 0, int(latency), 500, err.Error())
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error": gin.H{
@@ -819,19 +952,28 @@ func (h *CompletionsHandler) FIMCompletions(c *gin.Context) {
 
 	h.recordLog(ch.ID, req.Model, keyInfo, requestID,
 		resp.Usage.PromptTokens, resp.Usage.CompletionTokens, int(latency), 200, "")
-	cost, _ := h.calculateAndDeductCost(c, req.Model, keyInfo, resp.Usage, requestID)
+	cost, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, resp.Usage, requestID)
 	if h.commissionCalc != nil && cost > 0 {
-		h.commissionCalc.CalculateCommissionsAsync(keyInfo.UserID, keyInfo.TenantID, cost)
+		h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, cost, req.Model)
 	}
 	if h.tpmLimiter != nil && resp.Usage.TotalTokens > 0 {
 		h.tpmLimiter.RecordTPM(c.Request.Context(), keyInfo.UserID, resp.Usage.TotalTokens)
+	}
+	h.recordFIMApiCallLog(c, &req, ch, keyInfo, requestID, &resp.Usage, int(latency), 200, cost, costRMB, "")
+
+	// v5.1: 记录积分消耗到反滥用 TPM 计数器
+	if pkgredis.Client != nil && cost > 0 {
+		minuteKey := time.Now().Unix() / 60
+		abuseTpmKey := fmt.Sprintf("abuse:tpm:%d:%d", keyInfo.UserID, minuteKey)
+		pkgredis.Client.IncrBy(c.Request.Context(), abuseTpmKey, cost)
+		pkgredis.Client.Expire(c.Request.Context(), abuseTpmKey, 120*time.Second)
 	}
 
 	// 转换为 OpenAI completions 响应格式
 	completionText := ""
 	finishReason := "stop"
 	if len(resp.Choices) > 0 {
-		completionText = resp.Choices[0].Message.Content
+		completionText = provider.TextContent(resp.Choices[0].Message.Content)
 		finishReason = resp.Choices[0].FinishReason
 	}
 
@@ -882,6 +1024,7 @@ func (h *CompletionsHandler) handleDeepSeekFIM(
 		reader, err := p.FIMStreamCompletion(c.Request.Context(), fimReq)
 		if err != nil {
 			latency := time.Since(start).Milliseconds()
+			h.releaseBillingFreeze(c, h.billingFreezeID(c))
 			h.recordLog(ch.ID, req.Model, keyInfo, requestID, 0, 0, int(latency), 500, err.Error())
 			c.JSON(http.StatusBadGateway, gin.H{
 				"error": gin.H{
@@ -894,6 +1037,9 @@ func (h *CompletionsHandler) handleDeepSeekFIM(
 		sseResult, err := provider.SSEWriter(c, reader, false)
 		latency := time.Since(start).Milliseconds()
 		if err != nil {
+			if sseResult == nil || sseResult.Usage == nil || sseResult.Usage.TotalTokens <= 0 {
+				h.releaseBillingFreeze(c, h.billingFreezeID(c))
+			}
 			h.recordLog(ch.ID, req.Model, keyInfo, requestID, 0, 0, int(latency), 500, err.Error())
 			return
 		}
@@ -901,13 +1047,16 @@ func (h *CompletionsHandler) handleDeepSeekFIM(
 			usage := sseResult.Usage
 			h.recordLog(ch.ID, req.Model, keyInfo, requestID,
 				usage.PromptTokens, usage.CompletionTokens, int(latency), 200, "")
-			cost, _ := h.calculateAndDeductCost(c, req.Model, keyInfo, *usage, requestID)
+			cost, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, *usage, requestID)
 			if h.commissionCalc != nil && cost > 0 {
-				h.commissionCalc.CalculateCommissionsAsync(keyInfo.UserID, keyInfo.TenantID, cost)
+				h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, cost, req.Model)
 			}
 			if h.tpmLimiter != nil && usage.TotalTokens > 0 {
 				h.tpmLimiter.RecordTPM(c.Request.Context(), keyInfo.UserID, usage.TotalTokens)
 			}
+			h.recordFIMApiCallLog(c, req, ch, keyInfo, requestID, usage, int(latency), 200, cost, costRMB, "")
+		} else {
+			h.releaseBillingFreeze(c, h.billingFreezeID(c))
 		}
 		return
 	}
@@ -917,6 +1066,7 @@ func (h *CompletionsHandler) handleDeepSeekFIM(
 	latency := time.Since(start).Milliseconds()
 
 	if err != nil {
+		h.releaseBillingFreeze(c, h.billingFreezeID(c))
 		h.recordLog(ch.ID, req.Model, keyInfo, requestID, 0, 0, int(latency), 500, err.Error())
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error": gin.H{
@@ -930,13 +1080,16 @@ func (h *CompletionsHandler) handleDeepSeekFIM(
 	if fimResp.Usage != nil {
 		h.recordLog(ch.ID, req.Model, keyInfo, requestID,
 			fimResp.Usage.PromptTokens, fimResp.Usage.CompletionTokens, int(latency), 200, "")
-		cost, _ := h.calculateAndDeductCost(c, req.Model, keyInfo, *fimResp.Usage, requestID)
+		cost, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, *fimResp.Usage, requestID)
 		if h.commissionCalc != nil && cost > 0 {
-			h.commissionCalc.CalculateCommissionsAsync(keyInfo.UserID, keyInfo.TenantID, cost)
+			h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, cost, req.Model)
 		}
 		if h.tpmLimiter != nil && fimResp.Usage.TotalTokens > 0 {
 			h.tpmLimiter.RecordTPM(c.Request.Context(), keyInfo.UserID, fimResp.Usage.TotalTokens)
 		}
+		h.recordFIMApiCallLog(c, req, ch, keyInfo, requestID, fimResp.Usage, int(latency), 200, cost, costRMB, "")
+	} else {
+		h.releaseBillingFreeze(c, h.billingFreezeID(c))
 	}
 
 	c.JSON(http.StatusOK, fimResp)
@@ -975,18 +1128,18 @@ func (h *CompletionsHandler) recordLog(
 	category := inferErrorCategory(statusCode, errMsg)
 	go func() {
 		log := &model.ChannelLog{
-			ChannelID:      channelID,
-			ModelName:      modelName,
-			TenantID:       keyInfo.TenantID,
-			UserID:         keyInfo.UserID,
-			ApiKeyID:       keyInfo.KeyID,
-			RequestTokens:  promptTokens,
-			ResponseTokens: completionTokens,
-			LatencyMs:      latencyMs,
-			StatusCode:     statusCode,
-			ErrorMessage:   errMsg,
-			ErrorCategory:  category,
-			RequestID:      requestID,
+			ChannelID:           channelID,
+			ModelName:           modelName,
+			TenantID:            keyInfo.TenantID,
+			UserID:              keyInfo.UserID,
+			ApiKeyID:            keyInfo.KeyID,
+			RequestTokens:       promptTokens,
+			ResponseTokens:      completionTokens,
+			LatencyMs:           latencyMs,
+			StatusCode:          statusCode,
+			ErrorMessage:        errMsg,
+			ErrorCategory:       category,
+			RequestID:           requestID,
 			MatchedPriceTierIdx: -1,
 		}
 		if err := h.db.Create(log).Error; err != nil {
@@ -1032,6 +1185,94 @@ func applyMatchedTierFromCtx(c *gin.Context, callLog *model.ApiCallLog) {
 			callLog.MatchedPriceTierIdx = i
 		}
 	}
+	// 思考模式标记：calculateAndDeductCostWithErr 在实际应用思考加价时设置 thinking_mode_applied
+	// 即使未应用加价（模型未配置 thinking 价），仅 enable_thinking=true 也记录 thinking_mode 方便审计
+	if v, ok := c.Get("thinking_mode"); ok {
+		if b, ok2 := v.(bool); ok2 && b {
+			callLog.ThinkingMode = true
+		}
+	}
+	// v4.0 用户特殊折扣信息
+	if v, ok := c.Get("user_discount_id"); ok {
+		if id, ok2 := v.(uint); ok2 && id > 0 {
+			callLog.UserDiscountID = &id
+		}
+	}
+	if v, ok := c.Get("user_discount_rate"); ok {
+		if r, ok2 := v.(float64); ok2 {
+			callLog.UserDiscountRate = &r
+		}
+	}
+	if v, ok := c.Get("user_discount_type"); ok {
+		if s, ok2 := v.(string); ok2 {
+			callLog.UserDiscountType = s
+		}
+	}
+	if v, ok := c.Get("billing_status"); ok {
+		if s, ok2 := v.(string); ok2 {
+			callLog.BillingStatus = s
+		}
+	}
+	if v, ok := c.Get("estimated_cost_credits"); ok {
+		if n, ok2 := v.(int64); ok2 {
+			callLog.EstimatedCostCredits = n
+		}
+	}
+	if v, ok := c.Get("estimated_cost_units"); ok {
+		if n, ok2 := v.(int64); ok2 {
+			callLog.EstimatedCostUnits = n
+		}
+	}
+	if v, ok := c.Get("actual_cost_credits"); ok {
+		if n, ok2 := v.(int64); ok2 {
+			callLog.ActualCostCredits = n
+		}
+	}
+	if v, ok := c.Get("actual_cost_units"); ok {
+		if n, ok2 := v.(int64); ok2 {
+			callLog.ActualCostUnits = n
+		}
+	}
+	if v, ok := c.Get("under_collected_credits"); ok {
+		if n, ok2 := v.(int64); ok2 {
+			callLog.UnderCollectedCredits = n
+		}
+	}
+	if v, ok := c.Get("under_collected_units"); ok {
+		if n, ok2 := v.(int64); ok2 {
+			callLog.UnderCollectedUnits = n
+		}
+	}
+	if v, ok := c.Get("cost_units"); ok {
+		if n, ok2 := v.(int64); ok2 {
+			callLog.CostUnits = n
+		}
+	}
+	if v, ok := c.Get("platform_cost_units"); ok {
+		if n, ok2 := v.(int64); ok2 {
+			callLog.PlatformCostUnits = n
+		}
+	}
+	if v, ok := c.Get("platform_cost_rmb"); ok {
+		if n, ok2 := v.(float64); ok2 {
+			callLog.PlatformCostRMB = n
+		}
+	}
+	if v, ok := c.Get("usage_source"); ok {
+		if s, ok2 := v.(string); ok2 {
+			callLog.UsageSource = s
+		}
+	}
+	if v, ok := c.Get("usage_estimated"); ok {
+		if b, ok2 := v.(bool); ok2 {
+			callLog.UsageEstimated = b
+		}
+	}
+	if v, ok := c.Get("billing_snapshot_json"); ok {
+		if raw, ok2 := v.(string); ok2 && raw != "" {
+			callLog.BillingSnapshot = model.JSON(raw)
+		}
+	}
 }
 
 // ensureModelPriced 校验请求模型已在 model_pricings 表维护售价
@@ -1048,7 +1289,7 @@ func (h *CompletionsHandler) ensureModelPriced(ctx context.Context, modelName st
 		First(&m).Error; err != nil {
 		return nil // 模型不存在交给渠道路由处理
 	}
-	_, err := h.pricingCalc.CalculatePrice(ctx, m.ID, 0, 0)
+	_, err := h.pricingCalc.CalculatePrice(ctx, 0, m.ID, 0, 0)
 	return err
 }
 
@@ -1077,6 +1318,31 @@ func (h *CompletionsHandler) calculateAndDeductCostWithErr(
 	c *gin.Context,
 	modelName string, keyInfo *apikey.ApiKeyInfo, usage provider.Usage, requestID string,
 ) (int64, float64, error) {
+	if h.billingSvc != nil {
+		out, err := h.billingSvc.SettleUsage(c.Request.Context(), billingsvc.UsageRequest{
+			RequestID:    requestID,
+			UserID:       keyInfo.UserID,
+			TenantID:     keyInfo.TenantID,
+			ModelName:    modelName,
+			Usage:        usage,
+			ThinkingMode: c.GetBool("thinking_mode"),
+			FreezeID:     h.billingFreezeID(c),
+		})
+		if out == nil {
+			return 0, 0, err
+		}
+		h.applyBillingOutcomeToContext(c, out)
+		if err != nil {
+			h.logger.Error("鎵ｈ垂澶辫触锛岄渶瑕佷汉宸ュ璐?",
+				zap.Error(err),
+				zap.String("request_id", requestID),
+				zap.Uint("user_id", keyInfo.UserID),
+				zap.Uint("tenant_id", keyInfo.TenantID),
+				zap.String("model", modelName),
+				zap.Int64("cost_credits", out.CostCredits))
+		}
+		return out.CostCredits, out.CostRMB, err
+	}
 	if h.pricingCalc == nil {
 		return 0, 0, nil
 	}
@@ -1090,21 +1356,67 @@ func (h *CompletionsHandler) calculateAndDeductCostWithErr(
 	var costResult *pricing.CostResult
 	var err error
 	if usage.CacheReadTokens > 0 || usage.CacheWriteTokens > 0 {
-		costResult, err = h.pricingCalc.CalculateCostWithCache(ctx, &aiModel, keyInfo.TenantID, 0, pricing.CacheUsageInput{
+		costResult, err = h.pricingCalc.CalculateCostWithCache(ctx, keyInfo.UserID, &aiModel, keyInfo.TenantID, 0, pricing.CacheUsageInput{
 			InputTokens:      usage.PromptTokens,
 			OutputTokens:     usage.CompletionTokens,
 			CacheReadTokens:  usage.CacheReadTokens,
 			CacheWriteTokens: usage.CacheWriteTokens,
 		})
 	} else {
-		costResult, err = h.pricingCalc.CalculateCost(ctx, aiModel.ID, keyInfo.TenantID, 0, usage.PromptTokens, usage.CompletionTokens)
+		costResult, err = h.pricingCalc.CalculateCost(ctx, keyInfo.UserID, aiModel.ID, keyInfo.TenantID, 0, usage.PromptTokens, usage.CompletionTokens)
 	}
 	if err != nil || costResult == nil {
 		return 0, 0, err
 	}
+	c.Set("estimated_cost_credits", costResult.TotalCost)
+	c.Set("platform_cost_rmb", float64(costResult.PlatformCost)/10000.0)
+	c.Set("usage_source", "provider")
+	c.Set("usage_estimated", false)
+	// 思考模式加价：按优先级查找有效"思考输出售价"，与普通输出售价的差值做加价
+	//   1. 阶梯命中 + tier.SellingOutputThinkingPrice  (平台阶梯售价覆盖)
+	//   2. 阶梯命中 + tier.OutputPriceThinking (成本) × ratio  (保持售价链路)
+	//   3. mp.OutputPriceThinkingRMB (模型级思考售价)
+	//   4. aiModel.OutputCostThinkingRMB × ratio (顶层成本 × 当前 output 售价/成本 比例)
+	// ratio = 当前已应用的 output 售价 / 模型 output 成本价（在有阶梯时自动等于 tier 售价/tier 成本）
+	if tmVal, ok := c.Get("thinking_mode"); ok {
+		if tm, isBool := tmVal.(bool); isBool && tm && usage.CompletionTokens > 0 {
+			thinkingSellRMB := resolveThinkingOutputSellRMB(h.db, ctx, &aiModel, costResult)
+			if thinkingSellRMB > 0 {
+				normalSellRMB := costResult.PriceDetail.OutputPriceRMB
+				diffRMB := thinkingSellRMB - normalSellRMB
+				if diffRMB > 0 {
+					surchargeRMB := diffRMB * float64(usage.CompletionTokens) / 1_000_000
+					surchargeCredits := int64(surchargeRMB*10000 + 0.5) // 1 RMB = 10,000 积分
+					costResult.TotalCost += surchargeCredits
+					costResult.OutputCost += surchargeCredits
+					costResult.TotalCostRMB += surchargeRMB
+					c.Set("thinking_mode_applied", true)
+					c.Set("thinking_output_price_rmb", thinkingSellRMB)
+					h.logger.Info("thinking mode surcharge applied",
+						zap.String("model", modelName),
+						zap.Int("completion_tokens", usage.CompletionTokens),
+						zap.Float64("normal_sell_rmb", normalSellRMB),
+						zap.Float64("thinking_sell_rmb", thinkingSellRMB),
+						zap.Float64("surcharge_rmb", surchargeRMB),
+						zap.Int64("surcharge_credits", surchargeCredits))
+				}
+			}
+		}
+	}
 	// 将命中阶梯信息写入 gin.Context，供 ApiCallLog 构造时提取（key: matched_price_tier / matched_price_tier_idx）
 	c.Set("matched_price_tier", costResult.MatchedTier)
 	c.Set("matched_price_tier_idx", costResult.MatchedTierIdx)
+	// 将用户特殊折扣信息写入 gin.Context（v4.0），供 ApiCallLog 构造时提取
+	if costResult.UserDiscountID != nil {
+		c.Set("user_discount_id", *costResult.UserDiscountID)
+	}
+	if costResult.UserDiscountRate != nil {
+		c.Set("user_discount_rate", *costResult.UserDiscountRate)
+	}
+	if costResult.UserDiscountType != "" {
+		c.Set("user_discount_type", costResult.UserDiscountType)
+	}
+	c.Set("estimated_cost_credits", costResult.TotalCost)
 	if h.balanceSvc != nil && costResult.TotalCost > 0 {
 		if dErr := h.balanceSvc.DeductForRequest(ctx, keyInfo.UserID, keyInfo.TenantID, costResult.TotalCost, modelName, requestID); dErr != nil {
 			h.logger.Error("扣费失败，需要人工对账",
@@ -1114,14 +1426,29 @@ func (h *CompletionsHandler) calculateAndDeductCostWithErr(
 				zap.Uint("tenant_id", keyInfo.TenantID),
 				zap.String("model", modelName),
 				zap.Int64("cost_credits", costResult.TotalCost))
+			c.Set("billing_status", "deduct_failed")
+			c.Set("actual_cost_credits", int64(0))
+			c.Set("under_collected_credits", costResult.TotalCost)
+			h.setBillingSnapshot(c, requestID, modelName, &aiModel, costResult, usage, "deduct_failed", 0, costResult.TotalCost)
 			return costResult.TotalCost, costResult.TotalCostRMB, dErr
 		}
+	}
+	if costResult.TotalCost > 0 {
+		c.Set("billing_status", "settled")
+		c.Set("actual_cost_credits", costResult.TotalCost)
+		c.Set("under_collected_credits", int64(0))
+		h.setBillingSnapshot(c, requestID, modelName, &aiModel, costResult, usage, "settled", costResult.TotalCost, 0)
+	} else {
+		c.Set("billing_status", "no_charge")
+		c.Set("actual_cost_credits", int64(0))
+		c.Set("under_collected_credits", int64(0))
+		h.setBillingSnapshot(c, requestID, modelName, &aiModel, costResult, usage, "no_charge", 0, 0)
 	}
 	// 异步计算并记录缓存节省金额（不阻塞响应）
 	if (usage.CacheReadTokens > 0 || usage.CacheWriteTokens > 0) && h.pricingCalc != nil {
 		go func() {
 			_, savingsRMB, sErr := h.pricingCalc.CalculateWithCache(
-				context.Background(), &aiModel, keyInfo.TenantID, 0,
+				context.Background(), keyInfo.UserID, &aiModel, keyInfo.TenantID, 0,
 				pricing.CacheUsageInput{
 					InputTokens:      usage.PromptTokens,
 					OutputTokens:     usage.CompletionTokens,
@@ -1148,6 +1475,70 @@ func (h *CompletionsHandler) calculateAndDeductCostWithErr(
 	return costResult.TotalCost, costResult.TotalCostRMB, nil
 }
 
+// setBillingSnapshot 将本次扣费使用的价格、用量、折扣和账务状态固化到日志快照。
+// 成本分析优先读取该快照，避免后续改价后污染历史账单。
+func (h *CompletionsHandler) setBillingSnapshot(
+	c *gin.Context,
+	requestID, modelName string,
+	aiModel *model.AIModel,
+	costResult *pricing.CostResult,
+	usage provider.Usage,
+	billingStatus string,
+	actualCostCredits, underCollectedCredits int64,
+) {
+	if c == nil || aiModel == nil || costResult == nil {
+		return
+	}
+	snapshot := map[string]interface{}{
+		"schema_version":          1,
+		"generated_at":            time.Now().UTC().Format(time.RFC3339Nano),
+		"request_id":              requestID,
+		"model_id":                aiModel.ID,
+		"model_name":              modelName,
+		"pricing_unit":            aiModel.PricingUnit,
+		"prompt_tokens":           usage.PromptTokens,
+		"completion_tokens":       usage.CompletionTokens,
+		"total_tokens":            usage.TotalTokens,
+		"cache_read_tokens":       usage.CacheReadTokens,
+		"cache_write_tokens":      usage.CacheWriteTokens,
+		"sell_input_per_million":  costResult.PriceDetail.InputPricePerMillion,
+		"sell_output_per_million": costResult.PriceDetail.OutputPricePerMillion,
+		"sell_input_rmb":          costResult.PriceDetail.InputPriceRMB,
+		"sell_output_rmb":         costResult.PriceDetail.OutputPriceRMB,
+		"input_cost_credits":      costResult.InputCost,
+		"output_cost_credits":     costResult.OutputCost,
+		"total_cost_credits":      costResult.TotalCost,
+		"total_cost_rmb":          costResult.TotalCostRMB,
+		"platform_cost_credits":   costResult.PlatformCost,
+		"platform_cost_rmb":       float64(costResult.PlatformCost) / 10000.0,
+		"pricing_source":          costResult.PriceDetail.Source,
+		"matched_price_tier":      costResult.MatchedTier,
+		"matched_price_tier_idx":  costResult.MatchedTierIdx,
+		"user_discount_type":      costResult.UserDiscountType,
+		"billing_status":          billingStatus,
+		"actual_cost_credits":     actualCostCredits,
+		"under_collected_credits": underCollectedCredits,
+		"cache_read_cost":         costResult.CacheReadCost,
+		"cache_write_cost":        costResult.CacheWriteCost,
+		"regular_input_cost":      costResult.RegularInputCost,
+		"cache_saving_credits":    costResult.CacheSavingCredits,
+		"thinking_mode":           c.GetBool("thinking_mode"),
+		"thinking_mode_applied":   c.GetBool("thinking_mode_applied"),
+	}
+	if costResult.UserDiscountID != nil {
+		snapshot["user_discount_id"] = *costResult.UserDiscountID
+	}
+	if costResult.UserDiscountRate != nil {
+		snapshot["user_discount_rate"] = *costResult.UserDiscountRate
+	}
+	if v, ok := c.Get("thinking_output_price_rmb"); ok {
+		snapshot["thinking_output_price_rmb"] = v
+	}
+	if b, err := json.Marshal(snapshot); err == nil {
+		c.Set("billing_snapshot_json", string(b))
+	}
+}
+
 // shouldInjectCacheControl 判断是否应为当前请求自动注入缓存控制标记
 // 仅对 Anthropic explicit 机制模型生效（注意：Anthropic 是唯一需要显式参数才能触发缓存的供应商）
 func (h *CompletionsHandler) shouldInjectCacheControl(req *chatCompletionRequest, aiModel *model.AIModel) bool {
@@ -1166,12 +1557,12 @@ func (h *CompletionsHandler) shouldInjectCacheControl(req *chatCompletionRequest
 		var systemLen int
 		for _, m := range req.Messages {
 			if m.Role == "system" {
-				systemLen = len(m.Content)
+				systemLen = len(provider.TextContent(m.Content))
 				break
 			}
 		}
 		if systemLen == 0 && len(req.Messages) > 0 {
-			systemLen = len(req.Messages[0].Content)
+			systemLen = len(provider.TextContent(req.Messages[0].Content))
 		}
 		estimatedTokens := systemLen / 4
 		if estimatedTokens < aiModel.CacheMinTokens {
@@ -1185,8 +1576,20 @@ func (h *CompletionsHandler) shouldInjectCacheControl(req *chatCompletionRequest
 // 通过检查消息内容中是否含有 cache_control JSON 键来判断
 func hasCacheControlInRequest(messages []provider.Message) bool {
 	for _, m := range messages {
-		if strings.Contains(m.Content, "cache_control") {
-			return true
+		// 对 string 类型按子串匹配；对数组类型按 JSON 编码后搜索关键字，覆盖 OpenAI 多模态块内
+		// 出现 cache_control 的情形（如 Anthropic 风格的 ephemeral 断点透传）。
+		switch v := m.Content.(type) {
+		case string:
+			if strings.Contains(v, "cache_control") {
+				return true
+			}
+		default:
+			if v == nil {
+				continue
+			}
+			if b, err := json.Marshal(v); err == nil && strings.Contains(string(b), "cache_control") {
+				return true
+			}
 		}
 	}
 	return false
@@ -1287,11 +1690,13 @@ func skipBogusBoolFlag(modelName, source, key string, value interface{}) bool {
 
 // modelMeta 是模型前置校验所需的最小元信息
 type modelMeta struct {
-	ID        uint   `gorm:"column:id"`
-	ModelName string `gorm:"column:model_name"`
-	ModelType string `gorm:"column:model_type"`
-	Status    string `gorm:"column:status"`
-	IsActive  bool   `gorm:"column:is_active"`
+	ID         uint   `gorm:"column:id"`
+	ModelName  string `gorm:"column:model_name"`
+	ModelType  string `gorm:"column:model_type"`
+	Status     string `gorm:"column:status"`
+	IsActive   bool   `gorm:"column:is_active"`
+	IsFreeTier bool   `gorm:"column:is_free_tier"`
+	Features   model.JSON
 }
 
 // loadModelMeta 从 ai_models 表查找模型的可用状态与类型
@@ -1299,13 +1704,145 @@ type modelMeta struct {
 func (h *CompletionsHandler) loadModelMeta(modelName string) (*modelMeta, error) {
 	var m modelMeta
 	err := h.db.Table("ai_models").
-		Select("id, model_name, model_type, status, is_active").
+		Select("id, model_name, model_type, status, is_active, is_free_tier, features").
 		Where("model_name = ?", modelName).
 		Take(&m).Error
 	if err != nil {
 		return nil, err
 	}
 	return &m, nil
+}
+
+func (m *modelMeta) MissingRequiredFeatures(required []string) []string {
+	if len(required) == 0 {
+		return nil
+	}
+	var feats map[string]interface{}
+	if len(m.Features) > 0 {
+		_ = json.Unmarshal(m.Features, &feats)
+	}
+	var missing []string
+	for _, key := range required {
+		if !featureBool(feats, key) {
+			missing = append(missing, key)
+		}
+	}
+	return missing
+}
+
+func featureBool(features map[string]interface{}, key string) bool {
+	if features == nil {
+		return false
+	}
+	switch v := features[key].(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(v, "true")
+	case float64:
+		return v != 0
+	default:
+		return false
+	}
+}
+
+func requiredChatFeatureKeys(req *chatCompletionRequest, rawMap map[string]json.RawMessage, thinkingMode bool) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(key string) {
+		if key != "" && !seen[key] {
+			seen[key] = true
+			out = append(out, key)
+		}
+	}
+
+	if requestHasVisionInput(req) {
+		add("supports_vision")
+	}
+	if requestHasTools(rawMap) {
+		add("supports_function_call")
+	}
+	if requestRequiresJSONMode(rawMap) {
+		add("supports_json_mode")
+	}
+	if thinkingMode {
+		add("supports_thinking")
+	}
+	return out
+}
+
+func requestHasVisionInput(req *chatCompletionRequest) bool {
+	if req == nil {
+		return false
+	}
+	for _, msg := range req.Messages {
+		if contentHasMedia(msg.Content) {
+			return true
+		}
+	}
+	return false
+}
+
+func contentHasMedia(v interface{}) bool {
+	switch x := v.(type) {
+	case []interface{}:
+		for _, item := range x {
+			if contentHasMedia(item) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		if typ, _ := x["type"].(string); isVisionContentType(typ) {
+			return true
+		}
+		if _, ok := x["image_url"]; ok {
+			return true
+		}
+		if _, ok := x["video_url"]; ok {
+			return true
+		}
+		for _, val := range x {
+			if contentHasMedia(val) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isVisionContentType(typ string) bool {
+	switch strings.ToLower(strings.TrimSpace(typ)) {
+	case "image_url", "input_image", "image", "video_url", "input_video", "video":
+		return true
+	default:
+		return false
+	}
+}
+
+func requestHasTools(rawMap map[string]json.RawMessage) bool {
+	raw, ok := rawMap["tools"]
+	if !ok || len(raw) == 0 || string(raw) == "null" {
+		return false
+	}
+	var tools []interface{}
+	if err := json.Unmarshal(raw, &tools); err == nil {
+		return len(tools) > 0
+	}
+	return true
+}
+
+func requestRequiresJSONMode(rawMap map[string]json.RawMessage) bool {
+	raw, ok := rawMap["response_format"]
+	if !ok || len(raw) == 0 || string(raw) == "null" {
+		return false
+	}
+	var rf map[string]interface{}
+	if err := json.Unmarshal(raw, &rf); err != nil {
+		return false
+	}
+	typ, _ := rf["type"].(string)
+	typ = strings.ToLower(strings.TrimSpace(typ))
+	return typ != "" && typ != "text"
 }
 
 // isChatCompatibleModelType 判断 model_type 是否允许走 /v1/chat/completions
@@ -1343,4 +1880,183 @@ func endpointHintForModelType(t string) string {
 		return "/v1/moderations"
 	}
 	return "the matching dedicated endpoint"
+}
+
+// resolveThinkingOutputSellRMB 按优先级计算思考模式输出的实际"平台售价"（元/百万 token）
+//  1. 命中阶梯 + tier.SellingOutputThinkingPrice（管理员显式覆盖，最高优先级）
+//  2. 命中阶梯 + tier.OutputPriceThinking（阶梯成本价）× ratio（= 当前阶梯售价/阶梯成本）
+//  3. ModelPricing.OutputPriceThinkingRMB（模型级平台售价）
+//  4. aiModel.OutputCostThinkingRMB × ratio（顶层成本 × 当前 output 售价/成本 比例）
+//
+// 返回 0 表示该请求不应用思考模式加价（沿用普通 output 售价）。
+func resolveThinkingOutputSellRMB(
+	db *gorm.DB,
+	ctx context.Context,
+	aiModel *model.AIModel,
+	costResult *pricing.CostResult,
+) float64 {
+	if aiModel == nil || costResult == nil {
+		return 0
+	}
+
+	// 当前 output 售价与成本
+	normalSellRMB := costResult.PriceDetail.OutputPriceRMB
+	normalCostRMB := aiModel.OutputCostRMB
+
+	// 加载 ModelPricing（可能没有）
+	var mp model.ModelPricing
+	hasMP := false
+	if err := db.WithContext(ctx).Where("model_id = ?", aiModel.ID).First(&mp).Error; err == nil {
+		hasMP = true
+	}
+
+	// 1 & 2. 命中阶梯
+	if costResult.MatchedTierIdx >= 0 {
+		// 2a. 平台阶梯数据
+		if hasMP && len(mp.PriceTiers) > 0 {
+			var mpData model.PriceTiersData
+			if json.Unmarshal(mp.PriceTiers, &mpData) == nil &&
+				costResult.MatchedTierIdx < len(mpData.Tiers) {
+				t := mpData.Tiers[costResult.MatchedTierIdx]
+				// 1. 阶梯售价覆盖
+				if t.SellingOutputThinkingPrice != nil && *t.SellingOutputThinkingPrice > 0 {
+					return *t.SellingOutputThinkingPrice
+				}
+			}
+		}
+		// 2b. AIModel 阶梯成本数据
+		if len(aiModel.PriceTiers) > 0 {
+			var amData model.PriceTiersData
+			if json.Unmarshal(aiModel.PriceTiers, &amData) == nil &&
+				costResult.MatchedTierIdx < len(amData.Tiers) {
+				t := amData.Tiers[costResult.MatchedTierIdx]
+				if t.OutputPriceThinking > 0 && t.OutputPrice > 0 && normalSellRMB > 0 {
+					// 按当前阶梯 (售价/成本) 比例把成本缩放到售价
+					tierRatio := normalSellRMB / t.OutputPrice
+					return t.OutputPriceThinking * tierRatio
+				}
+			}
+		}
+	}
+
+	// 3. 模型级 MP 思考售价
+	if hasMP && mp.OutputPriceThinkingRMB > 0 {
+		return mp.OutputPriceThinkingRMB
+	}
+
+	// 4. 顶层成本 × ratio
+	if aiModel.OutputCostThinkingRMB > 0 && normalCostRMB > 0 && normalSellRMB > 0 {
+		ratio := normalSellRMB / normalCostRMB
+		return aiModel.OutputCostThinkingRMB * ratio
+	}
+
+	return 0
+}
+
+func (h *CompletionsHandler) applyBillingOutcomeToContext(c *gin.Context, out *billingsvc.UsageOutcome) {
+	if c == nil || out == nil || out.CostResult == nil {
+		return
+	}
+	c.Set("estimated_cost_credits", out.CostCredits)
+	c.Set("estimated_cost_units", out.CostUnits)
+	c.Set("cost_units", out.CostUnits)
+	c.Set("platform_cost_rmb", out.PlatformCostRMB)
+	c.Set("platform_cost_units", out.PlatformCostUnits)
+	c.Set("usage_source", out.UsageSource)
+	c.Set("usage_estimated", out.UsageEstimated)
+	c.Set("matched_price_tier", out.CostResult.MatchedTier)
+	c.Set("matched_price_tier_idx", out.CostResult.MatchedTierIdx)
+	c.Set("billing_status", out.BillingStatus)
+	c.Set("actual_cost_credits", out.ActualCostCredits)
+	c.Set("actual_cost_units", out.ActualCostUnits)
+	c.Set("under_collected_credits", out.UnderCollectedCredits)
+	c.Set("under_collected_units", out.UnderCollectedUnits)
+	if out.ThinkingModeApplied {
+		c.Set("thinking_mode_applied", true)
+	}
+	if out.ThinkingOutputPriceRMB > 0 {
+		c.Set("thinking_output_price_rmb", out.ThinkingOutputPriceRMB)
+	}
+	if out.CostResult.UserDiscountID != nil {
+		c.Set("user_discount_id", *out.CostResult.UserDiscountID)
+	}
+	if out.CostResult.UserDiscountRate != nil {
+		c.Set("user_discount_rate", *out.CostResult.UserDiscountRate)
+	}
+	if out.CostResult.UserDiscountType != "" {
+		c.Set("user_discount_type", out.CostResult.UserDiscountType)
+	}
+	if out.SnapshotJSON != "" {
+		c.Set("billing_snapshot_json", out.SnapshotJSON)
+	}
+}
+
+func (h *CompletionsHandler) billingFreezeID(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if v, ok := c.Get("billing_freeze_id"); ok {
+		if s, ok2 := v.(string); ok2 {
+			return s
+		}
+	}
+	return ""
+}
+
+func (h *CompletionsHandler) releaseBillingFreeze(c *gin.Context, freezeID string) {
+	if h == nil || h.billingSvc == nil || freezeID == "" {
+		return
+	}
+	if err := h.billingSvc.ReleaseFrozen(c.Request.Context(), freezeID); err != nil {
+		h.logger.Warn("release billing freeze failed", zap.String("freeze_id", freezeID), zap.Error(err))
+	}
+}
+
+func estimateChatRequestUsage(req *chatCompletionRequest) provider.Usage {
+	if req == nil {
+		return provider.Usage{}
+	}
+	promptTokens := 0
+	for _, msg := range req.Messages {
+		promptTokens += estimateTextTokens(msg.Role)
+		promptTokens += estimateTextTokens(provider.TextContent(msg.Content))
+	}
+	outputTokens := req.MaxTokens
+	if outputTokens <= 0 {
+		outputTokens = 1024
+	}
+	total := promptTokens + outputTokens
+	return provider.Usage{
+		PromptTokens:     promptTokens,
+		CompletionTokens: outputTokens,
+		TotalTokens:      total,
+	}
+}
+
+func estimateFIMRequestUsage(req *fimCompletionRequest) provider.Usage {
+	if req == nil {
+		return provider.Usage{}
+	}
+	promptTokens := estimateTextTokens(req.Prompt) + estimateTextTokens(req.Suffix)
+	outputTokens := req.MaxTokens
+	if outputTokens <= 0 {
+		outputTokens = 512
+	}
+	return provider.Usage{
+		PromptTokens:     promptTokens,
+		CompletionTokens: outputTokens,
+		TotalTokens:      promptTokens + outputTokens,
+	}
+}
+
+func estimateTextTokens(text string) int {
+	runes := len([]rune(text))
+	if runes == 0 {
+		return 0
+	}
+	tokens := (runes + 3) / 4
+	if tokens < 1 {
+		return 1
+	}
+	return tokens
 }

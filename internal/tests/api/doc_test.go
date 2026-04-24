@@ -45,7 +45,9 @@ func TestPublishDoc_Success(t *testing.T) {
 	if err != nil || statusCode != http.StatusOK {
 		t.Skip("cannot create doc for publish test")
 	}
-	var doc struct{ ID uint `json:"id"` }
+	var doc struct {
+		ID uint `json:"id"`
+	}
 	json.Unmarshal(createResp.Data, &doc)
 	if doc.ID == 0 {
 		t.Skip("no doc ID")
@@ -74,7 +76,9 @@ func TestPublicDocList_OnlyPublished(t *testing.T) {
 		"content": "Published content.",
 	}, adminToken)
 	if statusCode == http.StatusOK {
-		var doc struct{ ID uint `json:"id"` }
+		var doc struct {
+			ID uint `json:"id"`
+		}
 		json.Unmarshal(createResp.Data, &doc)
 		if doc.ID > 0 {
 			doPost(fmt.Sprintf("%s/api/v1/admin/docs/%d/publish", baseURL, doc.ID), nil, adminToken)

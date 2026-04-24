@@ -1,6 +1,7 @@
 package user
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 
@@ -9,6 +10,7 @@ import (
 
 	"tokenhub-server/internal/pkg/response"
 	announcementsvc "tokenhub-server/internal/service/announcement"
+	"tokenhub-server/internal/service/usercache"
 )
 
 // ========================================================================
@@ -62,13 +64,16 @@ func (h *NotificationHandler) List(c *gin.Context) {
 }
 
 // UnreadCount GET /user/notifications/unread-count
+// 缓存：user:notif:unread:{uid}，2min TTL（Dashboard 轮询热点）
 func (h *NotificationHandler) UnreadCount(c *gin.Context) {
 	userID := h.getUserID(c)
 	if userID == 0 {
 		response.ErrorMsg(c, http.StatusUnauthorized, 40101, "未认证")
 		return
 	}
-	count, err := h.svc.GetUnreadCount(c.Request.Context(), userID)
+	count, err := usercache.GetOrLoadNotifUnread[int64](c.Request.Context(), userID, func(ctx context.Context) (int64, error) {
+		return h.svc.GetUnreadCount(ctx, userID)
+	})
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, 50002, "统计失败")
 		return
@@ -92,6 +97,7 @@ func (h *NotificationHandler) MarkRead(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusInternalServerError, 50003, "标记已读失败")
 		return
 	}
+	usercache.InvalidateNotifUnread(c.Request.Context(), userID)
 	response.Success(c, nil)
 }
 
@@ -106,6 +112,7 @@ func (h *NotificationHandler) MarkAllRead(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusInternalServerError, 50004, "操作失败")
 		return
 	}
+	usercache.InvalidateNotifUnread(c.Request.Context(), userID)
 	response.Success(c, nil)
 }
 

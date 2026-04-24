@@ -172,6 +172,11 @@ func (s *AlibabaScraper) ScrapePrices(ctx context.Context) (*ScrapedPriceData, e
 	// API 返回值优先，仅在 API 未覆盖时用硬编码数据兜底
 	scrapedModels = mergeAlibabaWithSupplementary(scrapedModels, getAlibabaSupplementaryPrices())
 
+	// v4.4：合并阿里云思考模式双价格覆盖表（官网文档页拆列的模型）
+	// API 返回的 output_token 是统一价，官网文档页对部分推理模型分列「非思考 / 思考」，
+	// 本表仅对这些确定拆列的模型，按阶梯 name 对齐覆盖 OutputPriceThinking 字段。
+	scrapedModels = applyAlibabaThinkingOverrides(scrapedModels, getAlibabaThinkingPrices())
+
 	log.Info("阿里云 API 价格获取完成",
 		zap.Int("api_models", len(allModels)),
 		zap.Int("with_prices", len(scrapedModels)))
@@ -288,6 +293,7 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 	for _, priceRange := range m.Prices {
 		var inputPrice, outputPrice float64
 		var tierUnit string
+		var outputThinkingPrice float64 // 思考模式输出价（阿里云 qwen3.5-plus/qwen3.6-plus 等；API 若不区分则保持 0）
 		for _, item := range priceRange.Prices {
 			price, err := strconv.ParseFloat(item.Price, 64)
 			if err != nil || price <= 0 {
@@ -295,13 +301,29 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 			}
 
 			typeLower := strings.ToLower(item.Type)
+			priceNameLower := strings.ToLower(item.PriceName)
+			// 识别思考模式：Type 含 thinking/reasoning，或中文 PriceName 含"思考模式"/"思维链"
+			isThinking := strings.Contains(typeLower, "thinking") ||
+				strings.Contains(typeLower, "reasoning") ||
+				strings.Contains(priceNameLower, "thinking") ||
+				strings.Contains(item.PriceName, "思考模式") ||
+				strings.Contains(item.PriceName, "思维链")
+
 			switch {
 			// ---- Token 计费 ----
 			case typeLower == "input_token" || typeLower == "input_tokens":
 				inputPrice = price
 				tierUnit = PricingUnitPerMillionTokens
 			case typeLower == "output_token" || typeLower == "output_tokens":
-				outputPrice = price
+				if isThinking {
+					outputThinkingPrice = price
+				} else {
+					outputPrice = price
+				}
+				tierUnit = PricingUnitPerMillionTokens
+			// 思考模式专用 Type（若阿里云 API 未来改用独立 type 字段）
+			case typeLower == "output_token_thinking" || typeLower == "output_tokens_thinking":
+				outputThinkingPrice = price
 				tierUnit = PricingUnitPerMillionTokens
 			// ---- 图片计费（按张）----
 			case strings.Contains(typeLower, "image") || strings.Contains(typeLower, "per_image"):
@@ -352,6 +374,9 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 		if sm.OutputPrice == 0 && outputPrice > 0 {
 			sm.OutputPrice = outputPrice
 		}
+		if sm.OutputPriceThinking == 0 && outputThinkingPrice > 0 {
+			sm.OutputPriceThinking = outputThinkingPrice
+		}
 		if sm.PricingUnit == "" && tierUnit != "" {
 			sm.PricingUnit = tierUnit
 		}
@@ -365,9 +390,10 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 			tierName = "default"
 		}
 		tier := model.PriceTier{
-			Name:        tierName,
-			InputPrice:  inputPrice,
-			OutputPrice: outputPrice,
+			Name:                tierName,
+			InputPrice:          inputPrice,
+			OutputPrice:         outputPrice,
+			OutputPriceThinking: outputThinkingPrice,
 		}
 		// 仅 Token 计费单位注入阶梯缓存价（按张/按秒等不支持缓存）
 		if tierUnit == PricingUnitPerMillionTokens && inputPrice > 0 {

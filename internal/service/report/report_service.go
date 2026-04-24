@@ -308,11 +308,26 @@ func (s *ReportService) GetUsageReport(ctx context.Context, filter ReportFilter)
 	groupCols := "period, model_id, tenant_id"
 	query = query.Group(groupCols).Order("period DESC")
 
-	// Count total
+	// Count total distinct groups — 避免 GORM 子查询包裹导致 MySQL 1064 错误
+	// 重建独立 count 查询，复用相同 WHERE 条件
 	var total int64
-	countQuery := s.db.Table("(?) as sub", query).Count(&total)
-	if countQuery.Error != nil {
-		return nil, fmt.Errorf("failed to count usage report: %w", countQuery.Error)
+	{
+		countQ := s.db.Table("daily_stats").
+			Where("date >= ? AND date <= ?", filter.StartDate, filter.EndDate).
+			Scopes(permission.TenantScope(ctx))
+		if filter.TenantID != nil {
+			countQ = countQ.Where("tenant_id = ?", *filter.TenantID)
+		}
+		if filter.ModelID != nil {
+			countQ = countQ.Where("model_id = ?", *filter.ModelID)
+		}
+		if filter.ChannelID != nil {
+			countQ = countQ.Where("channel_id = ?", *filter.ChannelID)
+		}
+		row := countQ.Select(fmt.Sprintf("COUNT(DISTINCT %s, model_id, tenant_id)", groupExpr)).Row()
+		if err := row.Scan(&total); err != nil {
+			return nil, fmt.Errorf("failed to count usage report: %w", err)
+		}
 	}
 
 	// Paginate

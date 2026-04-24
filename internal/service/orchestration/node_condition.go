@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"tokenhub-server/internal/pkg/safego"
 	"tokenhub-server/internal/provider"
 )
 
@@ -45,7 +46,7 @@ func (n *ConditionNode) Execute(ctx context.Context, input *NodeInput) (*NodeOut
 
 	lastMsg := ""
 	if len(input.Messages) > 0 {
-		lastMsg = input.Messages[len(input.Messages)-1].Content
+		lastMsg = provider.TextContent(input.Messages[len(input.Messages)-1].Content)
 	}
 
 	result := n.Evaluate(len(lastMsg), lastMsg)
@@ -69,7 +70,7 @@ func (n *ConditionNode) Execute(ctx context.Context, input *NodeInput) (*NodeOut
 // Stream 将Execute包装为单事件流（条件节点是同步的）
 func (n *ConditionNode) Stream(ctx context.Context, input *NodeInput) (<-chan StreamEvent, error) {
 	ch := make(chan StreamEvent, 2)
-	go func() {
+	safego.Go("orchestration-condition-stream", func() {
 		defer close(ch)
 
 		output, err := n.Execute(ctx, input)
@@ -92,7 +93,7 @@ func (n *ConditionNode) Stream(ctx context.Context, input *NodeInput) (<-chan St
 			Status:   "done",
 			Usage:    &output.Usage,
 		}
-	}()
+	})
 	return ch, nil
 }
 

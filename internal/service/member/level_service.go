@@ -418,17 +418,63 @@ func (s *MemberLevelService) GetUserRateLimits(ctx context.Context, userID uint)
 	return limits, nil
 }
 
-// BatchSetUserRateLimits 批量为指定用户设置自定义 RPM / TPM 覆盖
-// rpm/tpm 传 0 表示不修改该字段；当至少一项 > 0 时 upsert UserQuotaConfig
-// 完成后清理 Redis 缓存 member:rate_limits:{userId}
+// BatchQuotaPatch 批量更新用户配额的补丁结构
+// 所有字段为零时视为不修改；ClearOverride=true 时清空该用户全部覆盖
+type BatchQuotaPatch struct {
+	RPM             int
+	TPM             int
+	DailyLimit      int64
+	MonthlyLimit    int64
+	MaxTokensPerReq int
+	MaxConcurrent   int
+	ClearOverride   bool
+}
+
+// BatchSetUserRateLimits 批量为指定用户设置自定义 RPM / TPM 覆盖（兼容旧签名）
+// Deprecated: 使用 BatchSetUserQuota 支持全字段 patch
 func (s *MemberLevelService) BatchSetUserRateLimits(ctx context.Context, userIDs []uint, rpm int, tpm int) (int, error) {
+	return s.BatchSetUserQuota(ctx, userIDs, BatchQuotaPatch{RPM: rpm, TPM: tpm})
+}
+
+// BatchSetUserQuota 批量为指定用户设置用户级 UserQuotaConfig 覆盖
+// 非零字段覆写；ClearOverride=true 时 DELETE 该用户的全部覆盖（回退到会员等级默认值）
+// 完成后清理 Redis 缓存 member:rate_limits:{userId}
+func (s *MemberLevelService) BatchSetUserQuota(ctx context.Context, userIDs []uint, patch BatchQuotaPatch) (int, error) {
 	if len(userIDs) == 0 {
 		return 0, nil
 	}
-	if rpm <= 0 && tpm <= 0 {
-		return 0, fmt.Errorf("at least one of rpm/tpm must be > 0")
+	// 校验：至少要有一项有效动作
+	hasAny := patch.RPM > 0 || patch.TPM > 0 || patch.DailyLimit > 0 || patch.MonthlyLimit > 0 ||
+		patch.MaxTokensPerReq > 0 || patch.MaxConcurrent > 0 || patch.ClearOverride
+	if !hasAny {
+		return 0, fmt.Errorf("no patch fields specified")
 	}
 
+	// ClearOverride 分支：批量 DELETE
+	if patch.ClearOverride {
+		cleanIDs := make([]uint, 0, len(userIDs))
+		for _, uid := range userIDs {
+			if uid != 0 {
+				cleanIDs = append(cleanIDs, uid)
+			}
+		}
+		if len(cleanIDs) == 0 {
+			return 0, nil
+		}
+		if err := s.db.WithContext(ctx).Where("user_id IN ?", cleanIDs).Delete(&model.UserQuotaConfig{}).Error; err != nil {
+			return 0, fmt.Errorf("delete quota configs: %w", err)
+		}
+		// 清理所有受影响用户的 Redis 缓存
+		if s.redis != nil {
+			for _, uid := range cleanIDs {
+				cacheKey := fmt.Sprintf("%s%d", memberRateLimitsCachePrefix, uid)
+				_ = s.redis.Del(ctx, cacheKey).Err()
+			}
+		}
+		return len(cleanIDs), nil
+	}
+
+	// 常规分支：upsert 非零字段
 	updated := 0
 	for _, uid := range userIDs {
 		if uid == 0 {
@@ -441,18 +487,29 @@ func (s *MemberLevelService) BatchSetUserRateLimits(ctx context.Context, userIDs
 		} else if err != nil {
 			return updated, fmt.Errorf("query quota config user=%d: %w", uid, err)
 		}
-		if rpm > 0 {
-			cfg.CustomRPM = rpm
+		if patch.RPM > 0 {
+			cfg.CustomRPM = patch.RPM
 		}
-		if tpm > 0 {
-			cfg.CustomTPM = tpm
+		if patch.TPM > 0 {
+			cfg.CustomTPM = patch.TPM
+		}
+		if patch.DailyLimit > 0 {
+			cfg.DailyLimit = patch.DailyLimit
+		}
+		if patch.MonthlyLimit > 0 {
+			cfg.MonthlyLimit = patch.MonthlyLimit
+		}
+		if patch.MaxTokensPerReq > 0 {
+			cfg.MaxTokensPerReq = patch.MaxTokensPerReq
+		}
+		if patch.MaxConcurrent > 0 {
+			cfg.MaxConcurrent = patch.MaxConcurrent
 		}
 		if err := s.db.WithContext(ctx).Save(&cfg).Error; err != nil {
 			return updated, fmt.Errorf("save quota config user=%d: %w", uid, err)
 		}
 		updated++
 
-		// 清理该用户 Redis 限流缓存
 		if s.redis != nil {
 			cacheKey := fmt.Sprintf("%s%d", memberRateLimitsCachePrefix, uid)
 			_ = s.redis.Del(ctx, cacheKey).Err()

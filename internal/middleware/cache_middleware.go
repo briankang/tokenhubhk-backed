@@ -13,6 +13,7 @@ import (
 
 	"tokenhub-server/internal/pkg/logger"
 	"tokenhub-server/internal/pkg/redis"
+	"tokenhub-server/internal/pkg/safego"
 	cachesvc "tokenhub-server/internal/service/cache"
 )
 
@@ -83,7 +84,7 @@ func CacheMiddleware(ttl time.Duration) gin.HandlerFunc {
 			// 复制响应体到新切片，避免 goroutine 访问已被释放的 buffer
 			bodyCopy := make([]byte, recorder.body.Len())
 			copy(bodyCopy, recorder.body.Bytes())
-			go func() {
+			safego.Go("cache-middleware-async-set", func() {
 				// 异步写入缓存，不阻塞响应。
 				// 必须使用独立的 context，否则请求结束后 c.Request.Context() 会立即被取消，
 				// 导致 Redis Set 调用报 "context canceled" 无法写入缓存。
@@ -96,7 +97,7 @@ func CacheMiddleware(ttl time.Duration) gin.HandlerFunc {
 							zap.Error(err))
 					}
 				}
-			}()
+			})
 		}
 	}
 }

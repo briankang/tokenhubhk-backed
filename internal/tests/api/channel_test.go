@@ -87,7 +87,9 @@ func TestUpdateChannel_Success(t *testing.T) {
 		t.Skipf("create channel returned %d, skipping update test", statusCode)
 	}
 
-	var ch struct{ ID uint `json:"id"` }
+	var ch struct {
+		ID uint `json:"id"`
+	}
 	json.Unmarshal(createResp.Data, &ch)
 	if ch.ID == 0 {
 		t.Skip("no channel ID returned")
@@ -131,7 +133,9 @@ func TestDeleteChannel_Success(t *testing.T) {
 		t.Skipf("create returned %d", statusCode)
 	}
 
-	var ch struct{ ID uint `json:"id"` }
+	var ch struct {
+		ID uint `json:"id"`
+	}
 	json.Unmarshal(createResp.Data, &ch)
 	if ch.ID == 0 {
 		t.Skip("no channel ID")
@@ -182,7 +186,9 @@ func TestSetChannelTags_Success(t *testing.T) {
 	if err != nil || statusCode != http.StatusOK {
 		t.Skip("cannot create tag for SetTags test")
 	}
-	var tag struct{ ID uint `json:"id"` }
+	var tag struct {
+		ID uint `json:"id"`
+	}
 	json.Unmarshal(tagResp.Data, &tag)
 
 	// Create a channel
@@ -200,7 +206,9 @@ func TestSetChannelTags_Success(t *testing.T) {
 	if err != nil || statusCode != http.StatusOK {
 		t.Skip("cannot create channel for SetTags test")
 	}
-	var ch struct{ ID uint `json:"id"` }
+	var ch struct {
+		ID uint `json:"id"`
+	}
 	json.Unmarshal(chResp.Data, &ch)
 
 	if tag.ID == 0 || ch.ID == 0 {
@@ -258,7 +266,9 @@ func TestCreateBackupRule_Success(t *testing.T) {
 	if statusCode != http.StatusOK {
 		t.Skip("cannot create channel group for backup rule test")
 	}
-	var grp struct{ ID uint `json:"id"` }
+	var grp struct {
+		ID uint `json:"id"`
+	}
 	json.Unmarshal(grpResp.Data, &grp)
 	if grp.ID == 0 {
 		t.Skip("no group ID")
@@ -294,7 +304,9 @@ func TestBackupRuleStatus_Success(t *testing.T) {
 	if statusCode != http.StatusOK {
 		t.Skip("cannot create group")
 	}
-	var grp struct{ ID uint `json:"id"` }
+	var grp struct {
+		ID uint `json:"id"`
+	}
 	json.Unmarshal(grpResp.Data, &grp)
 
 	ruleName := uniqueName("bkps_rule")
@@ -306,7 +318,9 @@ func TestBackupRuleStatus_Success(t *testing.T) {
 	if statusCode != http.StatusOK {
 		t.Skip("cannot create backup rule")
 	}
-	var rule struct{ ID uint `json:"id"` }
+	var rule struct {
+		ID uint `json:"id"`
+	}
 	json.Unmarshal(ruleResp.Data, &rule)
 	if rule.ID == 0 {
 		t.Skip("no rule ID")

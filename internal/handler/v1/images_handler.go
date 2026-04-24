@@ -27,6 +27,7 @@ import (
 	"tokenhub-server/internal/provider"
 	"tokenhub-server/internal/service/apikey"
 	balancesvc "tokenhub-server/internal/service/balance"
+	billingsvc "tokenhub-server/internal/service/billing"
 	channelsvc "tokenhub-server/internal/service/channel"
 	codingsvc "tokenhub-server/internal/service/coding"
 	"tokenhub-server/internal/service/parammapping"
@@ -40,6 +41,7 @@ type ImagesHandler struct {
 	channelRouter *channelsvc.ChannelRouter
 	apiKeySvc     *apikey.ApiKeyService
 	balanceSvc    *balancesvc.BalanceService
+	billingSvc    *billingsvc.Service
 	paramSvc      *parammapping.ParamMappingService
 	pricingCalc   *pricing.PricingCalculator
 	logger        *zap.Logger
@@ -61,6 +63,7 @@ func NewImagesHandler(
 		channelRouter: channelRouter,
 		apiKeySvc:     apiKeySvc,
 		balanceSvc:    balSvc,
+		billingSvc:    billingsvc.NewService(db, pricingCalc, balSvc),
 		paramSvc:      paramSvc,
 		pricingCalc:   pricingCalc,
 		logger:        logger.L,
@@ -89,7 +92,7 @@ type imageGenerationRequest struct {
 func (h *ImagesHandler) GenerateImages(c *gin.Context) {
 	// 1. 身份认证
 	keyInfo, err := h.authenticateAPIKey(c)
-	if err != nil {
+	if err != nil || keyInfo == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": gin.H{
 				"message": "Invalid API key",
@@ -147,6 +150,35 @@ func (h *ImagesHandler) GenerateImages(c *gin.Context) {
 		}
 	}
 	start := time.Now()
+	estimatedImages := req.N
+	if estimatedImages <= 0 {
+		estimatedImages = 1
+	}
+	freezeID := ""
+	if h.billingSvc != nil {
+		freeze, fErr := h.billingSvc.FreezeUnitUsage(c.Request.Context(), billingsvc.UnitUsageRequest{
+			RequestID: requestID,
+			UserID:    keyInfo.UserID,
+			TenantID:  keyInfo.TenantID,
+			ModelName: req.Model,
+			Usage:     pricing.UsageInput{ImageCount: estimatedImages},
+		})
+		if fErr != nil {
+			c.JSON(http.StatusPaymentRequired, gin.H{
+				"error": gin.H{
+					"message": "Insufficient balance",
+					"type":    "insufficient_quota",
+					"code":    "insufficient_quota",
+				},
+			})
+			return
+		}
+		if freeze != nil {
+			freezeID = freeze.FreezeID
+			c.Set("estimated_cost_credits", freeze.EstimatedCostCredits)
+			c.Set("estimated_cost_units", freeze.EstimatedCostUnits)
+		}
+	}
 
 	// 3. 检查余额
 	if h.balanceSvc != nil {
@@ -170,8 +202,8 @@ func (h *ImagesHandler) GenerateImages(c *gin.Context) {
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		// 4.1 选择渠道
-		result, err := h.channelRouter.SelectChannelWithExcludes(
-			c.Request.Context(), req.Model, customChannelID, keyInfo.UserID, excludeChannelIDs)
+		result, err := h.channelRouter.SelectChannelForCapability(
+			c.Request.Context(), req.Model, customChannelID, keyInfo.UserID, model.CapabilityImage, excludeChannelIDs)
 		if err != nil {
 			h.logger.Warn("v1 images: 渠道选择失败",
 				zap.String("model", req.Model), zap.Int("attempt", attempt+1), zap.Error(err))
@@ -252,8 +284,8 @@ func (h *ImagesHandler) GenerateImages(c *gin.Context) {
 		h.recordLog(ch.ID, actualModel, keyInfo, requestID, int(latency), 200, "")
 
 		imageCount := len(resp.Data)
-		costCredits, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, pricing.UsageInput{ImageCount: imageCount}, requestID)
-		h.recordApiCallLog(keyInfo, ch, requestID, req.Model, actualModel, c.ClientIP(), int(latency), 200, costCredits, costRMB, rawBody, imageCount)
+		costCredits, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, pricing.UsageInput{ImageCount: imageCount}, requestID, freezeID)
+		h.recordApiCallLog(c, keyInfo, ch, requestID, req.Model, actualModel, c.ClientIP(), int(latency), 200, costCredits, costRMB, rawBody, imageCount)
 
 		h.logger.Info("v1 images: 图像生成成功",
 			zap.String("model", req.Model),
@@ -284,6 +316,7 @@ func (h *ImagesHandler) GenerateImages(c *gin.Context) {
 		errMsg = lastErr.Error()
 	}
 	c.Header("X-Request-ID", requestID)
+	_ = releaseFrozenWithBillingService(c, h.billingSvc, freezeID)
 	c.JSON(http.StatusBadGateway, gin.H{
 		"error": gin.H{
 			"message": errMsg,
@@ -335,57 +368,89 @@ func (h *ImagesHandler) recordLog(
 
 // calculateAndDeductCost 按计费单位计算费用并扣减余额（失败时记录 error 日志，返回已计算的 cost 供对账）
 func (h *ImagesHandler) calculateAndDeductCost(
-	c *gin.Context, modelName string, keyInfo *apikey.ApiKeyInfo, usage pricing.UsageInput, requestID string,
+	c *gin.Context, modelName string, keyInfo *apikey.ApiKeyInfo, usage pricing.UsageInput, requestID string, freezeID string,
 ) (int64, float64) {
+	if h.billingSvc != nil {
+		out, err := h.billingSvc.SettleUnitUsage(c.Request.Context(), billingsvc.UnitUsageRequest{
+			RequestID: requestID,
+			UserID:    keyInfo.UserID,
+			TenantID:  keyInfo.TenantID,
+			ModelName: modelName,
+			Usage:     usage,
+			FreezeID:  freezeID,
+		})
+		if out == nil {
+			return 0, 0
+		}
+		applyUnitBillingOutcomeToContext(c, out)
+		if err != nil {
+			h.logger.Error("v1 images 鎵ｈ垂澶辫触锛岄渶瑕佷汉宸ュ璐?",
+				zap.Error(err),
+				zap.String("request_id", requestID),
+				zap.Uint("user_id", keyInfo.UserID),
+				zap.String("model", modelName),
+				zap.Int64("cost_credits", out.CostCredits))
+		}
+		return out.CostCredits, out.CostRMB
+	}
 	if h.pricingCalc == nil {
 		return 0, 0
 	}
 	ctx := c.Request.Context()
-	var aiModel model.AIModel
-	if err := h.db.WithContext(ctx).Where("model_name = ? AND is_active = true", modelName).First(&aiModel).Error; err != nil {
+	aiModel, billedModel := findActiveModelByRequestOrActual(ctx, h.db, modelName, modelName)
+	if aiModel == nil {
 		return 0, 0
 	}
-	costResult, err := h.pricingCalc.CalculateCostByUnit(ctx, aiModel.ID, keyInfo.TenantID, 0, usage)
+	costResult, err := h.pricingCalc.CalculateCostByUnit(ctx, keyInfo.UserID, aiModel.ID, keyInfo.TenantID, 0, usage)
 	if err != nil || costResult == nil {
 		return 0, 0
 	}
 	if h.balanceSvc != nil && costResult.TotalCost > 0 {
-		if dErr := h.balanceSvc.DeductForRequest(ctx, keyInfo.UserID, keyInfo.TenantID, costResult.TotalCost, modelName, requestID); dErr != nil {
+		if dErr := h.balanceSvc.DeductForRequest(ctx, keyInfo.UserID, keyInfo.TenantID, costResult.TotalCost, billedModel, requestID); dErr != nil {
 			h.logger.Error("v1 images 扣费失败，需要人工对账",
 				zap.Error(dErr),
 				zap.String("request_id", requestID),
 				zap.Uint("user_id", keyInfo.UserID),
-				zap.String("model", modelName),
+				zap.String("model", billedModel),
 				zap.Int64("cost_credits", costResult.TotalCost))
+			setUnitBillingContext(c, requestID, billedModel, aiModel, costResult, usage, "deduct_failed", 0, costResult.TotalCost)
+			return costResult.TotalCost, costResult.TotalCostRMB
 		}
 	}
+	status := "no_charge"
+	actualCredits := int64(0)
+	if costResult.TotalCost > 0 {
+		status = "settled"
+		actualCredits = costResult.TotalCost
+	}
+	setUnitBillingContext(c, requestID, billedModel, aiModel, costResult, usage, status, actualCredits, 0)
 	return costResult.TotalCost, costResult.TotalCostRMB
 }
 
 // recordApiCallLog 异步写入 /v1/images/generations 的全链路日志（供 /user/usage 聚合使用）
 func (h *ImagesHandler) recordApiCallLog(
-	keyInfo *apikey.ApiKeyInfo, ch *model.Channel, requestID, requestModel, actualModel, clientIP string,
+	c *gin.Context, keyInfo *apikey.ApiKeyInfo, ch *model.Channel, requestID, requestModel, actualModel, clientIP string,
 	latencyMs, statusCode int, costCredits int64, costRMB float64, rawBody []byte, imageCount int,
 ) {
 	callLog := &model.ApiCallLog{
-		RequestID:       requestID,
-		UserID:          keyInfo.UserID,
-		TenantID:        keyInfo.TenantID,
-		ApiKeyID:        keyInfo.KeyID,
-		ClientIP:        clientIP,
-		Endpoint:        "/v1/images/generations",
-		RequestModel:    requestModel,
-		ActualModel:     actualModel,
-		ChannelID:       ch.ID,
-		ChannelName:     ch.Name,
-		SupplierName:    ch.Supplier.Name,
-		StatusCode:      statusCode,
-		TotalLatencyMs:  latencyMs,
+		RequestID:         requestID,
+		UserID:            keyInfo.UserID,
+		TenantID:          keyInfo.TenantID,
+		ApiKeyID:          keyInfo.KeyID,
+		ClientIP:          clientIP,
+		Endpoint:          "/v1/images/generations",
+		RequestModel:      requestModel,
+		ActualModel:       actualModel,
+		ChannelID:         ch.ID,
+		ChannelName:       ch.Name,
+		SupplierName:      resolveChannelSupplierName(c.Request.Context(), h.db, ch),
+		StatusCode:        statusCode,
+		TotalLatencyMs:    latencyMs,
 		UpstreamLatencyMs: latencyMs,
-		CostCredits:     costCredits,
-		CostRMB:         costRMB,
-		ImageCount:      imageCount,
-		Status:          "success",
+		CostCredits:       costCredits,
+		CostRMB:           costRMB,
+		ImageCount:        imageCount,
+		Status:            "success",
 	}
 	if statusCode >= 400 {
 		callLog.Status = "error"
@@ -393,6 +458,7 @@ func (h *ImagesHandler) recordApiCallLog(
 	if rawBody != nil && len(rawBody) > 0 {
 		callLog.RequestBody = string(rawBody)
 	}
+	applyMatchedTierFromCtx(c, callLog)
 	go func() {
 		if err := h.db.Create(callLog).Error; err != nil {
 			h.logger.Error("v1 images: 记录API调用日志失败", zap.Error(err))

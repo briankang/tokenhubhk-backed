@@ -260,7 +260,7 @@ func (h *ChatHandler) handleCompletion(
 
 	// 异步计算推荐佣金
 	if h.commissionCalc != nil && cost > 0 {
-		h.commissionCalc.CalculateCommissionsAsync(keyInfo.UserID, keyInfo.TenantID, cost)
+		h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, cost, req.Model)
 	}
 
 	c.JSON(http.StatusOK, resp)
@@ -325,7 +325,7 @@ func (h *ChatHandler) handleStreamCompletion(
 		}
 		// 异步计算推荐佣金
 		if h.commissionCalc != nil && cost > 0 {
-			h.commissionCalc.CalculateCommissionsAsync(keyInfo.UserID, keyInfo.TenantID, cost)
+			h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, cost, req.Model)
 		}
 	} else {
 		// 无 usage 信息时：释放冻结；若命中 thinking-only 也补写一条日志便于聚合
@@ -587,7 +587,7 @@ func (h *ChatHandler) calculateActualCost(
 	}
 	costResult, err := h.pricingCalc.CalculateCost(
 		ctx,
-		aiModel.ID, keyInfo.TenantID, 0,
+		keyInfo.UserID, aiModel.ID, keyInfo.TenantID, 0,
 		usage.PromptTokens, usage.CompletionTokens,
 	)
 	if err != nil || costResult == nil {
@@ -610,7 +610,7 @@ func (h *ChatHandler) estimateCost(ctx context.Context, modelName string, maxTok
 		return 0
 	}
 	// 预估：假设 prompt_tokens ≈ 1000（合理预估），completion_tokens = max_tokens
-	costResult, err := h.pricingCalc.CalculateCost(ctx, aiModel.ID, 0, 0, 1000, maxTokens)
+	costResult, err := h.pricingCalc.CalculateCost(ctx, 0, aiModel.ID, 0, 0, 1000, maxTokens)
 	if err != nil || costResult == nil {
 		return 0
 	}

@@ -32,6 +32,16 @@ func (h *ParamMappingHandler) ListParams(c *gin.Context) {
 	response.Success(c, params)
 }
 
+// Coverage returns supplier-level parameter mapping diagnostics.
+func (h *ParamMappingHandler) Coverage(c *gin.Context) {
+	report, err := h.svc.GetCoverageReport(c.Request.Context())
+	if err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	response.Success(c, report)
+}
+
 // GetParam 获取单个参数详情 GET /admin/param-mappings/:id
 func (h *ParamMappingHandler) GetParam(c *gin.Context) {
 	id, err := strconv.ParseUint(c.Param("id"), 10, 64)

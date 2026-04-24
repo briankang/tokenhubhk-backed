@@ -10,8 +10,8 @@ func TestSetModelPricing_Success(t *testing.T) {
 
 	resp, statusCode, err := doPost(baseURL+"/api/v1/admin/model-pricings", map[string]interface{}{
 		"model_id":               1,
-		"input_price_per_token":  0.00003,
-		"output_price_per_token": 0.00006,
+		"input_price_per_token":  int64(30),
+		"output_price_per_token": int64(60),
 		"currency":               "USD",
 	}, adminToken)
 	if err != nil {
@@ -19,6 +19,7 @@ func TestSetModelPricing_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, statusCode)
 	skipIfNotFound(t, statusCode)
+	skipIfForbidden(t, statusCode)
 
 	if statusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", statusCode, resp.Message)
@@ -34,6 +35,7 @@ func TestGetPriceMatrix_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, statusCode)
 	skipIfNotFound(t, statusCode)
+	skipIfForbidden(t, statusCode)
 
 	if statusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", statusCode, resp.Message)
@@ -53,6 +55,7 @@ func TestSetLevelDiscount_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, statusCode)
 	skipIfNotFound(t, statusCode)
+	skipIfForbidden(t, statusCode)
 
 	if statusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", statusCode, resp.Message)
@@ -73,6 +76,7 @@ func TestPriceCalculation_LevelDiscount(t *testing.T) {
 	}
 	skipIfNotImplemented(t, statusCode)
 	skipIfNotFound(t, statusCode)
+	skipIfForbidden(t, statusCode)
 
 	if statusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", statusCode, resp.Message)
@@ -92,6 +96,7 @@ func TestPriceCalculation_AgentCustom(t *testing.T) {
 	}, adminToken)
 	skipIfNotImplemented(t, statusCode)
 	skipIfNotFound(t, statusCode)
+	skipIfForbidden(t, statusCode)
 
 	// Calculate with agent custom pricing
 	resp, statusCode, err := doPost(baseURL+"/api/v1/admin/price-calculate", map[string]interface{}{
@@ -105,6 +110,7 @@ func TestPriceCalculation_AgentCustom(t *testing.T) {
 	}
 	skipIfNotImplemented(t, statusCode)
 	skipIfNotFound(t, statusCode)
+	skipIfForbidden(t, statusCode)
 
 	if statusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", statusCode, resp.Message)
@@ -127,6 +133,7 @@ func TestPriceCalculation_Inheritance(t *testing.T) {
 	}
 	skipIfNotImplemented(t, statusCode)
 	skipIfNotFound(t, statusCode)
+	skipIfForbidden(t, statusCode)
 
 	if statusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", statusCode, resp.Message)

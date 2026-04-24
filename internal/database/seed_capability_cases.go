@@ -8,36 +8,59 @@ import (
 	"tokenhub-server/internal/pkg/logger"
 )
 
-// RunSeedCapabilityCases 初始化默认能力测试用例
+// RunSeedCapabilityCases 初始化/更新默认能力测试用例
 //
-// 行为：仅在首次安装时（表中完全无记录）写入种子数据，避免每次重启覆盖管理员的修改。
-// 如需重新应用默认用例，请调用 ResetSeedCapabilityCases（管理后台"重置默认"按钮）。
+// v4.2 起：每次重启均执行 upsert，确保所有环境拥有最新的用例模板。
+// 更新策略：
+//   - 按 name 匹配：存在则更新 display_name/notes/request_template/assertions/
+//     provider_filter/capability/category/priority/timeout_seconds
+//   - 不修改管理员手动调整的 enabled 字段
+//   - name 不存在则创建（默认 enabled=true）
 func RunSeedCapabilityCases(db *gorm.DB) {
-	// 检查是否首次安装（包含软删除记录也算已安装，避免误覆盖）
-	var count int64
-	if err := db.Unscoped().Model(&model.CapabilityTestCase{}).Count(&count).Error; err != nil {
-		logger.L.Warn("能力测试用例种子：查表失败，跳过种子写入", zap.Error(err))
-		return
-	}
-	if count > 0 {
-		logger.L.Debug("能力测试用例种子：表非空，跳过（首次安装已完成）", zap.Int64("existing", count))
-		return
-	}
-
-	// 首次安装：批量写入
 	cases := buildDefaultCapabilityCases()
-	inserted := 0
+	created, updated := 0, 0
 	for _, c := range cases {
-		if err := db.Create(&c).Error; err != nil {
-			logger.L.Warn("能力测试用例种子写入失败",
-				zap.String("name", c.Name), zap.Error(err))
-			continue
+		var existing model.CapabilityTestCase
+		err := db.Unscoped().Where("name = ?", c.Name).First(&existing).Error
+		if err != nil {
+			// 不存在，创建
+			if err2 := db.Create(&c).Error; err2 != nil {
+				logger.L.Warn("能力测试用例种子写入失败",
+					zap.String("name", c.Name), zap.Error(err2))
+				continue
+			}
+			created++
+		} else {
+			// 已存在，更新模板字段（保留管理员的 enabled 设置）
+			updates := map[string]interface{}{
+				"display_name":          c.DisplayName,
+				"notes":                 c.Notes,
+				"request_template":      c.RequestTemplate,
+				"assertions":            c.Assertions,
+				"provider_filter":       c.ProviderFilter,
+				"model_type_filter":     c.ModelTypeFilter,
+				"capability":            c.Capability,
+				"category":              c.Category,
+				"subcategory":           c.Subcategory,
+				"model_type":            c.ModelType,
+				"endpoint_override":     c.EndpointOverride,
+				"flow_steps":            c.FlowSteps,
+				"expected_outcome":      c.ExpectedOutcome,
+				"priority":              c.Priority,
+				"cost_estimate_credits": c.CostEstimateCredits,
+				"deleted_at":            nil, // 恢复软删除的种子用例
+			}
+			if err2 := db.Unscoped().Model(&model.CapabilityTestCase{}).
+				Where("id = ?", existing.ID).Updates(updates).Error; err2 != nil {
+				logger.L.Warn("能力测试用例种子更新失败",
+					zap.String("name", c.Name), zap.Error(err2))
+				continue
+			}
+			updated++
 		}
-		inserted++
 	}
-	if inserted > 0 {
-		logger.L.Info("能力测试用例种子已写入（首次安装）", zap.Int("count", inserted))
-	}
+	logger.L.Info("能力测试用例种子 upsert 完成",
+		zap.Int("created", created), zap.Int("updated", updated), zap.Int("total", len(cases)))
 }
 
 // ResetSeedCapabilityCases 重置为默认用例（删除所有种子用例后重新插入）
@@ -310,23 +333,23 @@ func buildDefaultCapabilityCases() []model.CapabilityTestCase {
 		// ===== Video Generation (3 条，默认 enabled=false) =====
 		{
 			Name: "video_submit_basic", DisplayName: "视频任务提交（禁用）", Category: "async", ModelType: "video",
-			Subcategory: "async", EndpointOverride: "/video/generations", Priority: 30, Enabled: false, CostEstimateCredits: 50,
-			RequestTemplate: `{"path":"/video/generations","body":{"model":"{{.ModelName}}","prompt":"夕阳下的山脉全景","duration":5}}`,
-			Assertions:      `[{"type":"status_in","value":[200,202]},{"type":"jsonpath_exists","path":"$.id"}]`,
+			Subcategory: "async", EndpointOverride: "/videos/generations", Priority: 30, Enabled: false, CostEstimateCredits: 50,
+			RequestTemplate: `{"path":"/videos/generations","body":{"model":"{{.ModelName}}","prompt":"夕阳下的山脉全景","duration":5}}`,
+			Assertions:      `[{"type":"status_in","value":[200,202]},{"type":"jsonpath_exists","path":"$.task_id"}]`,
 			Notes:           "异步视频：提交生成任务，断言返回 task_id 和初始 pending 状态，高成本默认禁用",
 		},
 		{
 			Name: "video_poll_until_done", DisplayName: "视频异步轮询完成（禁用）", Category: "async", ModelType: "video",
-			Subcategory: "async", EndpointOverride: "/video/generations", Priority: 40, Enabled: false, CostEstimateCredits: 100,
-			RequestTemplate: `{"path":"/video/generations","body":{"model":"{{.ModelName}}","prompt":"海浪拍打礁石","duration":3}}`,
-			Assertions:      `[{"type":"status_in","value":[200,202]},{"type":"async_poll","taskIdPath":"$.id","pollEndpoint":"/video/tasks/{taskId}","statusPath":"$.status","resultPath":"$.result.video_url","successValues":["succeeded","completed","success"],"failValues":["failed","error"],"pollIntervalSec":10,"timeoutSec":300},{"type":"field_nonempty","path":"$.result.video_url"}]`,
+			Subcategory: "async", EndpointOverride: "/videos/generations", Priority: 40, Enabled: false, CostEstimateCredits: 100,
+			RequestTemplate: `{"path":"/videos/generations","body":{"model":"{{.ModelName}}","prompt":"海浪拍打礁石","duration":3}}`,
+			Assertions:      `[{"type":"status_in","value":[200,202]},{"type":"async_poll","taskIdPath":"$.task_id","pollEndpoint":"/videos/tasks/{taskId}","statusPath":"$.status","resultPath":"$.result.video_url","successValues":["succeeded","completed","success"],"failValues":["failed","error"],"pollIntervalSec":10,"timeoutSec":300},{"type":"field_nonempty","path":"$.result.video_url"}]`,
 			Notes:           "异步视频：轮询任务状态直至 succeeded，断言 video_url 不为空（超时 5 分钟），高成本默认禁用",
 		},
 		{
 			Name: "video_poll_timeout_graceful", DisplayName: "视频轮询超时降级（禁用）", Category: "async", ModelType: "video",
-			Subcategory: "async", EndpointOverride: "/video/generations", Priority: 50, Enabled: false, CostEstimateCredits: 80,
-			RequestTemplate: `{"path":"/video/generations","body":{"model":"{{.ModelName}}","prompt":"测试短片","duration":3}}`,
-			Assertions:      `[{"type":"async_poll","taskIdPath":"$.id","pollEndpoint":"/video/tasks/{taskId}","statusPath":"$.status","successValues":["succeeded"],"failValues":["failed"],"pollIntervalSec":5,"timeoutSec":30}]`,
+			Subcategory: "async", EndpointOverride: "/videos/generations", Priority: 50, Enabled: false, CostEstimateCredits: 80,
+			RequestTemplate: `{"path":"/videos/generations","body":{"model":"{{.ModelName}}","prompt":"测试短片","duration":3}}`,
+			Assertions:      `[{"type":"async_poll","taskIdPath":"$.task_id","pollEndpoint":"/videos/tasks/{taskId}","statusPath":"$.status","successValues":["succeeded"],"failValues":["failed"],"pollIntervalSec":5,"timeoutSec":30}]`,
 			Notes:           "异步视频：故意设置 30 秒短超时，验证超时时返回友好错误而非 panic，高成本默认禁用",
 		},
 
@@ -392,6 +415,70 @@ func buildDefaultCapabilityCases() []model.CapabilityTestCase {
 			RequestTemplate: `{"path":"/chat/completions","body":{"model":"{{.ModelName}}","messages":[{"role":"user","content":"你好"}],"enable_thinking":false,"max_tokens":4}}`,
 			Assertions:      `[{"type":"status_eq","value":200},{"type":"latency_lt_ms","threshold":5000}]`,
 			Notes:           "性能测试：简单对话延迟应低于 5000ms（P50 基线），超出时触发回归告警；enable_thinking=false 兼容 qwen3",
+		},
+
+		// ===== 网宿 AI 网关专用用例 (4 条) =====
+		// 针对网宿代理的 GPT/Claude/Gemini 高级参数测试。
+		// 因网宿 Claude/Gemini 网关 stream:true 仍返回整段 JSON（非原生 SSE），
+		// 这些用例的设计避开了对 SSE 帧数的强假设，转而验证 HTTP 状态 + JSON 字段。
+
+		{
+			Name:        "chat_wangsu_reasoning",
+			DisplayName: "网宿-深度思考 (reasoning_effort)",
+			Category:    "thinking",
+			ModelType:   "chat",
+			Capability:  "supports_thinking",
+			// 仅匹配支持 reasoning 的 Wangsu 模型（GPT-5 / Claude Opus|Sonnet / Gemini 3 Pro）；
+			// features.supports_thinking=true 也会触发匹配（绕过 provider_filter）
+			ProviderFilter:      "gpt-5,claude-opus,claude-sonnet,gemini-3-pro",
+			Priority:            20,
+			Enabled:             true,
+			CostEstimateCredits: 3,
+			RequestTemplate:     `{"path":"/chat/completions","body":{"model":"{{.ModelName}}","messages":[{"role":"user","content":"计算 3+4*2=? 只输出数字"}],"reasoning_effort":"low","max_tokens":500}}`,
+			Assertions:          `[{"type":"status_eq","value":200},{"type":"field_nonempty","path":"$.choices[0].message.content"}]`,
+			Notes:               "网宿专用：reasoning_effort 参数对 GPT-5 / Claude Opus|Sonnet / Gemini 3 Pro 的支持。Wangsu OpenAI 兼容层会把此参数转换为各家原生思考参数（OpenAI reasoning / Anthropic thinking / Google thinking_config）。非流式以避开 Wangsu Claude/Gemini 不返 SSE 的限制",
+		},
+		{
+			Name:                "chat_wangsu_prompt_cache_explicit",
+			DisplayName:         "网宿-提示词缓存（显式）",
+			Category:            "cache",
+			ModelType:           "chat",
+			Capability:          "supports_cache",
+			ProviderFilter:      "claude,anthropic",
+			Priority:            25,
+			Enabled:             true,
+			CostEstimateCredits: 2,
+			RequestTemplate:     `{"path":"/chat/completions","body":{"model":"{{.ModelName}}","messages":[{"role":"system","content":[{"type":"text","text":"你是一个友好的中文助手。请用简短的方式回答问题。这段系统提示会被缓存以节省成本。","cache_control":{"type":"ephemeral"}}]},{"role":"user","content":"你好"}],"max_tokens":32}}`,
+			Assertions:          `[{"type":"status_eq","value":200},{"type":"field_nonempty","path":"$.choices[0].message.content"}]`,
+			Notes:               "网宿专用：Claude 显式缓存 cache_control.ephemeral 通过 Wangsu OpenAI 兼容层透传到 Anthropic 上游。HTTP 200 + 非空 content 表示缓存参数被正确识别（即使没命中缓存也应能正常响应）",
+		},
+		{
+			Name:                "chat_wangsu_stream_usage",
+			DisplayName:         "网宿-流式 Usage 返回",
+			Category:            "baseline",
+			ModelType:           "chat",
+			Capability:          "supports_stream",
+			ProviderFilter:      "gpt,claude,gemini,anthropic",
+			Priority:            15,
+			Enabled:             true,
+			CostEstimateCredits: 1,
+			RequestTemplate:     `{"path":"/chat/completions","body":{"model":"{{.ModelName}}","messages":[{"role":"user","content":"回复一个字：好"}],"stream":true,"stream_options":{"include_usage":true},"max_tokens":8}}`,
+			Assertions:          `[{"type":"status_eq","value":200},{"type":"streaming_min_chunks","min_chunks":1},{"type":"content_type_matches","pattern":"text/event-stream"}]`,
+			Notes:               "网宿专用：三家网关原生 SSE + include_usage 能力对比。Wangsu GPT 真流式（PASS）；Wangsu Claude/Gemini 仅返回整段 JSON（FAIL，符合预期）。我们的 WangsuProvider 会自动把这种非 SSE 响应包装成伪流式发给终端用户，所以 /v1/chat/completions 入口对客户端是流式的",
+		},
+		{
+			Name:                "chat_wangsu_native_sse",
+			DisplayName:         "网宿-原生 SSE 诊断",
+			Category:            "baseline",
+			ModelType:           "chat",
+			Capability:          "",
+			ProviderFilter:      "gpt,claude,gemini,anthropic",
+			Priority:            16,
+			Enabled:             true,
+			CostEstimateCredits: 1,
+			RequestTemplate:     `{"path":"/chat/completions","body":{"model":"{{.ModelName}}","messages":[{"role":"user","content":"回复一个字：好"}],"stream":true,"max_tokens":8}}`,
+			Assertions:          `[{"type":"status_eq","value":200}]`,
+			Notes:               "网宿诊断：仅断言 HTTP 200，不区分响应是 SSE 还是 JSON。配合 chat_wangsu_stream_usage 用例使用：本用例 9/9 PASS + stream_usage 仅 GPT PASS，即可确认 Wangsu Claude/Gemini 不支持原生 SSE",
 		},
 	}
 }

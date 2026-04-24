@@ -9,25 +9,25 @@ package model
 // - error: 验证失败或API异常
 type Channel struct {
 	BaseModel
-	Name           string       `gorm:"type:varchar(100);not null" json:"name"`                                  // 渠道名称
-	SupplierID     uint         `gorm:"index;not null" json:"supplier_id"`                                       // 关联供应商 ID
-	Type           string       `gorm:"type:varchar(30);not null" json:"type"`                                   // 类型: openai / azure / anthropic / ...
-	ChannelType    string       `gorm:"type:varchar(20);default:'CHAT';index" json:"channel_type"`               // 渠道用途: CHAT(对话) / CODING(代码补全) / MIXED(混合)
+	Name        string `gorm:"type:varchar(100);not null" json:"name"`                    // 渠道名称
+	SupplierID  uint   `gorm:"index;not null" json:"supplier_id"`                         // 关联供应商 ID
+	Type        string `gorm:"type:varchar(30);not null" json:"type"`                     // 类型: openai / azure / anthropic / ...
+	ChannelType string `gorm:"type:varchar(20);default:'CHAT';index" json:"channel_type"` // 渠道用途: CHAT(对话) / CODING(代码补全) / MIXED(混合)
 	// SupportedCapabilities 渠道支持的能力列表，逗号分隔
 	// 可选值: chat, image, video, tts, asr, embedding
 	// 空值或 "chat" 兼容旧数据（老渠道默认仅支持对话）
 	SupportedCapabilities string       `gorm:"type:varchar(255);default:'chat'" json:"supported_capabilities"`
-	Endpoint       string       `gorm:"type:varchar(500);not null" json:"endpoint"`                               // API 端点 URL
-	APIKey         string       `gorm:"type:varchar(500);not null" json:"-"`                                     // API Key（不输出）
-	Models         JSON         `gorm:"type:json" json:"models,omitempty"`                                       // Deprecated: 使用 CustomChannelRoute + ChannelModel 替代。保留兼容旧数据
-	Weight         int          `gorm:"default:1" json:"weight"`                                                 // 路由权重
-	Priority       int          `gorm:"default:0" json:"priority"`                                               // 路由优先级
-	Status         string       `gorm:"type:varchar(20);default:'unverified';index" json:"status"`                // 状态: unverified(默认) / active / disabled / error
-	Verified       bool         `gorm:"default:false" json:"verified"`                                           // Key是否已验证通过
-	MaxConcurrency int          `gorm:"default:100" json:"max_concurrency"`                                      // 最大并发数
-	QPM            int          `gorm:"default:60" json:"qpm"`                                                   // 每分钟请求数限制
-	PreferenceTag  string       `gorm:"type:varchar(30);default:''" json:"preference_tag"`                        // 偏好标签: availability/cost/speed 或空
-	Tags           []ChannelTag `gorm:"many2many:channel_tags_relation" json:"tags,omitempty"`                    // 标签（多对多）
+	Endpoint              string       `gorm:"type:varchar(500);not null" json:"endpoint"`                // API 端点 URL
+	APIKey                string       `gorm:"type:varchar(500);not null" json:"-"`                       // API Key（不输出）
+	Models                JSON         `gorm:"type:json" json:"models,omitempty"`                         // Deprecated: 使用 CustomChannelRoute + ChannelModel 替代。保留兼容旧数据
+	Weight                int          `gorm:"default:1" json:"weight"`                                   // 路由权重
+	Priority              int          `gorm:"default:0" json:"priority"`                                 // 路由优先级
+	Status                string       `gorm:"type:varchar(20);default:'unverified';index" json:"status"` // 状态: unverified(默认) / active / disabled / error
+	Verified              bool         `gorm:"default:false" json:"verified"`                             // Key是否已验证通过
+	MaxConcurrency        int          `gorm:"default:100" json:"max_concurrency"`                        // 最大并发数
+	QPM                   int          `gorm:"default:60" json:"qpm"`                                     // 每分钟请求数限制
+	PreferenceTag         string       `gorm:"type:varchar(30);default:''" json:"preference_tag"`         // 偏好标签: availability/cost/speed 或空
+	Tags                  []ChannelTag `gorm:"many2many:channel_tags_relation" json:"tags,omitempty"`     // 标签（多对多）
 
 	// --- API协议与鉴权配置 ---
 	ApiProtocol string `gorm:"type:varchar(30);default:'openai_chat'" json:"api_protocol"`
@@ -59,6 +59,7 @@ const (
 	CapabilityTTS       = "tts"
 	CapabilityASR       = "asr"
 	CapabilityEmbedding = "embedding"
+	CapabilityRerank    = "rerank"
 )
 
 // ModelTypeToCapability 将 ai_models.model_type 映射为渠道能力标签
@@ -73,9 +74,15 @@ func ModelTypeToCapability(modelType string) string {
 		return CapabilityTTS
 	case "SpeechRecognition":
 		return CapabilityASR
+	case "TTS":
+		return CapabilityTTS
+	case "ASR":
+		return CapabilityASR
 	case "Embedding":
 		return CapabilityEmbedding
-	case "LLM", "VLM", "":
+	case "Rerank":
+		return CapabilityRerank
+	case "LLM", "VLM", "Vision", "Reasoning", "":
 		return CapabilityChat
 	default:
 		return CapabilityChat

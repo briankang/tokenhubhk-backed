@@ -62,8 +62,6 @@ func (s *Service) GetConfig(ctx context.Context) *model.RegistrationGuard {
 	if err != nil {
 		// 返回默认安全值
 		return &model.RegistrationGuard{
-			CaptchaEnabled:         true,
-			CaptchaProvider:        "turnstile",
 			EmailOTPEnabled:        true,
 			EmailOTPLength:         6,
 			EmailOTPTTLSeconds:     300,
@@ -76,6 +74,9 @@ func (s *Service) GetConfig(ctx context.Context) *model.RegistrationGuard {
 			IPReputationEnabled:    true,
 			BlockTor:               true,
 			DisposableEmailBlocked: true,
+			FreeUserRPM:            5,
+			FreeUserTPM:            10000,
+			FreeUserConcurrency:    2,
 			IsActive:               true,
 		}
 	}
@@ -105,12 +106,6 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *model.RegistrationGuard
 	}
 
 	// 仅覆盖用户可配置的字段,保持 IsActive/BaseModel 不被改掉
-	existing.CaptchaEnabled = cfg.CaptchaEnabled
-	existing.CaptchaProvider = cfg.CaptchaProvider
-	existing.CaptchaSiteKey = cfg.CaptchaSiteKey
-	if cfg.CaptchaSecretEnc != "" {
-		existing.CaptchaSecretEnc = cfg.CaptchaSecretEnc
-	}
 	existing.EmailOTPEnabled = cfg.EmailOTPEnabled
 	existing.EmailOTPLength = cfg.EmailOTPLength
 	existing.EmailOTPTTLSeconds = cfg.EmailOTPTTLSeconds
@@ -124,6 +119,9 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *model.RegistrationGuard
 	existing.BlockVPN = cfg.BlockVPN
 	existing.BlockTor = cfg.BlockTor
 	existing.DisposableEmailBlocked = cfg.DisposableEmailBlocked
+	existing.FreeUserRPM = cfg.FreeUserRPM
+	existing.FreeUserTPM = cfg.FreeUserTPM
+	existing.FreeUserConcurrency = cfg.FreeUserConcurrency
 
 	if err := s.db.WithContext(ctx).Save(&existing).Error; err != nil {
 		return err
@@ -200,9 +198,10 @@ func (s *Service) ListDisposable(ctx context.Context, page, pageSize int) ([]mod
 		pageSize = 50
 	}
 	var total int64
-	s.db.WithContext(ctx).Model(&model.DisposableEmailDomain{}).Count(&total)
+	s.db.WithContext(ctx).Model(&model.DisposableEmailDomain{}).Where("is_active = ?", true).Count(&total)
 	var list []model.DisposableEmailDomain
 	err := s.db.WithContext(ctx).
+		Where("is_active = ?", true).
 		Order("created_at DESC").
 		Offset((page - 1) * pageSize).
 		Limit(pageSize).
@@ -397,9 +396,9 @@ type Decision struct {
 }
 
 // EvaluateRegistration 综合 7 层防御规则判断是否允许注册
-// 入参:注册上下文 + CAPTCHA 是否通过(上层调用 Turnstile/hcaptcha 校验后告知)
+// 入参:注册上下文
 // 出参:Decision
-func (s *Service) EvaluateRegistration(ctx context.Context, reqCtx RegistrationContext, captchaPassed bool) Decision {
+func (s *Service) EvaluateRegistration(ctx context.Context, reqCtx RegistrationContext) Decision {
 	cfg := s.GetConfig(ctx)
 	if cfg == nil || !cfg.IsActive {
 		return Decision{Allow: true}
@@ -408,11 +407,6 @@ func (s *Service) EvaluateRegistration(ctx context.Context, reqCtx RegistrationC
 	// 1) Honeypot
 	if reqCtx.HoneypotHit {
 		return Decision{Allow: false, BlockedReason: "HONEYPOT_HIT"}
-	}
-
-	// 2) CAPTCHA
-	if cfg.CaptchaEnabled && !captchaPassed {
-		return Decision{Allow: false, BlockedReason: "CAPTCHA_FAIL"}
 	}
 
 	// 3) 一次性邮箱

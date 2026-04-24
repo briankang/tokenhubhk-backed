@@ -66,7 +66,11 @@ func Bootstrap(db *gorm.DB, redis *goredis.Client) *Services {
 	if apiKey != "" && baseURL != "" {
 		embed = NewEmbeddingClient(baseURL, apiKey, cfg.EmbeddingModel)
 		retriever = NewKnowledgeRetriever(db, redis, embed, resolver)
+		// Phase A3: 切换向量存储模式（默认 memory，可配 polardb 走 HNSW）
+		retriever.SetVectorStore(cfg.VectorStore)
 		rebuilder = NewKnowledgeRebuilder(db, embed)
+		// Phase A4: 让 rebuilder 知道是否需要写 embedding_vec（PolarDB only）
+		rebuilder.SetVectorStore(cfg.VectorStore)
 	}
 
 	prompt := NewPromptBuilder(resolver)
@@ -159,10 +163,14 @@ func resolveInternalAPIKey(db *gorm.DB, fromConfig string) string {
 		}
 	}
 
-	// 3. 自动发现：取首个 ADMIN 用户的第一条 active APIKey
+	// 3. 自动发现：取首个 SUPER_ADMIN 角色用户的第一条 active APIKey
+	// 注意：RBAC v4.0 已删除 users.role 列，改用 user_roles 表查询
 	var admin model.User
-	if err := db.WithContext(ctx).Where("role = ?", "ADMIN").Order("id ASC").First(&admin).Error; err != nil {
-		logger.L.Warn("no admin user found for support auto-key", zap.Error(err))
+	if err := db.WithContext(ctx).
+		Joins("JOIN user_roles ur ON ur.user_id = users.id").
+		Joins("JOIN roles r ON r.id = ur.role_id AND r.code = ?", "SUPER_ADMIN").
+		Order("users.id ASC").First(&admin).Error; err != nil {
+		logger.L.Warn("no SUPER_ADMIN user found for support auto-key", zap.Error(err))
 		return ""
 	}
 

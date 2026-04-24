@@ -3,11 +3,13 @@ package admin
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -18,6 +20,7 @@ import (
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 	"tokenhub-server/internal/service/apikey"
+	referralsvc "tokenhub-server/internal/service/referral"
 )
 
 // ApiCallLogHandler API 调用日志查询处理器（管理员专用）
@@ -39,6 +42,8 @@ func NewApiCallLogHandler(db *gorm.DB, apiKeySvc *apikey.ApiKeyService) *ApiCall
 func (h *ApiCallLogHandler) Register(rg *gin.RouterGroup) {
 	rg.GET("/api-call-logs", h.List)
 	rg.GET("/api-call-logs/summary", h.Summary)
+	rg.GET("/api-call-logs/reconciliation", h.Reconciliation)
+	rg.GET("/api-call-logs/reconciliation/export", h.ExportReconciliationCSV)
 	rg.GET("/api-call-logs/:requestId", h.GetByRequestID)
 	rg.GET("/api-call-logs/:requestId/chain", h.GetFullChain)
 	rg.GET("/api-call-logs/:requestId/cost-breakdown", h.GetCostBreakdown)
@@ -57,8 +62,9 @@ type ApiCallLogItem struct {
 
 // List 分页查询 API 调用日志 GET /api/v1/admin/api-call-logs
 // 支持筛选：request_id, user_id, user_email, model, status, channel_id,
-//          supplier_name, start_date, end_date, endpoint, min_latency_ms,
-//          errors_only, cost_min, cost_max
+//
+//	supplier_name, start_date, end_date, endpoint, min_latency_ms,
+//	errors_only, cost_min, cost_max
 func (h *ApiCallLogHandler) List(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
@@ -91,6 +97,9 @@ func (h *ApiCallLogHandler) List(c *gin.Context) {
 	}
 	if s := c.Query("status"); s != "" {
 		query = query.Where("l.status = ?", s)
+	}
+	if bs := c.Query("billing_status"); bs != "" {
+		query = query.Where("l.billing_status = ?", bs)
 	}
 	if cid := c.Query("channel_id"); cid != "" {
 		query = query.Where("l.channel_id = ?", cid)
@@ -127,6 +136,19 @@ func (h *ApiCallLogHandler) List(c *gin.Context) {
 	// 仅错误请求
 	if c.Query("errors_only") == "true" {
 		query = query.Where("l.status != ?", "success")
+	}
+	// 仅显示应用了特殊折扣的调用
+	if c.Query("user_discount_only") == "true" {
+		query = query.Where("l.user_discount_id IS NOT NULL AND l.user_discount_id > 0")
+	}
+	if c.Query("under_collected_only") == "true" {
+		query = query.Where("l.under_collected_credits > 0")
+	}
+	if c.Query("missing_snapshot_only") == "true" {
+		query = query.Where("(l.billing_snapshot IS NULL OR CAST(l.billing_snapshot AS CHAR) = '' OR CAST(l.billing_snapshot AS CHAR) = 'null')")
+	}
+	if c.Query("negative_profit_only") == "true" {
+		query = query.Where("(CASE WHEN COALESCE(l.actual_cost_credits,0) > 0 THEN l.actual_cost_credits WHEN COALESCE(l.billing_status,'settled') = 'settled' THEN l.cost_credits ELSE 0 END)/10000.0 - COALESCE(l.platform_cost_rmb,0) < 0")
 	}
 
 	var total int64
@@ -335,10 +357,10 @@ func (h *ApiCallLogHandler) Replay(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"status_code":     resp.StatusCode,
-		"latency_ms":      latencyMs,
-		"response_body":   string(respBytes),
-		"new_request_id":  newRequestID,
+		"status_code":         resp.StatusCode,
+		"latency_ms":          latencyMs,
+		"response_body":       string(respBytes),
+		"new_request_id":      newRequestID,
 		"original_request_id": requestID,
 	})
 }
@@ -369,8 +391,54 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 	}
 
 	// 关联用户
+	billingSnapshot := map[string]interface{}{}
+	snapshotFound := false
+	if len(log.BillingSnapshot) > 0 && string(log.BillingSnapshot) != "null" {
+		if err := json.Unmarshal(log.BillingSnapshot, &billingSnapshot); err == nil {
+			snapshotFound = true
+		}
+	}
+	snapshotInt64 := func(key string) int64 {
+		v, ok := billingSnapshot[key]
+		if !ok || v == nil {
+			return 0
+		}
+		switch n := v.(type) {
+		case float64:
+			return int64(n)
+		case int64:
+			return n
+		case int:
+			return int64(n)
+		case json.Number:
+			i, _ := n.Int64()
+			return i
+		default:
+			return 0
+		}
+	}
+	snapshotFloat64 := func(key string) float64 {
+		v, ok := billingSnapshot[key]
+		if !ok || v == nil {
+			return 0
+		}
+		switch n := v.(type) {
+		case float64:
+			return n
+		case int64:
+			return float64(n)
+		case int:
+			return float64(n)
+		case json.Number:
+			f, _ := n.Float64()
+			return f
+		default:
+			return 0
+		}
+	}
+
 	var user model.User
-	_ = h.db.WithContext(ctx).Select("id, email, name, role, tenant_id").
+	_ = h.db.WithContext(ctx).Select("id, email, name, tenant_id").
 		Where("id = ?", log.UserID).First(&user).Error
 
 	// 查找模型（按 request_model 优先匹配，fallback 到 actual_model）
@@ -461,9 +529,12 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 		InputMax      int64   `json:"input_max"` // -1 表示无上限
 		CostInputRMB  float64 `json:"cost_input_rmb"`
 		CostOutputRMB float64 `json:"cost_output_rmb"`
-		SellInputRMB  float64 `json:"sell_input_rmb"`
-		SellOutputRMB float64 `json:"sell_output_rmb"`
-		IsMatched     bool    `json:"is_matched"`
+		// 思考模式输出价（0 = 不区分，与非思考同价）
+		CostOutputThinkingRMB float64 `json:"cost_output_thinking_rmb,omitempty"`
+		SellInputRMB          float64 `json:"sell_input_rmb"`
+		SellOutputRMB         float64 `json:"sell_output_rmb"`
+		SellOutputThinkingRMB float64 `json:"sell_output_thinking_rmb,omitempty"`
+		IsMatched             bool    `json:"is_matched"`
 	}
 	var priceTiersDetail []TierDetailItem
 	if pricingFound {
@@ -482,12 +553,16 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 				// 确定成本价：优先用 aiModel 的成本阶梯（对应下标），否则用 flat 成本价
 				costIn := aiModel.InputCostRMB
 				costOut := aiModel.OutputCostRMB
+				costOutThinking := aiModel.OutputCostThinkingRMB // 顶层 fallback
 				if i < len(costTierData.Tiers) {
 					if costTierData.Tiers[i].InputPrice > 0 {
 						costIn = costTierData.Tiers[i].InputPrice
 					}
 					if costTierData.Tiers[i].OutputPrice > 0 {
 						costOut = costTierData.Tiers[i].OutputPrice
+					}
+					if costTierData.Tiers[i].OutputPriceThinking > 0 {
+						costOutThinking = costTierData.Tiers[i].OutputPriceThinking
 					}
 				}
 				// 确定售价：优先 SellingInputPrice，否则 InputPrice，再 fallback 基础价
@@ -503,21 +578,33 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 				} else if tier.OutputPrice > 0 {
 					sellOut = tier.OutputPrice
 				}
+				// 思考模式售价（选择链路与 resolveThinkingOutputSellRMB 保持一致）
+				var sellOutThinking float64
+				if tier.SellingOutputThinkingPrice != nil && *tier.SellingOutputThinkingPrice > 0 {
+					sellOutThinking = *tier.SellingOutputThinkingPrice
+				} else if costOutThinking > 0 && costOut > 0 && sellOut > 0 {
+					// 按 (tier 售价/tier 成本) 比例缩放成本→售价
+					sellOutThinking = costOutThinking * (sellOut / costOut)
+				} else if mp.OutputPriceThinkingRMB > 0 {
+					sellOutThinking = mp.OutputPriceThinkingRMB
+				}
 				// 确定范围上限（-1 = ∞）
 				inputMax := int64(-1)
 				if tier.InputMax != nil {
 					inputMax = *tier.InputMax
 				}
 				priceTiersDetail = append(priceTiersDetail, TierDetailItem{
-					TierName:      tier.Name,
-					TierIdx:       i,
-					InputMin:      tier.InputMin,
-					InputMax:      inputMax,
-					CostInputRMB:  costIn,
-					CostOutputRMB: costOut,
-					SellInputRMB:  sellIn,
-					SellOutputRMB: sellOut,
-					IsMatched:     i == log.MatchedPriceTierIdx,
+					TierName:              tier.Name,
+					TierIdx:               i,
+					InputMin:              tier.InputMin,
+					InputMax:              inputMax,
+					CostInputRMB:          costIn,
+					CostOutputRMB:         costOut,
+					CostOutputThinkingRMB: costOutThinking,
+					SellInputRMB:          sellIn,
+					SellOutputRMB:         sellOut,
+					SellOutputThinkingRMB: sellOutThinking,
+					IsMatched:             i == log.MatchedPriceTierIdx,
 				})
 			}
 		}
@@ -581,7 +668,26 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 			regularInputCost = effectiveInputPricePerToken * prompt / 1_000_000
 			recomputedInputCost = regularInputCost
 		}
-		recomputedOutputCost = effectiveOutputPricePerToken * completion / 1_000_000
+		// 思考模式：若本次请求 thinking_mode=true 且模型有思考售价，按思考售价重算输出
+		// 优先级与 resolveThinkingOutputSellRMB 一致：阶梯 selling → 阶梯 cost×ratio → mp thinking → top-level × ratio
+		outputPricePerTokenForRecompute := effectiveOutputPricePerToken
+		if log.ThinkingMode {
+			var thinkingSellRMB float64
+			if log.MatchedPriceTierIdx >= 0 && len(priceTiersDetail) > log.MatchedPriceTierIdx {
+				thinkingSellRMB = priceTiersDetail[log.MatchedPriceTierIdx].SellOutputThinkingRMB
+			}
+			if thinkingSellRMB == 0 && mp.OutputPriceThinkingRMB > 0 {
+				thinkingSellRMB = mp.OutputPriceThinkingRMB
+			}
+			if thinkingSellRMB == 0 && aiModel.OutputCostThinkingRMB > 0 && aiModel.OutputCostRMB > 0 && mp.OutputPriceRMB > 0 {
+				ratio := mp.OutputPriceRMB / aiModel.OutputCostRMB
+				thinkingSellRMB = aiModel.OutputCostThinkingRMB * ratio
+			}
+			if thinkingSellRMB > 0 {
+				outputPricePerTokenForRecompute = int64(thinkingSellRMB * 10000) // RMB→credits/M
+			}
+		}
+		recomputedOutputCost = outputPricePerTokenForRecompute * completion / 1_000_000
 		recomputedTotal = recomputedInputCost + recomputedOutputCost
 		if recomputedTotal == 0 && (prompt > 0 || completion > 0) {
 			recomputedTotal = 1 // 保底 1 积分，与计价引擎逻辑一致
@@ -592,6 +698,43 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 
 	deviation := log.CostCredits - recomputedTotal
 	profitCredits := log.CostCredits - platformCostCredits
+	if snapshotFound {
+		if v := snapshotInt64("input_cost_credits"); v > 0 {
+			recomputedInputCost = v
+		}
+		if v := snapshotInt64("output_cost_credits"); v > 0 {
+			recomputedOutputCost = v
+		}
+		if v := snapshotInt64("total_cost_credits"); v > 0 {
+			recomputedTotal = v
+		}
+		if v := snapshotInt64("platform_cost_credits"); v > 0 {
+			platformCostCredits = v
+		}
+		deviation = log.CostCredits - recomputedTotal
+		profitCredits = log.ActualCostCredits - platformCostCredits
+		if log.ActualCostCredits == 0 && log.CostCredits > 0 && log.BillingStatus == "settled" {
+			profitCredits = log.CostCredits - platformCostCredits
+		}
+	}
+	actualRevenueCredits := log.ActualCostCredits
+	if actualRevenueCredits == 0 && log.CostCredits > 0 && (log.BillingStatus == "" || log.BillingStatus == "settled") {
+		actualRevenueCredits = log.CostCredits
+	}
+	commissionInfo := h.resolveCommissionInfo(ctx, log.UserID, aiModel.ID, float64(actualRevenueCredits)/10000.0)
+	commissionRMB, _ := commissionInfo["commission_rmb"].(float64)
+	netProfitRMB := float64(actualRevenueCredits-platformCostCredits)/10000.0 - commissionRMB
+
+	// ─── v4.0 用户特殊折扣命中信息 ───
+	userDiscountApplied := false
+	var userDiscountDetail *model.UserModelDiscount
+	if log.UserDiscountID != nil && *log.UserDiscountID > 0 {
+		userDiscountApplied = true
+		var ud model.UserModelDiscount
+		if err := h.db.WithContext(ctx).First(&ud, *log.UserDiscountID).Error; err == nil {
+			userDiscountDetail = &ud
+		}
+	}
 
 	// 动态重算缓存节省金额（比较"全部按常规价"与"实际缓存拆分"的差值）
 	// 日志中存储的 CacheSavingsRMB 可能为 0（旧日志 / 手动插入），此处基于当前价格重算
@@ -601,6 +744,16 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 		savedCredits := noCacheInputCost - recomputedInputCost
 		if savedCredits > 0 {
 			computedCacheSavingsRMB = float64(savedCredits) / 10000.0
+		}
+	}
+	formulaPromptTokens := prompt
+	formulaCompletionTokens := completion
+	if snapshotFound {
+		if v := snapshotInt64("input_tokens"); v > 0 {
+			formulaPromptTokens = v
+		}
+		if v := snapshotInt64("output_tokens"); v > 0 {
+			formulaCompletionTokens = v
 		}
 	}
 
@@ -644,8 +797,8 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 				"输入成本 = %d（每百万积分） × %d（输入tokens） ÷ 1,000,000 = %d 积分\n"+
 					"输出成本 = %d（每百万积分） × %d（输出tokens） ÷ 1,000,000 = %d 积分\n"+
 					"合计 = %d + %d = %d 积分（%.4f 元）",
-				effectiveInputPricePerToken, prompt, recomputedInputCost,
-				effectiveOutputPricePerToken, completion, recomputedOutputCost,
+				effectiveInputPricePerToken, formulaPromptTokens, recomputedInputCost,
+				effectiveOutputPricePerToken, formulaCompletionTokens, recomputedOutputCost,
 				recomputedInputCost, recomputedOutputCost, recomputedTotal,
 				float64(recomputedTotal)/10000.0,
 			)
@@ -656,11 +809,39 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 		formula = "未在 ai_models 表中找到该模型，无法执行价格重算。"
 	}
 
+	// v4.0: 用户特殊折扣公式行
+	if userDiscountApplied && userDiscountDetail != nil {
+		line := ""
+		switch userDiscountDetail.PricingType {
+		case "DISCOUNT":
+			if userDiscountDetail.DiscountRate != nil {
+				line = fmt.Sprintf("\n【特殊折扣】× %.2f（用户自定义折扣", *userDiscountDetail.DiscountRate)
+			}
+		case "FIXED":
+			line = "\n【特殊折扣】固定价格（用户自定义"
+		case "MARKUP":
+			if userDiscountDetail.MarkupRate != nil {
+				line = fmt.Sprintf("\n【特殊折扣】+ %.2f%%（用户自定义加价", *userDiscountDetail.MarkupRate*100)
+			}
+		}
+		if line != "" {
+			if userDiscountDetail.Note != "" {
+				line += "：" + userDiscountDetail.Note + "）"
+			} else {
+				line += "）"
+			}
+			formula = line + "\n" + formula
+		}
+	}
+
 	payload := gin.H{
-		"log":        log,
-		"user_email": user.Email,
-		"user_name":  user.Name,
-		"user_role":  user.Role,
+		"log":                log,
+		"user_email":         user.Email,
+		"user_name":          user.Name,
+		"snapshot_found":     snapshotFound,
+		"billing_snapshot":   billingSnapshot,
+		"snapshot_total_rmb": snapshotFloat64("total_cost_rmb"),
+		"user_role":          "", // v4.0: role 字段已移除，保留 key 防止前端字段缺失告警
 
 		"model_found":   modelFound,
 		"pricing_found": pricingFound,
@@ -677,6 +858,11 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 		"current_output_cost_per_million": outputCostCredits,
 		"current_input_cost_rmb":          aiModel.InputCostRMB,
 		"current_output_cost_rmb":         aiModel.OutputCostRMB,
+		// 思考模式输出成本/售价（0 = 不区分，与普通输出同价；>0 时可用于计算加价）
+		"current_output_cost_thinking_rmb":  aiModel.OutputCostThinkingRMB,
+		"current_output_price_thinking_rmb": mp.OutputPriceThinkingRMB,
+		// 本次请求是否按思考模式计费（由 api_call_logs.thinking_mode 读取）
+		"thinking_mode": log.ThinkingMode,
 
 		// 售价（model_pricings）- 平台对用户的定价（含阶梯覆盖）
 		"current_input_price_per_million":  effectiveInputPricePerToken,
@@ -694,10 +880,13 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 		"recomputed_total_cost_rmb": float64(recomputedTotal) / 10000.0,
 
 		// 平台成本与利润估算
-		"platform_cost_credits": platformCostCredits,
-		"platform_cost_rmb":     float64(platformCostCredits) / 10000.0,
-		"profit_credits":        profitCredits,
-		"profit_rmb":            float64(profitCredits) / 10000.0,
+		"platform_cost_credits":  platformCostCredits,
+		"platform_cost_rmb":      float64(platformCostCredits) / 10000.0,
+		"profit_credits":         profitCredits,
+		"profit_rmb":             float64(profitCredits) / 10000.0,
+		"actual_revenue_credits": actualRevenueCredits,
+		"actual_revenue_rmb":     float64(actualRevenueCredits) / 10000.0,
+		"net_profit_rmb":         netProfitRMB,
 
 		// 与日志记录值的偏差
 		"recorded_cost_credits": log.CostCredits,
@@ -729,10 +918,416 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 		"matched_price_tier_idx": log.MatchedPriceTierIdx,
 		"discount_info":          h.resolvePricingLayers(ctx, log.UserID, aiModel.ID, user.TenantID),
 
+		// v4.0 用户特殊折扣命中
+		"user_discount_applied": userDiscountApplied,
+		"user_discount_id":      log.UserDiscountID,
+		"user_discount_rate":    log.UserDiscountRate,
+		"user_discount_detail":  userDiscountDetail,
+
+		// v4.3 返佣信息（本次请求产生的返佣对平台是负收益）
+		"commission_info": commissionInfo,
+
 		"formula": formula,
 	}
 
 	response.Success(c, payload)
+}
+
+// Reconciliation 返回成本分析对账报表。
+// 维度包括按日、按模型、按供应商聚合的应收、实收、欠收、平台成本和毛利。
+func (h *ApiCallLogHandler) Reconciliation(c *gin.Context) {
+	ctx := c.Request.Context()
+	base := h.db.WithContext(ctx).
+		Table("api_call_logs AS l").
+		Joins("LEFT JOIN users AS u ON u.id = l.user_id")
+
+	applyFilters := func(query *gorm.DB) *gorm.DB {
+		if rid := c.Query("request_id"); rid != "" {
+			query = query.Where("l.request_id LIKE ?", "%"+rid+"%")
+		}
+		if uid := c.Query("user_id"); uid != "" {
+			query = query.Where("l.user_id = ?", uid)
+		}
+		if ue := c.Query("user_email"); ue != "" {
+			query = query.Where("u.email LIKE ?", "%"+ue+"%")
+		}
+		if m := c.Query("model"); m != "" {
+			query = query.Where("l.request_model LIKE ?", "%"+m+"%")
+		}
+		if s := c.Query("status"); s != "" {
+			query = query.Where("l.status = ?", s)
+		}
+		if bs := c.Query("billing_status"); bs != "" {
+			query = query.Where("l.billing_status = ?", bs)
+		}
+		if cid := c.Query("channel_id"); cid != "" {
+			query = query.Where("l.channel_id = ?", cid)
+		}
+		if sn := c.Query("supplier_name"); sn != "" {
+			supplierSubquery := `(SELECT s.name FROM ai_models m
+				LEFT JOIN suppliers s ON s.id = m.supplier_id AND s.deleted_at IS NULL
+				WHERE m.model_name = COALESCE(NULLIF(l.actual_model,''), l.request_model)
+				  AND m.deleted_at IS NULL
+				LIMIT 1)`
+			query = query.Where("l.supplier_name LIKE ? OR "+supplierSubquery+" LIKE ?", "%"+sn+"%", "%"+sn+"%")
+		}
+		if sd := c.Query("start_date"); sd != "" {
+			query = query.Where("l.created_at >= ?", sd)
+		}
+		if ed := c.Query("end_date"); ed != "" {
+			query = query.Where("l.created_at <= ?", ed+" 23:59:59")
+		}
+		if ep := c.Query("endpoint"); ep != "" {
+			query = query.Where("l.endpoint = ?", ep)
+		}
+		if cmin := c.Query("cost_min"); cmin != "" {
+			query = query.Where("l.cost_credits >= ?", cmin)
+		}
+		if cmax := c.Query("cost_max"); cmax != "" {
+			query = query.Where("l.cost_credits <= ?", cmax)
+		}
+		if c.Query("errors_only") == "true" {
+			query = query.Where("l.status != ?", "success")
+		}
+		if c.Query("user_discount_only") == "true" {
+			query = query.Where("l.user_discount_id IS NOT NULL AND l.user_discount_id > 0")
+		}
+		if c.Query("under_collected_only") == "true" {
+			query = query.Where("l.under_collected_credits > 0")
+		}
+		if c.Query("missing_snapshot_only") == "true" {
+			query = query.Where("(l.billing_snapshot IS NULL OR CAST(l.billing_snapshot AS CHAR) = '' OR CAST(l.billing_snapshot AS CHAR) = 'null')")
+		}
+		if c.Query("negative_profit_only") == "true" {
+			query = query.Where("(CASE WHEN COALESCE(l.actual_cost_credits,0) > 0 THEN l.actual_cost_credits WHEN COALESCE(l.billing_status,'settled') = 'settled' THEN l.cost_credits ELSE 0 END)/10000.0 - COALESCE(l.platform_cost_rmb,0) < 0")
+		}
+		return query
+	}
+
+	type totalsRow struct {
+		Requests              int64   `json:"requests"`
+		ChargeCredits         int64   `json:"charge_credits"`
+		ChargeRMB             float64 `json:"charge_rmb"`
+		ActualRevenueCredits  int64   `json:"actual_revenue_credits"`
+		ActualRevenueRMB      float64 `json:"actual_revenue_rmb"`
+		UnderCollectedCredits int64   `json:"under_collected_credits"`
+		UnderCollectedRMB     float64 `json:"under_collected_rmb"`
+		PlatformCostRMB       float64 `json:"platform_cost_rmb"`
+		GrossProfitRMB        float64 `json:"gross_profit_rmb"`
+		DeductFailedRequests  int64   `json:"deduct_failed_requests"`
+	}
+	actualCreditsExpr := "CASE WHEN COALESCE(l.actual_cost_credits,0) > 0 THEN l.actual_cost_credits WHEN COALESCE(l.billing_status,'settled') = 'settled' THEN l.cost_credits ELSE 0 END"
+	selectTotals := "COUNT(*) AS requests," +
+		"COALESCE(SUM(l.cost_credits),0) AS charge_credits," +
+		"COALESCE(SUM(l.cost_credits),0)/10000.0 AS charge_rmb," +
+		"COALESCE(SUM(" + actualCreditsExpr + "),0) AS actual_revenue_credits," +
+		"COALESCE(SUM(" + actualCreditsExpr + "),0)/10000.0 AS actual_revenue_rmb," +
+		"COALESCE(SUM(l.under_collected_credits),0) AS under_collected_credits," +
+		"COALESCE(SUM(l.under_collected_credits),0)/10000.0 AS under_collected_rmb," +
+		"COALESCE(SUM(l.platform_cost_rmb),0) AS platform_cost_rmb," +
+		"(COALESCE(SUM(" + actualCreditsExpr + "),0)/10000.0 - COALESCE(SUM(l.platform_cost_rmb),0)) AS gross_profit_rmb," +
+		"SUM(CASE WHEN l.billing_status = 'deduct_failed' THEN 1 ELSE 0 END) AS deduct_failed_requests"
+
+	var totals totalsRow
+	if err := applyFilters(base.Session(&gorm.Session{})).Select(selectTotals).Scan(&totals).Error; err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+
+	type groupRow struct {
+		Key                   string  `gorm:"column:dimension_key" json:"key"`
+		Requests              int64   `json:"requests"`
+		ChargeCredits         int64   `json:"charge_credits"`
+		ChargeRMB             float64 `json:"charge_rmb"`
+		ActualRevenueCredits  int64   `json:"actual_revenue_credits"`
+		ActualRevenueRMB      float64 `json:"actual_revenue_rmb"`
+		UnderCollectedCredits int64   `json:"under_collected_credits"`
+		UnderCollectedRMB     float64 `json:"under_collected_rmb"`
+		PlatformCostRMB       float64 `json:"platform_cost_rmb"`
+		GrossProfitRMB        float64 `json:"gross_profit_rmb"`
+		DeductFailedRequests  int64   `json:"deduct_failed_requests"`
+	}
+	queryGroup := func(groupExpr, keyExpr, orderExpr string) ([]groupRow, error) {
+		var rows []groupRow
+		err := applyFilters(base.Session(&gorm.Session{})).
+			Select(keyExpr + " AS dimension_key," + selectTotals).
+			Group(groupExpr).
+			Order(orderExpr).
+			Limit(30).
+			Scan(&rows).Error
+		return rows, err
+	}
+
+	byDay, err := queryGroup("DATE(l.created_at)", "DATE(l.created_at)", "dimension_key DESC")
+	if err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	byModel, err := queryGroup("l.request_model", "COALESCE(NULLIF(l.request_model,''),'-')", "charge_credits DESC")
+	if err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	bySupplier, err := queryGroup("COALESCE(NULLIF(l.supplier_name,''),'-')", "COALESCE(NULLIF(l.supplier_name,''),'-')", "charge_credits DESC")
+	if err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+
+	type alertItem struct {
+		Type     string  `json:"type"`
+		Label    string  `json:"label"`
+		Count    int64   `json:"count"`
+		Amount   float64 `json:"amount_rmb"`
+		Severity string  `json:"severity"`
+		Hint     string  `json:"hint"`
+	}
+	countAlert := func(where, amountExpr string) (int64, float64) {
+		var row struct {
+			Count  int64   `json:"count"`
+			Amount float64 `json:"amount_rmb"`
+		}
+		selectExpr := "COUNT(*) AS count"
+		if amountExpr != "" {
+			selectExpr += ", COALESCE(SUM(" + amountExpr + "),0) AS amount"
+		} else {
+			selectExpr += ", 0 AS amount"
+		}
+		_ = applyFilters(base.Session(&gorm.Session{})).
+			Where(where).
+			Select(selectExpr).
+			Scan(&row).Error
+		return row.Count, row.Amount
+	}
+	negativeProfitExpr := "(" + actualCreditsExpr + ")/10000.0 - COALESCE(l.platform_cost_rmb,0)"
+	missingSnapshotWhere := "(l.billing_snapshot IS NULL OR CAST(l.billing_snapshot AS CHAR) = '' OR CAST(l.billing_snapshot AS CHAR) = 'null')"
+	deductFailedCount, deductFailedAmount := countAlert("l.billing_status = 'deduct_failed'", "l.cost_credits/10000.0")
+	underCollectedCount, underCollectedAmount := countAlert("l.under_collected_credits > 0", "l.under_collected_credits/10000.0")
+	missingSnapshotCount, _ := countAlert(missingSnapshotWhere, "")
+	negativeProfitCount, negativeProfitAmount := countAlert(negativeProfitExpr+" < 0", "-("+negativeProfitExpr+")")
+	alerts := []alertItem{
+		{Type: "deduct_failed", Label: "扣费失败", Count: deductFailedCount, Amount: deductFailedAmount, Severity: "critical", Hint: "已生成调用日志但扣款未成功，需要补扣或人工核销。"},
+		{Type: "under_collected", Label: "欠收", Count: underCollectedCount, Amount: underCollectedAmount, Severity: "warning", Hint: "冻结/预估金额低于最终应收，建议对余额和冻结记录做二次对账。"},
+		{Type: "missing_snapshot", Label: "快照缺失", Count: missingSnapshotCount, Amount: 0, Severity: "warning", Hint: "缺少 billing_snapshot 的旧日志只能按当前价重算，历史账单可信度较低。"},
+		{Type: "negative_profit", Label: "毛利为负", Count: negativeProfitCount, Amount: negativeProfitAmount, Severity: "critical", Hint: "实收低于平台成本，需检查供应商成本价、用户折扣或返佣配置。"},
+	}
+
+	response.Success(c, gin.H{
+		"totals":      totals,
+		"by_day":      byDay,
+		"by_model":    byModel,
+		"by_supplier": bySupplier,
+		"alerts":      alerts,
+	})
+}
+
+// ExportReconciliationCSV exports the reconciliation rows for the current filters.
+func (h *ApiCallLogHandler) ExportReconciliationCSV(c *gin.Context) {
+	ctx := c.Request.Context()
+	base := h.db.WithContext(ctx).
+		Table("api_call_logs AS l").
+		Joins("LEFT JOIN users AS u ON u.id = l.user_id")
+	actualCreditsExpr := "CASE WHEN COALESCE(l.actual_cost_credits,0) > 0 THEN l.actual_cost_credits WHEN COALESCE(l.billing_status,'settled') = 'settled' THEN l.cost_credits ELSE 0 END"
+	applyFilters := func(query *gorm.DB) *gorm.DB {
+		if rid := c.Query("request_id"); rid != "" {
+			query = query.Where("l.request_id LIKE ?", "%"+rid+"%")
+		}
+		if uid := c.Query("user_id"); uid != "" {
+			query = query.Where("l.user_id = ?", uid)
+		}
+		if ue := c.Query("user_email"); ue != "" {
+			query = query.Where("u.email LIKE ?", "%"+ue+"%")
+		}
+		if m := c.Query("model"); m != "" {
+			query = query.Where("l.request_model LIKE ?", "%"+m+"%")
+		}
+		if s := c.Query("status"); s != "" {
+			query = query.Where("l.status = ?", s)
+		}
+		if bs := c.Query("billing_status"); bs != "" {
+			query = query.Where("l.billing_status = ?", bs)
+		}
+		if cid := c.Query("channel_id"); cid != "" {
+			query = query.Where("l.channel_id = ?", cid)
+		}
+		if sn := c.Query("supplier_name"); sn != "" {
+			query = query.Where("l.supplier_name LIKE ?", "%"+sn+"%")
+		}
+		if sd := c.Query("start_date"); sd != "" {
+			query = query.Where("l.created_at >= ?", sd)
+		}
+		if ed := c.Query("end_date"); ed != "" {
+			query = query.Where("l.created_at <= ?", ed+" 23:59:59")
+		}
+		if ep := c.Query("endpoint"); ep != "" {
+			query = query.Where("l.endpoint = ?", ep)
+		}
+		if cmin := c.Query("cost_min"); cmin != "" {
+			query = query.Where("l.cost_credits >= ?", cmin)
+		}
+		if cmax := c.Query("cost_max"); cmax != "" {
+			query = query.Where("l.cost_credits <= ?", cmax)
+		}
+		if c.Query("errors_only") == "true" {
+			query = query.Where("l.status != ?", "success")
+		}
+		if c.Query("user_discount_only") == "true" {
+			query = query.Where("l.user_discount_id IS NOT NULL AND l.user_discount_id > 0")
+		}
+		if c.Query("under_collected_only") == "true" {
+			query = query.Where("l.under_collected_credits > 0")
+		}
+		if c.Query("missing_snapshot_only") == "true" {
+			query = query.Where("(l.billing_snapshot IS NULL OR CAST(l.billing_snapshot AS CHAR) = '' OR CAST(l.billing_snapshot AS CHAR) = 'null')")
+		}
+		if c.Query("negative_profit_only") == "true" {
+			query = query.Where("(" + actualCreditsExpr + ")/10000.0 - COALESCE(l.platform_cost_rmb,0) < 0")
+		}
+		return query
+	}
+	selectTotals := "COUNT(*) AS requests," +
+		"COALESCE(SUM(l.cost_credits),0)/10000.0 AS charge_rmb," +
+		"COALESCE(SUM(" + actualCreditsExpr + "),0)/10000.0 AS actual_revenue_rmb," +
+		"COALESCE(SUM(l.under_collected_credits),0)/10000.0 AS under_collected_rmb," +
+		"COALESCE(SUM(l.platform_cost_rmb),0) AS platform_cost_rmb," +
+		"(COALESCE(SUM(" + actualCreditsExpr + "),0)/10000.0 - COALESCE(SUM(l.platform_cost_rmb),0)) AS gross_profit_rmb," +
+		"SUM(CASE WHEN l.billing_status = 'deduct_failed' THEN 1 ELSE 0 END) AS deduct_failed_requests"
+	type exportRow struct {
+		Key                  string  `gorm:"column:dimension_key"`
+		Requests             int64   `gorm:"column:requests"`
+		ChargeRMB            float64 `gorm:"column:charge_rmb"`
+		ActualRevenueRMB     float64 `gorm:"column:actual_revenue_rmb"`
+		UnderCollectedRMB    float64 `gorm:"column:under_collected_rmb"`
+		PlatformCostRMB      float64 `gorm:"column:platform_cost_rmb"`
+		GrossProfitRMB       float64 `gorm:"column:gross_profit_rmb"`
+		DeductFailedRequests int64   `gorm:"column:deduct_failed_requests"`
+	}
+	queryGroup := func(groupExpr, keyExpr, orderExpr string) ([]exportRow, error) {
+		var rows []exportRow
+		err := applyFilters(base.Session(&gorm.Session{})).
+			Select(keyExpr + " AS dimension_key," + selectTotals).
+			Group(groupExpr).
+			Order(orderExpr).
+			Limit(500).
+			Scan(&rows).Error
+		return rows, err
+	}
+	sections := []struct {
+		Name      string
+		GroupExpr string
+		KeyExpr   string
+		OrderExpr string
+	}{
+		{"by_day", "DATE(l.created_at)", "DATE(l.created_at)", "dimension_key DESC"},
+		{"by_model", "l.request_model", "COALESCE(NULLIF(l.request_model,''),'-')", "charge_rmb DESC"},
+		{"by_supplier", "COALESCE(NULLIF(l.supplier_name,''),'-')", "COALESCE(NULLIF(l.supplier_name,''),'-')", "charge_rmb DESC"},
+	}
+
+	c.Header("Content-Type", "text/csv; charset=utf-8")
+	c.Header("Content-Disposition", `attachment; filename="cost_reconciliation.csv"`)
+	w := csv.NewWriter(c.Writer)
+	_ = w.Write([]string{"section", "dimension", "requests", "charge_rmb", "actual_revenue_rmb", "under_collected_rmb", "platform_cost_rmb", "gross_profit_rmb", "deduct_failed_requests"})
+	for _, section := range sections {
+		rows, err := queryGroup(section.GroupExpr, section.KeyExpr, section.OrderExpr)
+		if err != nil {
+			response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+			return
+		}
+		for _, row := range rows {
+			_ = w.Write([]string{
+				section.Name,
+				strings.TrimSpace(row.Key),
+				strconv.FormatInt(row.Requests, 10),
+				fmt.Sprintf("%.6f", row.ChargeRMB),
+				fmt.Sprintf("%.6f", row.ActualRevenueRMB),
+				fmt.Sprintf("%.6f", row.UnderCollectedRMB),
+				fmt.Sprintf("%.6f", row.PlatformCostRMB),
+				fmt.Sprintf("%.6f", row.GrossProfitRMB),
+				strconv.FormatInt(row.DeductFailedRequests, 10),
+			})
+		}
+	}
+	w.Flush()
+}
+
+// resolveCommissionInfo 返回本次请求产生的返佣信息
+// 优先走 Redis 缓存（ruleResolver.Resolve 已带缓存）；不阻塞异步佣金写入
+func (h *ApiCallLogHandler) resolveCommissionInfo(ctx context.Context, consumerUserID, modelID uint, costRMB float64) map[string]interface{} {
+	info := map[string]interface{}{
+		"has_commission": false,
+		"user_rate":      0.0,
+		"platform_rate":  0.0,
+		"source":         "",
+		"commission_rmb": 0.0,
+	}
+
+	if consumerUserID == 0 {
+		return info
+	}
+
+	// 查归因
+	var attr model.ReferralAttribution
+	err := h.db.WithContext(ctx).
+		Where("user_id = ? AND is_valid = ?", consumerUserID, true).
+		First(&attr).Error
+	if err != nil {
+		return info
+	}
+
+	// 归因窗口 / 解锁状态校验
+	now := time.Now()
+	if (!attr.ExpiresAt.IsZero() && now.After(attr.ExpiresAt)) || attr.UnlockedAt == nil {
+		info["inviter_id"] = attr.InviterID
+		info["unlocked"] = false
+		return info
+	}
+
+	// 查邀请人
+	var inviter model.User
+	_ = h.db.WithContext(ctx).Select("id, email, name").First(&inviter, attr.InviterID).Error
+
+	// 解析比例（走 RuleResolver 缓存）
+	resolver := referralsvc.Default
+	if resolver == nil {
+		// fallback：无 resolver 时降级仅查 ReferralConfig
+		var cfg model.ReferralConfig
+		if qErr := h.db.WithContext(ctx).Where("is_active = ?", true).First(&cfg).Error; qErr == nil {
+			info["user_rate"] = cfg.CommissionRate
+			info["platform_rate"] = cfg.CommissionRate
+			info["source"] = "config"
+		}
+		info["has_commission"] = true
+		info["inviter_id"] = inviter.ID
+		info["inviter_email"] = inviter.Email
+		return info
+	}
+
+	resolved, _ := resolver.Resolve(ctx, attr.InviterID, modelID)
+	if resolved == nil {
+		return info
+	}
+
+	info["has_commission"] = resolved.Rate > 0
+	info["user_rate"] = resolved.Rate
+	info["platform_rate"] = resolved.PlatformRate
+	info["source"] = resolved.Source
+	info["commission_rmb"] = costRMB * resolved.Rate
+	info["inviter_id"] = inviter.ID
+	info["inviter_email"] = inviter.Email
+	info["inviter_name"] = inviter.Name
+	if resolved.RuleID > 0 {
+		info["rule_id"] = resolved.RuleID
+		// 附带规则名（供悬浮提示）
+		var rule model.CommissionRule
+		if rErr := h.db.WithContext(ctx).Select("id, name, note").First(&rule, resolved.RuleID).Error; rErr == nil {
+			info["rule_name"] = rule.Name
+			info["rule_note"] = rule.Note
+		}
+	}
+	if resolved.OverrideID > 0 {
+		info["override_id"] = resolved.OverrideID
+	}
+	return info
 }
 
 // resolvePricingLayers 解析该用户/模型组合命中的多级定价链路
@@ -824,6 +1419,9 @@ func (h *ApiCallLogHandler) Summary(c *gin.Context) {
 	if s := c.Query("status"); s != "" {
 		query = query.Where("l.status = ?", s)
 	}
+	if bs := c.Query("billing_status"); bs != "" {
+		query = query.Where("l.billing_status = ?", bs)
+	}
 	if cid := c.Query("channel_id"); cid != "" {
 		query = query.Where("l.channel_id = ?", cid)
 	}
@@ -856,14 +1454,32 @@ func (h *ApiCallLogHandler) Summary(c *gin.Context) {
 	if c.Query("errors_only") == "true" {
 		query = query.Where("l.status != ?", "success")
 	}
+	if c.Query("user_discount_only") == "true" {
+		query = query.Where("l.user_discount_id IS NOT NULL AND l.user_discount_id > 0")
+	}
+	if c.Query("under_collected_only") == "true" {
+		query = query.Where("l.under_collected_credits > 0")
+	}
+	if c.Query("missing_snapshot_only") == "true" {
+		query = query.Where("(l.billing_snapshot IS NULL OR CAST(l.billing_snapshot AS CHAR) = '' OR CAST(l.billing_snapshot AS CHAR) = 'null')")
+	}
+	if c.Query("negative_profit_only") == "true" {
+		query = query.Where("(CASE WHEN COALESCE(l.actual_cost_credits,0) > 0 THEN l.actual_cost_credits WHEN COALESCE(l.billing_status,'settled') = 'settled' THEN l.cost_credits ELSE 0 END)/10000.0 - COALESCE(l.platform_cost_rmb,0) < 0")
+	}
 
 	var result struct {
-		TotalRequests    int64   `json:"total_requests"`
-		TotalPrompt      int64   `json:"total_prompt_tokens"`
-		TotalCompletion  int64   `json:"total_completion_tokens"`
-		TotalTokens      int64   `json:"total_tokens"`
-		TotalCostCredits int64   `json:"total_cost_credits"`
-		TotalCostRMB     float64 `json:"total_cost_rmb"`
+		TotalRequests         int64   `json:"total_requests"`
+		TotalPrompt           int64   `json:"total_prompt_tokens"`
+		TotalCompletion       int64   `json:"total_completion_tokens"`
+		TotalTokens           int64   `json:"total_tokens"`
+		TotalCostCredits      int64   `json:"total_cost_credits"`
+		TotalCostRMB          float64 `json:"total_cost_rmb"`
+		ActualRevenueCredits  int64   `json:"actual_revenue_credits"`
+		ActualRevenueRMB      float64 `json:"actual_revenue_rmb"`
+		UnderCollectedCredits int64   `json:"under_collected_credits"`
+		UnderCollectedRMB     float64 `json:"under_collected_rmb"`
+		DeductFailedRequests  int64   `json:"deduct_failed_requests"`
+		PlatformCostRMB       float64 `json:"platform_cost_rmb"`
 	}
 	if err := query.Select(
 		"COUNT(*) AS total_requests," +
@@ -871,7 +1487,13 @@ func (h *ApiCallLogHandler) Summary(c *gin.Context) {
 			"COALESCE(SUM(l.completion_tokens),0) AS total_completion," +
 			"COALESCE(SUM(l.total_tokens),0) AS total_tokens," +
 			"COALESCE(SUM(l.cost_credits),0) AS total_cost_credits," +
-			"COALESCE(SUM(l.cost_rmb),0) AS total_cost_rmb",
+			"COALESCE(SUM(l.cost_rmb),0) AS total_cost_rmb," +
+			"COALESCE(SUM(CASE WHEN COALESCE(l.actual_cost_credits,0) > 0 THEN l.actual_cost_credits WHEN COALESCE(l.billing_status,'settled') = 'settled' THEN l.cost_credits ELSE 0 END),0) AS actual_revenue_credits," +
+			"COALESCE(SUM(CASE WHEN COALESCE(l.actual_cost_credits,0) > 0 THEN l.actual_cost_credits WHEN COALESCE(l.billing_status,'settled') = 'settled' THEN l.cost_credits ELSE 0 END),0)/10000.0 AS actual_revenue_rmb," +
+			"COALESCE(SUM(l.under_collected_credits),0) AS under_collected_credits," +
+			"COALESCE(SUM(l.under_collected_credits),0)/10000.0 AS under_collected_rmb," +
+			"SUM(CASE WHEN l.billing_status = 'deduct_failed' THEN 1 ELSE 0 END) AS deduct_failed_requests," +
+			"COALESCE(SUM(l.platform_cost_rmb),0) AS platform_cost_rmb",
 	).Scan(&result).Error; err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return

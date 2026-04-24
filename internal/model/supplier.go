@@ -25,6 +25,11 @@ type Supplier struct {
 	// 格式：[{"url":"xxx","type_hint":"VideoGeneration"}, ...]
 	// 用于供应商的文本/视频/图片/语音等定价分散在多个页面的场景
 	PricingURLs JSON `gorm:"type:json" json:"pricing_urls,omitempty"`
+
+	// DefaultFeatures 供应商默认能力配置（JSON 对象），同步新模型时作为初始 features 继承
+	// 格式：{"supports_thinking":true,"supports_web_search":false, ...}
+	// 已存在的模型不受影响；管理员在供应商编辑页维护此字段
+	DefaultFeatures JSON `gorm:"type:json;column:default_features" json:"default_features,omitempty"`
 }
 
 // PricingURLEntry 多页面定价配置的单条记录

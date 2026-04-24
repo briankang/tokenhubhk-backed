@@ -17,46 +17,45 @@ import (
 	"gorm.io/gorm"
 
 	"tokenhub-server/internal/model"
-	"tokenhub-server/internal/pkg/logger"
+	"tokenhub-server/internal/pkg/dbctx"
 )
 
 const (
-	// CurrencyUSD 美元
+	// CurrencyUSD 缇庡厓
 	CurrencyUSD = "USD"
 	// CurrencyCNY 人民币
 	CurrencyCNY = "CNY"
 
-	// SourcePrimary 来自主接口（阿里云市场 cmapi00064402）
+	// SourcePrimary 来自主接口
 	SourcePrimary = "aliyun_primary"
-	// SourceBackup 来自备用接口（阿里云市场 cmapi00063890）
+	// SourceBackup 来自备用接口
 	SourceBackup = "aliyun_backup"
-	// SourcePublic 来自公开免费接口（open.er-api.com，开箱即用兜底）
+	// SourcePublic 鏉ヨ嚜鍏紑鍏嶈垂鎺ュ彛锛坥pen.er-api.com锛屽紑绠卞嵆鐢ㄥ厹搴曪級
 	SourcePublic = "public_free"
 	// SourceManual 管理员手动覆盖
 	SourceManual = "manual"
 	// SourceDefault 默认值
 	SourceDefault = "default"
 
-	// 汇率合理范围（防脏数据）
+	// 姹囩巼鍚堢悊鑼冨洿锛堥槻鑴忔暟鎹級
 	minSaneRate = 0.1
 	maxSaneRate = 100.0
 
-	// 公开免费汇率接口 URL（无需 key、无需签名；作为第三级 fallback）
-	// API: https://www.exchangerate-api.com/docs/free （开放、每日更新、响应 <100ms）
+	// 公开免费汇率接口 URL
 	defaultPublicURL = "https://open.er-api.com/v6/latest/USD"
 )
 
-// Config 汇率服务配置
+// Config 姹囩巼鏈嶅姟閰嶇疆
 type Config struct {
 	PrimaryURL     string
 	BackupURL      string
-	PublicURL      string // 公开免费 fallback URL（open.er-api.com 兼容格式；默认 defaultPublicURL）
+	PublicURL      string // 公开免费 fallback URL
 	AppCode        string
 	AppKey         string
 	AppSecret      string
-	CacheTTL       time.Duration // 默认 24h
-	DefaultRate    float64       // 默认 7.2
-	RequestTimeout time.Duration // 默认 10s
+	CacheTTL       time.Duration // 榛樿 24h
+	DefaultRate    float64       // 榛樿 7.2
+	RequestTimeout time.Duration // 榛樿 10s
 }
 
 // HTTPDoer 用于 mock 测试的 HTTP 客户端接口
@@ -64,12 +63,12 @@ type HTTPDoer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-// EventSink 抽象事件日志写入（避免循环依赖 service/payment）
+// EventSink 抽象事件日志写入
 type EventSink interface {
 	LogExchangeEvent(ctx context.Context, eventType, source string, success bool, payload, result interface{}, err error, durationMs int64)
 }
 
-// ExchangeRateService 汇率服务（主备 fallback + Redis 缓存 + DB 持久化）
+// ExchangeRateService 姹囩巼鏈嶅姟锛堜富澶?fallback + Redis 缂撳瓨 + DB 鎸佷箙鍖栵級
 type ExchangeRateService struct {
 	db        *gorm.DB
 	redis     *goredis.Client
@@ -105,7 +104,7 @@ func New(db *gorm.DB, redis *goredis.Client, cfg Config) *ExchangeRateService {
 	}
 }
 
-// SetHTTPDoer 注入自定义 HTTP 客户端（测试用）
+// SetHTTPDoer 娉ㄥ叆鑷畾涔?HTTP 瀹㈡埛绔紙娴嬭瘯鐢級
 func (s *ExchangeRateService) SetHTTPDoer(d HTTPDoer) {
 	s.httpDoer = d
 }
@@ -120,32 +119,29 @@ func (s *ExchangeRateService) rateCacheKey(from, to string) string {
 	return fmt.Sprintf("fx:%s_%s", from, to)
 }
 
-// FetchAndCacheDaily 每日定时任务入口
-//   1. 调主接口 → 写 DB + Redis
-//   2. 主接口失败 → 调备用接口 → 写 DB + Redis（source=aliyun_backup）
-//   3. 两个都失败 → 不覆盖缓存，记录 failed 事件
+// FetchAndCacheDaily 姣忔棩瀹氭椂浠诲姟鍏ュ彛
+//  1. 璋冧富鎺ュ彛 鈫?鍐?DB + Redis
+//  2. 涓绘帴鍙ｅけ璐?鈫?璋冨鐢ㄦ帴鍙?鈫?鍐?DB + Redis锛坰ource=aliyun_backup锛?//   3. 涓や釜閮藉け璐?鈫?涓嶈鐩栫紦瀛橈紝璁板綍 failed 浜嬩欢
 func (s *ExchangeRateService) FetchAndCacheDaily(ctx context.Context) error {
 	s.fetchMu.Lock()
 	defer s.fetchMu.Unlock()
 
-	// singleflight：5 秒内重复调用直接复用结果
+	// singleflight锛? 绉掑唴閲嶅璋冪敤鐩存帴澶嶇敤缁撴灉
 	if time.Since(s.lastFetchAt) < 5*time.Second && s.lastFetchVal > 0 {
 		return nil
 	}
 
-	// 三级 fallback 链：
-	//   L1 aliyun_primary（如果 URL 已配置） →
-	//   L2 aliyun_backup（如果 URL 已配置） →
-	//   L3 public_free（open.er-api.com 免费、开放；保证开箱即用）
+	// 涓夌骇 fallback 閾撅細
+	//   L1 aliyun_primary锛堝鏋?URL 宸查厤缃級 鈫?	//   L2 aliyun_backup锛堝鏋?URL 宸查厤缃級 鈫?	//   L3 public_free锛坥pen.er-api.com 鍏嶈垂銆佸紑鏀撅紱淇濊瘉寮€绠卞嵆鐢級
 	var rate float64
 	var source, raw string
 	var lastErr error
 
-	// L1 主接口（仅当配置了 URL 时才尝试）
+	// L1 主接口。
 	if s.cfg.PrimaryURL != "" {
 		r, src, body, err := s.fetchFromPrimary(ctx)
 		if err != nil {
-			logger.L.Warn("exchange rate L1 primary failed, falling back to L2 backup",
+			log().Warn("exchange rate L1 primary failed, falling back to L2 backup",
 				zap.String("url", s.cfg.PrimaryURL), zap.Error(err))
 			s.logEvent(ctx, model.EventExchangeRateFallback, SourcePrimary, false, nil, nil, err, 0)
 			lastErr = err
@@ -154,11 +150,11 @@ func (s *ExchangeRateService) FetchAndCacheDaily(ctx context.Context) error {
 		}
 	}
 
-	// L2 备用（仅当 L1 未成功 + URL 已配置时才尝试）
+	// L2 澶囩敤锛堜粎褰?L1 鏈垚鍔?+ URL 宸查厤缃椂鎵嶅皾璇曪級
 	if rate == 0 && s.cfg.BackupURL != "" {
 		r, src, body, err := s.fetchFromBackup(ctx)
 		if err != nil {
-			logger.L.Warn("exchange rate L2 backup failed, falling back to L3 public",
+			log().Warn("exchange rate L2 backup failed, falling back to L3 public",
 				zap.String("url", s.cfg.BackupURL), zap.Error(err))
 			s.logEvent(ctx, model.EventExchangeRateFallback, SourceBackup, false, nil, nil, err, 0)
 			lastErr = err
@@ -167,11 +163,11 @@ func (s *ExchangeRateService) FetchAndCacheDaily(ctx context.Context) error {
 		}
 	}
 
-	// L3 公开免费接口（兜底，必跑）
+	// L3 公开免费接口兜底
 	if rate == 0 {
 		r, src, body, err := s.fetchFromPublic(ctx)
 		if err != nil {
-			logger.L.Error("exchange rate ALL sources failed (L1/L2/L3 all down)",
+			log().Error("exchange rate ALL sources failed (L1/L2/L3 all down)",
 				zap.Error(err), zap.Any("last_err", lastErr))
 			s.logEvent(ctx, model.EventExchangeRateFailed, SourcePublic, false, nil, nil, err, 0)
 			return fmt.Errorf("all exchange rate sources failed: last=%w public=%v", lastErr, err)
@@ -181,12 +177,12 @@ func (s *ExchangeRateService) FetchAndCacheDaily(ctx context.Context) error {
 
 	if !s.isSaneRate(rate) {
 		err := fmt.Errorf("rate out of sane range: %f", rate)
-		logger.L.Error("exchange rate sanity check failed", zap.Float64("rate", rate))
+		log().Error("exchange rate sanity check failed", zap.Float64("rate", rate))
 		s.logEvent(ctx, model.EventExchangeRateFailed, source, false, nil, rate, err, 0)
 		return err
 	}
 
-	// 写 DB
+	// 鍐?DB
 	hist := &model.ExchangeRateHistory{
 		FromCurrency: CurrencyUSD,
 		ToCurrency:   CurrencyCNY,
@@ -196,20 +192,20 @@ func (s *ExchangeRateService) FetchAndCacheDaily(ctx context.Context) error {
 		FetchedAt:    time.Now(),
 	}
 	if err := s.db.WithContext(ctx).Create(hist).Error; err != nil {
-		logger.L.Error("failed to persist exchange rate history", zap.Error(err))
-		// DB 失败不阻塞，仍写 Redis
+		log().Error("failed to persist exchange rate history", zap.Error(err))
+		// DB 澶辫触涓嶉樆濉烇紝浠嶅啓 Redis
 	}
 
-	// 写 Redis
+	// 鍐?Redis
 	if s.redis != nil {
 		key := s.rateCacheKey(CurrencyUSD, CurrencyCNY)
 		val := strconv.FormatFloat(rate, 'f', 8, 64)
 		if err := s.redis.Set(ctx, key, val, s.cfg.CacheTTL).Err(); err != nil {
-			logger.L.Warn("failed to cache exchange rate to redis", zap.Error(err))
+			log().Warn("failed to cache exchange rate to redis", zap.Error(err))
 		}
-		// 同步元信息（更新时间、来源）
+		// 鍚屾鍏冧俊鎭紙鏇存柊鏃堕棿銆佹潵婧愶級
 		_ = s.redis.Set(ctx, key+":meta", fmt.Sprintf("%d|%s", time.Now().Unix(), source), s.cfg.CacheTTL).Err()
-		// 失效公开接口 HTTP 缓存（CacheMiddleware 的 2h 缓存），让用户立即看到新汇率
+		// 澶辨晥鍏紑鎺ュ彛 HTTP 缂撳瓨锛圕acheMiddleware 鐨?2h 缂撳瓨锛夛紝璁╃敤鎴风珛鍗崇湅鍒版柊姹囩巼
 		s.invalidateHTTPCache(ctx)
 	}
 
@@ -217,15 +213,15 @@ func (s *ExchangeRateService) FetchAndCacheDaily(ctx context.Context) error {
 	s.lastFetchVal = rate
 
 	s.logEvent(ctx, model.EventExchangeRateFetched, source, true, nil, rate, nil, 0)
-	logger.L.Info("exchange rate fetched and cached",
+	log().Info("exchange rate fetched and cached",
 		zap.Float64("rate", rate),
 		zap.String("source", source),
 	)
 	return nil
 }
 
-// invalidateHTTPCache 清除 Nginx/CacheMiddleware 的 HTTP 缓存 key
-// 当汇率更新后立即可见，避免用户等 2h 缓存 TTL
+// invalidateHTTPCache 娓呴櫎 Nginx/CacheMiddleware 鐨?HTTP 缂撳瓨 key
+// 褰撴眹鐜囨洿鏂板悗绔嬪嵆鍙锛岄伩鍏嶇敤鎴风瓑 2h 缂撳瓨 TTL
 func (s *ExchangeRateService) invalidateHTTPCache(ctx context.Context) {
 	if s.redis == nil {
 		return
@@ -238,8 +234,8 @@ func (s *ExchangeRateService) invalidateHTTPCache(ctx context.Context) {
 	}
 }
 
-// GetUSDToCNY 获取 USD→CNY 汇率
-//   优先级：Redis → DB 最近一次 → 默认值
+// GetUSDToCNY 鑾峰彇 USD鈫扖NY 姹囩巼
+// 优先级：Redis -> DB 最近一次 -> 默认值
 func (s *ExchangeRateService) GetUSDToCNY(ctx context.Context) (float64, error) {
 	// 1. Redis
 	if s.redis != nil {
@@ -252,9 +248,11 @@ func (s *ExchangeRateService) GetUSDToCNY(ctx context.Context) (float64, error) 
 		}
 	}
 
-	// 2. DB 最近一次
+	// 2. DB 最近一次，使用短超时避免阻塞
+	dbCtx, dbCancel := dbctx.Short(ctx)
+	defer dbCancel()
 	var hist model.ExchangeRateHistory
-	err := s.db.WithContext(ctx).
+	err := s.db.WithContext(dbCtx).
 		Where("from_currency = ? AND to_currency = ?", CurrencyUSD, CurrencyCNY).
 		Order("fetched_at DESC").
 		First(&hist).Error
@@ -263,13 +261,13 @@ func (s *ExchangeRateService) GetUSDToCNY(ctx context.Context) (float64, error) 
 	}
 
 	// 3. 默认值
-	logger.L.Warn("falling back to default exchange rate", zap.Float64("default", s.cfg.DefaultRate))
+	log().Warn("falling back to default exchange rate", zap.Float64("default", s.cfg.DefaultRate))
 	return s.cfg.DefaultRate, nil
 }
 
-// GetUSDToCNYWithMeta 返回汇率及元信息（来源、更新时间）
+// GetUSDToCNYWithMeta 杩斿洖姹囩巼鍙婂厓淇℃伅锛堟潵婧愩€佹洿鏂版椂闂达級
 func (s *ExchangeRateService) GetUSDToCNYWithMeta(ctx context.Context) (rate float64, source string, updatedAt time.Time, err error) {
-	// 优先 Redis
+	// 浼樺厛 Redis
 	if s.redis != nil {
 		key := s.rateCacheKey(CurrencyUSD, CurrencyCNY)
 		val, gerr := s.redis.Get(ctx, key).Result()
@@ -282,8 +280,11 @@ func (s *ExchangeRateService) GetUSDToCNYWithMeta(ctx context.Context) (rate flo
 		}
 	}
 
+	// DB 鏌ヨ甯?2s 瓒呮椂锛岄槻姝㈡參鏌ヨ瀵艰嚧 /public/exchange-rate 姘镐箙闃诲
+	dbCtx, dbCancel := dbctx.Short(ctx)
+	defer dbCancel()
 	var hist model.ExchangeRateHistory
-	dberr := s.db.WithContext(ctx).
+	dberr := s.db.WithContext(dbCtx).
 		Where("from_currency = ? AND to_currency = ?", CurrencyUSD, CurrencyCNY).
 		Order("fetched_at DESC").
 		First(&hist).Error
@@ -294,13 +295,13 @@ func (s *ExchangeRateService) GetUSDToCNYWithMeta(ctx context.Context) (rate flo
 	return s.cfg.DefaultRate, SourceDefault, time.Now(), nil
 }
 
-// ConvertUSDToCNY 将 USD 金额换算为 CNY
+// ConvertUSDToCNY 灏?USD 閲戦鎹㈢畻涓?CNY
 func (s *ExchangeRateService) ConvertUSDToCNY(ctx context.Context, usd float64) float64 {
 	rate, _ := s.GetUSDToCNY(ctx)
 	return round2(usd * rate)
 }
 
-// ConvertCNYToUSD 将 CNY 金额换算为 USD
+// ConvertCNYToUSD 灏?CNY 閲戦鎹㈢畻涓?USD
 func (s *ExchangeRateService) ConvertCNYToUSD(ctx context.Context, cny float64) float64 {
 	rate, _ := s.GetUSDToCNY(ctx)
 	if rate <= 0 {
@@ -309,7 +310,7 @@ func (s *ExchangeRateService) ConvertCNYToUSD(ctx context.Context, cny float64) 
 	return round2(cny / rate)
 }
 
-// ManualOverride 管理员手动覆盖汇率（应急）
+// ManualOverride 绠＄悊鍛樻墜鍔ㄨ鐩栨眹鐜囷紙搴旀€ワ級
 func (s *ExchangeRateService) ManualOverride(ctx context.Context, rate float64, adminID uint64, reason string) error {
 	if !s.isSaneRate(rate) {
 		return fmt.Errorf("rate out of sane range: %f", rate)
@@ -329,7 +330,7 @@ func (s *ExchangeRateService) ManualOverride(ctx context.Context, rate float64, 
 		key := s.rateCacheKey(CurrencyUSD, CurrencyCNY)
 		_ = s.redis.Set(ctx, key, strconv.FormatFloat(rate, 'f', 8, 64), s.cfg.CacheTTL).Err()
 		_ = s.redis.Set(ctx, key+":meta", fmt.Sprintf("%d|%s", time.Now().Unix(), SourceManual), s.cfg.CacheTTL).Err()
-		s.invalidateHTTPCache(ctx) // 同步失效 HTTP 缓存
+		s.invalidateHTTPCache(ctx) // 鍚屾澶辨晥 HTTP 缂撳瓨
 	}
 	s.logEvent(ctx, model.EventExchangeRateOverride, SourceManual, true, map[string]interface{}{
 		"admin_id": adminID,
@@ -338,7 +339,7 @@ func (s *ExchangeRateService) ManualOverride(ctx context.Context, rate float64, 
 	return nil
 }
 
-// ListHistory 列出历史汇率（管理后台用）
+// ListHistory 列出历史汇率
 func (s *ExchangeRateService) ListHistory(ctx context.Context, limit int) ([]model.ExchangeRateHistory, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 30
@@ -357,13 +358,13 @@ func (s *ExchangeRateService) isSaneRate(rate float64) bool {
 	return rate >= minSaneRate && rate <= maxSaneRate
 }
 
-// fetchFromPrimary 调主接口（阿里云云市场 cmapi00064402 - 聚美智数 汇率转换）
+// fetchFromPrimary 璋冧富鎺ュ彛锛堥樋閲屼簯浜戝競鍦?cmapi00064402 - 鑱氱編鏅烘暟 姹囩巼杞崲锛?//
 //
 //	POST https://jmhlcx.market.alicloudapi.com/exchange-rate/convert
 //	Headers: Authorization: APPCODE {appcode}
 //	         Content-Type: application/x-www-form-urlencoded
 //	Body:    fromCode=USD&toCode=CNY&money=1
-//	响应：   {"data":{"money":"6.8095"},"msg":"成功","success":true,"code":200,"taskNo":"..."}
+//	鍝嶅簲锛?  {"data":{"money":"6.8095"},"msg":"鎴愬姛","success":true,"code":200,"taskNo":"..."}
 func (s *ExchangeRateService) fetchFromPrimary(ctx context.Context) (rate float64, source string, raw string, err error) {
 	if s.cfg.PrimaryURL == "" {
 		return 0, SourcePrimary, "", fmt.Errorf("primary url empty")
@@ -383,19 +384,18 @@ func (s *ExchangeRateService) fetchFromPrimary(ctx context.Context) (rate float6
 	return rate, SourcePrimary, string(body), nil
 }
 
-// fetchFromBackup 调备用接口（阿里云云市场 cmapi00063890 - 数脉API 中国银行汇率）
+// fetchFromBackup 璋冨鐢ㄦ帴鍙ｏ紙闃块噷浜戜簯甯傚満 cmapi00063890 - 鏁拌剦API 涓浗閾惰姹囩巼锛?//
 //
 //	GET https://smkjzgyhss.market.alicloudapi.com/exchange_rate/realtime?code=USD
 //	Headers: Authorization: APPCODE {appcode}
-//	响应：   {"success":true,"code":200,"data":{"list":[{"code":"USD","zhesuan":"686.22",...}]}}
-//	说明：   zhesuan 为"100 外币折算人民币"（例如 USD 一组为 100 美元对应 686.22 元）
-//	        取 USD 一行 zhesuan/100 得到 1 USD → CNY 的汇率（~6.8622）
+//	鍝嶅簲锛?  {"success":true,"code":200,"data":{"list":[{"code":"USD","zhesuan":"686.22",...}]}}
+//	璇存槑锛?  zhesuan 涓?100 澶栧竵鎶樼畻浜烘皯甯?锛堜緥濡?USD 涓€缁勪负 100 缇庡厓瀵瑰簲 686.22 鍏冿級
+//	        鍙?USD 涓€琛?zhesuan/100 寰楀埌 1 USD 鈫?CNY 鐨勬眹鐜囷紙~6.8622锛?
 func (s *ExchangeRateService) fetchFromBackup(ctx context.Context) (rate float64, source string, raw string, err error) {
 	if s.cfg.BackupURL == "" {
 		return 0, SourceBackup, "", fmt.Errorf("backup url empty")
 	}
-	// 使用 URL 参数 code=USD 让服务端过滤；但实际测试表明 code 参数在"一行返回"/"多行返回"上不稳定，
-	// 无论传什么参数都倾向于返回全列表。我们依旧加上参数以保持协议一致。
+	// 使用 URL 参数 code=USD，让服务端尽量只返回 USD 汇率。
 	url := fmt.Sprintf("%s?code=USD", s.cfg.BackupURL)
 	body, err := s.doHTTP(ctx, url)
 	if err != nil {
@@ -408,9 +408,8 @@ func (s *ExchangeRateService) fetchFromBackup(ctx context.Context) (rate float64
 	return rate, SourceBackup, string(body), nil
 }
 
-// fetchFromPublic 调公开免费接口（兜底，无需 AppCode）
-// 接口：open.er-api.com/v6/latest/USD
-// 响应示例：
+// fetchFromPublic 璋冨叕寮€鍏嶈垂鎺ュ彛锛堝厹搴曪紝鏃犻渶 AppCode锛?// 鎺ュ彛锛歰pen.er-api.com/v6/latest/USD
+// 鍝嶅簲绀轰緥锛?//
 //
 //	{
 //	  "result": "success",
@@ -434,7 +433,7 @@ func (s *ExchangeRateService) fetchFromPublic(ctx context.Context) (rate float64
 	return rate, SourcePublic, string(body), nil
 }
 
-// doHTTPNoAuth 不带 AppCode 的 GET（公开接口用）
+// doHTTPNoAuth 涓嶅甫 AppCode 鐨?GET锛堝叕寮€鎺ュ彛鐢級
 func (s *ExchangeRateService) doHTTPNoAuth(ctx context.Context, url string) ([]byte, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 	defer cancel()
@@ -459,8 +458,8 @@ func (s *ExchangeRateService) doHTTPNoAuth(ctx context.Context, url string) ([]b
 	return io.ReadAll(io.LimitReader(resp.Body, 65536))
 }
 
-// doHTTPPostForm 发起 POST form-urlencoded 请求，带 APPCODE 鉴权
-// 阿里云云市场 API 主接口（cmapi00064402）使用此方法
+// doHTTPPostForm 鍙戣捣 POST form-urlencoded 璇锋眰锛屽甫 APPCODE 閴存潈
+// 闃块噷浜戜簯甯傚満 API 涓绘帴鍙ｏ紙cmapi00064402锛変娇鐢ㄦ鏂规硶
 func (s *ExchangeRateService) doHTTPPostForm(ctx context.Context, apiURL string, form map[string]string) ([]byte, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 	defer cancel()
@@ -492,7 +491,7 @@ func (s *ExchangeRateService) doHTTPPostForm(ctx context.Context, apiURL string,
 	return io.ReadAll(io.LimitReader(resp.Body, 65536))
 }
 
-// doHTTP 发起 GET 请求并附带 APPCODE 鉴权
+// doHTTP 鍙戣捣 GET 璇锋眰骞堕檮甯?APPCODE 閴存潈
 func (s *ExchangeRateService) doHTTP(ctx context.Context, url string) ([]byte, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 	defer cancel()
@@ -519,18 +518,18 @@ func (s *ExchangeRateService) doHTTP(ctx context.Context, url string) ([]byte, e
 	return io.ReadAll(io.LimitReader(resp.Body, 65536))
 }
 
-// parsePrimaryResponse 解析阿里云 cmapi00064402 主接口响应
+// parsePrimaryResponse 瑙ｆ瀽闃块噷浜?cmapi00064402 涓绘帴鍙ｅ搷搴?//
 //
-//	{"data":{"money":"6.8095"},"msg":"成功","success":true,"code":200,"taskNo":"..."}
+//	{"data":{"money":"6.8095"},"msg":"鎴愬姛","success":true,"code":200,"taskNo":"..."}
 //
-// 由于 money 字段是字符串（不是 float），使用 json.Number 解析避免精度丢失
+// 鐢变簬 money 瀛楁鏄瓧绗︿覆锛堜笉鏄?float锛夛紝浣跨敤 json.Number 瑙ｆ瀽閬垮厤绮惧害涓㈠け
 func parsePrimaryResponse(body []byte) (float64, error) {
 	var resp struct {
 		Code    int    `json:"code"`
 		Msg     string `json:"msg"`
 		Success bool   `json:"success"`
 		Data    struct {
-			// money 既可能是字符串 "6.8095" 也可能是数字 6.8095，用 json.Number 兜底
+			// money 鏃㈠彲鑳芥槸瀛楃涓?"6.8095" 涔熷彲鑳芥槸鏁板瓧 6.8095锛岀敤 json.Number 鍏滃簳
 			Money json.Number `json:"money"`
 		} `json:"data"`
 	}
@@ -553,13 +552,13 @@ func parsePrimaryResponse(body []byte) (float64, error) {
 	return money, nil
 }
 
-// parsePublicResponse 解析公开免费接口响应（open.er-api.com 格式）
+// parsePublicResponse 解析公开免费接口响应
 func parsePublicResponse(body []byte) (float64, error) {
 	var resp struct {
 		Result   string             `json:"result"`
 		BaseCode string             `json:"base_code"`
 		Rates    map[string]float64 `json:"rates"`
-		// 备用兼容：有些 mirror 使用 "conversion_rates" 字段名
+		// 备用兼容：有些 mirror 使用 conversion_rates 字段
 		ConversionRates map[string]float64 `json:"conversion_rates"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -582,23 +581,23 @@ func parsePublicResponse(body []byte) (float64, error) {
 	return cny, nil
 }
 
-// parseBackupResponse 解析阿里云 cmapi00063890 备用接口响应（中国银行实时汇率）
+// parseBackupResponse 瑙ｆ瀽闃块噷浜?cmapi00063890 澶囩敤鎺ュ彛鍝嶅簲锛堜腑鍥介摱琛屽疄鏃舵眹鐜囷級
 //
 //	{
-//	  "success": true, "code": 200, "msg": "成功",
+//	  "success": true, "code": 200, "msg": "鎴愬姛",
 //	  "data": {
 //	    "list": [
 //	      {"code":"USD","zhesuan":"686.22","hui_in":"680.95","hui_out":"683.82",
-//	       "chao_out":"683.82","chao_in":"680.95","name":"美元","time":"05:30:00","day":"2026-04-18"},
+//	       "chao_out":"683.82","chao_in":"680.95","name":"缇庡厓","time":"05:30:00","day":"2026-04-18"},
 //	      ...
 //	    ]
 //	  }
 //	}
 //
-// 取值规则：
-//  1. 在 list 中找 code="USD" 的行
-//  2. 优先 zhesuan（中行"折算价"，最接近中间价）；除以 100（银行报价为每 100 外币换人民币）
-//  3. 若 zhesuan 缺失，用 (hui_in + hui_out)/2/100 作为中间价
+// 鍙栧€艰鍒欙細
+//  1. 鍦?list 涓壘 code="USD" 鐨勮
+//  2. 优先 zhesuan；除以 100
+//  3. 若 zhesuan 缺失，使用买入/卖出均值
 func parseBackupResponse(body []byte) (float64, error) {
 	var resp struct {
 		Code    int    `json:"code"`
@@ -606,13 +605,13 @@ func parseBackupResponse(body []byte) (float64, error) {
 		Success bool   `json:"success"`
 		Data    struct {
 			List []struct {
-				Code     string      `json:"code"`
-				Name     string      `json:"name"`
-				Zhesuan  json.Number `json:"zhesuan"`
-				HuiIn    json.Number `json:"hui_in"`
-				HuiOut   json.Number `json:"hui_out"`
-				ChaoIn   json.Number `json:"chao_in"`
-				ChaoOut  json.Number `json:"chao_out"`
+				Code    string      `json:"code"`
+				Name    string      `json:"name"`
+				Zhesuan json.Number `json:"zhesuan"`
+				HuiIn   json.Number `json:"hui_in"`
+				HuiOut  json.Number `json:"hui_out"`
+				ChaoIn  json.Number `json:"chao_in"`
+				ChaoOut json.Number `json:"chao_out"`
 			} `json:"list"`
 		} `json:"data"`
 	}
@@ -635,17 +634,17 @@ func parseBackupResponse(body []byte) (float64, error) {
 		if item.Code != "USD" {
 			continue
 		}
-		// 首选 zhesuan
+		// 棣栭€?zhesuan
 		if z := numFrom(item.Zhesuan); z > 0 {
 			return z / 100.0, nil
 		}
-		// 兜底：现汇买入+卖出取中间价
+		// 鍏滃簳锛氱幇姹囦拱鍏?鍗栧嚭鍙栦腑闂翠环
 		huiIn := numFrom(item.HuiIn)
 		huiOut := numFrom(item.HuiOut)
 		if huiIn > 0 && huiOut > 0 {
 			return (huiIn + huiOut) / 2.0 / 100.0, nil
 		}
-		// 再兜底：现钞买入+卖出
+		// 鍐嶅厹搴曪細鐜伴挒涔板叆+鍗栧嚭
 		chaoIn := numFrom(item.ChaoIn)
 		chaoOut := numFrom(item.ChaoOut)
 		if chaoIn > 0 && chaoOut > 0 {
@@ -656,7 +655,7 @@ func parseBackupResponse(body []byte) (float64, error) {
 	return 0, fmt.Errorf("backup: USD not found in list of %d items", len(resp.Data.List))
 }
 
-// parseMeta 解析 Redis 中存储的元信息 "{unix_ts}|{source}"
+// parseMeta 瑙ｆ瀽 Redis 涓瓨鍌ㄧ殑鍏冧俊鎭?"{unix_ts}|{source}"
 func parseMeta(s string) (time.Time, string) {
 	if s == "" {
 		return time.Time{}, SourceDefault
@@ -670,7 +669,7 @@ func parseMeta(s string) (time.Time, string) {
 	return time.Time{}, SourceDefault
 }
 
-// logEvent 异步写事件日志（非阻塞）
+// logEvent 寮傛鍐欎簨浠舵棩蹇楋紙闈為樆濉烇級
 func (s *ExchangeRateService) logEvent(ctx context.Context, eventType, source string, success bool, payload, result interface{}, err error, durationMs int64) {
 	if s.eventSink == nil {
 		return
@@ -678,7 +677,7 @@ func (s *ExchangeRateService) logEvent(ctx context.Context, eventType, source st
 	go s.eventSink.LogExchangeEvent(ctx, eventType, source, success, payload, result, err, durationMs)
 }
 
-// round2 保留 2 位小数
+// round2 保留 2 位小数。
 func round2(v float64) float64 {
 	return float64(int64(v*100+0.5)) / 100
 }

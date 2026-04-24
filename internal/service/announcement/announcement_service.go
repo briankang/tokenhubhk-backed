@@ -10,7 +10,9 @@ import (
 	"gorm.io/gorm"
 
 	"tokenhub-server/internal/model"
+	"tokenhub-server/internal/pkg/dbctx"
 	pkgredis "tokenhub-server/internal/pkg/redis"
+	"tokenhub-server/internal/service/usercache"
 )
 
 // Service 公告服务
@@ -187,6 +189,10 @@ func (s *Service) GetStats(ctx context.Context) (*Stats, error) {
 func (s *Service) GetUserNotifications(ctx context.Context, userID uint, page, pageSize int, unreadOnly, readOnly bool) ([]AnnouncementWithReadStatus, int64, error) {
 	now := time.Now()
 
+	// DB 查询 5s 超时（含子查询 + count + order by）
+	ctx, cancel := dbctx.Medium(ctx)
+	defer cancel()
+
 	// 构建基础查询：status=active，时间范围有效
 	baseQ := s.db.WithContext(ctx).Model(&model.Announcement{}).
 		Where("status = ?", "active").
@@ -259,12 +265,14 @@ func (s *Service) GetUnreadCount(ctx context.Context, userID uint) (int64, error
 		}
 	}
 
-	// 从数据库统计
+	// 从数据库统计（2s 超时，该端点 Dashboard 高频调用）
+	dbCtx, dbCancel := dbctx.Short(ctx)
+	defer dbCancel()
 	now := time.Now()
 	var count int64
 
 	// 使用 LEFT JOIN 避免子查询为空时的 SQL 错误
-	err := s.db.WithContext(ctx).
+	err := s.db.WithContext(dbCtx).
 		Table("announcements").
 		Select("COUNT(DISTINCT announcements.id)").
 		Joins("LEFT JOIN user_announcement_reads ON user_announcement_reads.announcement_id = announcements.id AND user_announcement_reads.user_id = ?", userID).
@@ -345,9 +353,12 @@ func (s *Service) GetActiveBanners(ctx context.Context) ([]model.Announcement, e
 		}
 	}
 
+	// 2s 超时 — 此端点是公开 landing / 顶栏 banner，必须快速失败降级
+	dbCtx, dbCancel := dbctx.Short(ctx)
+	defer dbCancel()
 	now := time.Now()
 	var banners []model.Announcement
-	err := s.db.WithContext(ctx).
+	err := s.db.WithContext(dbCtx).
 		Where("status = ?", "active").
 		Where("show_banner = ?", true).
 		Where("starts_at IS NULL OR starts_at <= ?", now).
@@ -379,4 +390,6 @@ func (s *Service) invalidateUnreadCache(userID uint) {
 	if rdb != nil {
 		rdb.Del(context.Background(), fmt.Sprintf("notif:unread:%d", userID))
 	}
+	// 统一失效 user:notif:unread:{uid}（新缓存路径由 NotificationHandler.UnreadCount 使用）
+	usercache.InvalidateNotifUnread(context.Background(), userID)
 }

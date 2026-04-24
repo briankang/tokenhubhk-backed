@@ -1360,7 +1360,7 @@ func (h *PaymentAdminHandler) GetUserPaymentProfile(c *gin.Context) {
 		UserID:      u.ID,
 		Email:       u.Email,
 		Name:        u.Name,
-		Role:        u.Role,
+		Role:        "", // v4.0: role 字段已移除；如需角色显示，查询 user_roles 表
 		CreatedAt:   u.CreatedAt,
 		LastLoginAt: u.LastLoginAt,
 	}

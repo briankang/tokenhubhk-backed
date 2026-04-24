@@ -21,6 +21,7 @@ import (
 	"tokenhub-server/internal/provider"
 	"tokenhub-server/internal/service/apikey"
 	balancesvc "tokenhub-server/internal/service/balance"
+	billingsvc "tokenhub-server/internal/service/billing"
 	channelsvc "tokenhub-server/internal/service/channel"
 	codingsvc "tokenhub-server/internal/service/coding"
 	"tokenhub-server/internal/service/parammapping"
@@ -34,6 +35,7 @@ type VideosHandler struct {
 	channelRouter *channelsvc.ChannelRouter
 	apiKeySvc     *apikey.ApiKeyService
 	balanceSvc    *balancesvc.BalanceService
+	billingSvc    *billingsvc.Service
 	paramSvc      *parammapping.ParamMappingService
 	pricingCalc   *pricing.PricingCalculator
 	logger        *zap.Logger
@@ -55,6 +57,7 @@ func NewVideosHandler(
 		channelRouter: channelRouter,
 		apiKeySvc:     apiKeySvc,
 		balanceSvc:    balSvc,
+		billingSvc:    billingsvc.NewService(db, pricingCalc, balSvc),
 		paramSvc:      paramSvc,
 		pricingCalc:   pricingCalc,
 		logger:        logger.L,
@@ -64,6 +67,7 @@ func NewVideosHandler(
 // Register 注册路由
 func (h *VideosHandler) Register(rg *gin.RouterGroup) {
 	rg.POST("/videos/generations", h.GenerateVideos)
+	rg.GET("/videos/tasks/:task_id", h.GetVideoTask)
 }
 
 // videoGenerationRequest 视频生成请求
@@ -83,7 +87,7 @@ type videoGenerationRequest struct {
 func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 	// 1. 认证
 	keyInfo, err := h.authenticateAPIKey(c)
-	if err != nil {
+	if err != nil || keyInfo == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": gin.H{"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"},
 		})
@@ -127,6 +131,35 @@ func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 		}
 	}
 	start := time.Now()
+	estimatedVideoCount := 1
+	estimatedDurationSec := float64(req.Duration)
+	if estimatedDurationSec <= 0 {
+		estimatedDurationSec = 1
+	}
+	estimatedVideoTokens := int(estimatedDurationSec*1280*720*24/1024 + 0.999)
+	freezeID := ""
+	if h.billingSvc != nil {
+		freeze, fErr := h.billingSvc.FreezeUnitUsage(c.Request.Context(), billingsvc.UnitUsageRequest{
+			RequestID: requestID,
+			UserID:    keyInfo.UserID,
+			TenantID:  keyInfo.TenantID,
+			ModelName: req.Model,
+			Usage: pricing.UsageInput{
+				ImageCount:   estimatedVideoCount,
+				DurationSec:  estimatedDurationSec,
+				OutputTokens: estimatedVideoTokens,
+			},
+		})
+		if fErr != nil {
+			c.JSON(http.StatusPaymentRequired, gin.H{"error": gin.H{"message": "Insufficient balance", "type": "insufficient_quota"}})
+			return
+		}
+		if freeze != nil {
+			freezeID = freeze.FreezeID
+			c.Set("estimated_cost_credits", freeze.EstimatedCostCredits)
+			c.Set("estimated_cost_units", freeze.EstimatedCostUnits)
+		}
+	}
 
 	// 3. 余额检查
 	if h.balanceSvc != nil {
@@ -143,8 +176,8 @@ func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		result, err := h.channelRouter.SelectChannelWithExcludes(
-			c.Request.Context(), req.Model, customChannelID, keyInfo.UserID, excludeChannelIDs)
+		result, err := h.channelRouter.SelectChannelForCapability(
+			c.Request.Context(), req.Model, customChannelID, keyInfo.UserID, model.CapabilityVideo, excludeChannelIDs)
 		if err != nil {
 			lastErr = fmt.Errorf("no channel for %s: %w", req.Model, err)
 			break
@@ -225,11 +258,16 @@ func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 		for _, v := range resp.Data {
 			totalDurationSec += float64(v.DurationSec)
 		}
+		if totalDurationSec <= 0 && req.Duration > 0 {
+			totalDurationSec = float64(req.Duration * videoCount)
+		}
+		actualVideoTokens := int(totalDurationSec*1280*720*24/1024 + 0.999)
 		costCredits, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, pricing.UsageInput{
-			ImageCount:  videoCount,
-			DurationSec: totalDurationSec,
-		}, requestID)
-		h.recordApiCallLog(keyInfo, ch, requestID, req.Model, actualModel, c.ClientIP(), int(latency), 200, costCredits, costRMB, rawBody, videoCount, totalDurationSec)
+			ImageCount:   videoCount,
+			DurationSec:  totalDurationSec,
+			OutputTokens: actualVideoTokens,
+		}, requestID, freezeID)
+		h.recordApiCallLog(c, keyInfo, ch, requestID, req.Model, actualModel, c.ClientIP(), int(latency), 200, costCredits, costRMB, rawBody, videoCount, totalDurationSec)
 
 		h.logger.Info("v1 videos: 生成成功",
 			zap.String("model", req.Model),
@@ -248,6 +286,7 @@ func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 			"model":      req.Model,
 			"data":       resp.Data,
 			"task_id":    resp.TaskID,
+			"status":     resp.Status,
 			"request_id": requestID,
 		})
 		return
@@ -258,8 +297,94 @@ func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 		msg = lastErr.Error()
 	}
 	c.Header("X-Request-ID", requestID)
+	_ = releaseFrozenWithBillingService(c, h.billingSvc, freezeID)
 	c.JSON(http.StatusBadGateway, gin.H{
 		"error":      gin.H{"message": msg, "type": "server_error"},
+		"request_id": requestID,
+	})
+}
+
+// GetVideoTask handles GET /v1/videos/tasks/:task_id.
+func (h *VideosHandler) GetVideoTask(c *gin.Context) {
+	keyInfo, err := h.authenticateAPIKey(c)
+	if err != nil || keyInfo == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": gin.H{"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"},
+		})
+		return
+	}
+
+	taskID := c.Param("task_id")
+	modelName := c.Query("model")
+	if taskID == "" || modelName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "task_id and model are required", "type": "invalid_request_error"}})
+		return
+	}
+
+	requestID := "vid-task-" + uuid.New().String()
+	start := time.Now()
+	result, err := h.channelRouter.SelectChannelForCapability(
+		c.Request.Context(), modelName, keyInfo.CustomChannelID, keyInfo.UserID, model.CapabilityVideo, nil)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "no channel for " + modelName + ": " + err.Error(), "type": "server_error"}})
+		return
+	}
+	ch := result.Channel
+	actualModel := result.ActualModel
+	if actualModel == "" {
+		actualModel = modelName
+	}
+	p := h.codingSvc.CreateProviderForChannel(ch)
+	querier, ok := p.(provider.VideoTaskQuerier)
+	if !ok {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": gin.H{"message": "provider does not support video task query", "type": "unsupported_operation"}})
+		return
+	}
+
+	resp, queryErr := querier.QueryVideoTask(c.Request.Context(), taskID)
+	latency := time.Since(start).Milliseconds()
+	c.Header("X-Request-ID", requestID)
+	c.Header("X-Actual-Model", actualModel)
+	c.Header("X-Channel-ID", fmt.Sprintf("%d", ch.ID))
+	c.Header("X-Upstream-Latency-Ms", fmt.Sprintf("%d", latency))
+	if queryErr != nil {
+		h.logger.Warn("v1 videos: query task not available yet", zap.String("task_id", taskID), zap.Error(queryErr))
+		c.JSON(http.StatusAccepted, gin.H{
+			"created":    time.Now().Unix(),
+			"model":      modelName,
+			"data":       []provider.VideoData{},
+			"task_id":    taskID,
+			"status":     "processing",
+			"request_id": requestID,
+			"message":    "task is still processing or the upstream query endpoint is not available yet",
+		})
+		return
+	}
+	if resp.Data == nil {
+		resp.Data = []provider.VideoData{}
+	}
+	if resp.Status == "" {
+		if len(resp.Data) > 0 {
+			resp.Status = "succeeded"
+		} else {
+			resp.Status = "processing"
+		}
+	}
+	if len(resp.Data) == 0 && resp.Status == "succeeded" {
+		resp.Status = "processing"
+	}
+	if resp.TaskID == "" {
+		resp.TaskID = taskID
+	}
+	if resp.Model == "" {
+		resp.Model = modelName
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"created":    resp.Created,
+		"model":      resp.Model,
+		"data":       resp.Data,
+		"task_id":    resp.TaskID,
+		"status":     resp.Status,
 		"request_id": requestID,
 	})
 }
@@ -296,36 +421,68 @@ func (h *VideosHandler) recordLog(channelID uint, modelName string, keyInfo *api
 
 // calculateAndDeductCost 按计费单位计算费用并扣减余额
 func (h *VideosHandler) calculateAndDeductCost(
-	c *gin.Context, modelName string, keyInfo *apikey.ApiKeyInfo, usage pricing.UsageInput, requestID string,
+	c *gin.Context, modelName string, keyInfo *apikey.ApiKeyInfo, usage pricing.UsageInput, requestID string, freezeID string,
 ) (int64, float64) {
+	if h.billingSvc != nil {
+		out, err := h.billingSvc.SettleUnitUsage(c.Request.Context(), billingsvc.UnitUsageRequest{
+			RequestID: requestID,
+			UserID:    keyInfo.UserID,
+			TenantID:  keyInfo.TenantID,
+			ModelName: modelName,
+			Usage:     usage,
+			FreezeID:  freezeID,
+		})
+		if out == nil {
+			return 0, 0
+		}
+		applyUnitBillingOutcomeToContext(c, out)
+		if err != nil {
+			h.logger.Error("v1 videos 鎵ｈ垂澶辫触锛岄渶瑕佷汉宸ュ璐?",
+				zap.Error(err),
+				zap.String("request_id", requestID),
+				zap.Uint("user_id", keyInfo.UserID),
+				zap.String("model", modelName),
+				zap.Int64("cost_credits", out.CostCredits))
+		}
+		return out.CostCredits, out.CostRMB
+	}
 	if h.pricingCalc == nil {
 		return 0, 0
 	}
 	ctx := c.Request.Context()
-	var aiModel model.AIModel
-	if err := h.db.WithContext(ctx).Where("model_name = ? AND is_active = true", modelName).First(&aiModel).Error; err != nil {
+	aiModel, billedModel := findActiveModelByRequestOrActual(ctx, h.db, modelName, modelName)
+	if aiModel == nil {
 		return 0, 0
 	}
-	costResult, err := h.pricingCalc.CalculateCostByUnit(ctx, aiModel.ID, keyInfo.TenantID, 0, usage)
+	costResult, err := h.pricingCalc.CalculateCostByUnit(ctx, keyInfo.UserID, aiModel.ID, keyInfo.TenantID, 0, usage)
 	if err != nil || costResult == nil {
 		return 0, 0
 	}
 	if h.balanceSvc != nil && costResult.TotalCost > 0 {
-		if dErr := h.balanceSvc.DeductForRequest(ctx, keyInfo.UserID, keyInfo.TenantID, costResult.TotalCost, modelName, requestID); dErr != nil {
+		if dErr := h.balanceSvc.DeductForRequest(ctx, keyInfo.UserID, keyInfo.TenantID, costResult.TotalCost, billedModel, requestID); dErr != nil {
 			h.logger.Error("v1 videos 扣费失败，需要人工对账",
 				zap.Error(dErr),
 				zap.String("request_id", requestID),
 				zap.Uint("user_id", keyInfo.UserID),
-				zap.String("model", modelName),
+				zap.String("model", billedModel),
 				zap.Int64("cost_credits", costResult.TotalCost))
+			setUnitBillingContext(c, requestID, billedModel, aiModel, costResult, usage, "deduct_failed", 0, costResult.TotalCost)
+			return costResult.TotalCost, costResult.TotalCostRMB
 		}
 	}
+	status := "no_charge"
+	actualCredits := int64(0)
+	if costResult.TotalCost > 0 {
+		status = "settled"
+		actualCredits = costResult.TotalCost
+	}
+	setUnitBillingContext(c, requestID, billedModel, aiModel, costResult, usage, status, actualCredits, 0)
 	return costResult.TotalCost, costResult.TotalCostRMB
 }
 
 // recordApiCallLog 异步写入 /v1/videos/generations 的全链路日志
 func (h *VideosHandler) recordApiCallLog(
-	keyInfo *apikey.ApiKeyInfo, ch *model.Channel, requestID, requestModel, actualModel, clientIP string,
+	c *gin.Context, keyInfo *apikey.ApiKeyInfo, ch *model.Channel, requestID, requestModel, actualModel, clientIP string,
 	latencyMs, statusCode int, costCredits int64, costRMB float64, rawBody []byte, videoCount int, durationSec float64,
 ) {
 	callLog := &model.ApiCallLog{
@@ -339,7 +496,7 @@ func (h *VideosHandler) recordApiCallLog(
 		ActualModel:       actualModel,
 		ChannelID:         ch.ID,
 		ChannelName:       ch.Name,
-		SupplierName:      ch.Supplier.Name,
+		SupplierName:      resolveChannelSupplierName(c.Request.Context(), h.db, ch),
 		StatusCode:        statusCode,
 		TotalLatencyMs:    latencyMs,
 		UpstreamLatencyMs: latencyMs,
@@ -355,6 +512,7 @@ func (h *VideosHandler) recordApiCallLog(
 	if rawBody != nil && len(rawBody) > 0 {
 		callLog.RequestBody = string(rawBody)
 	}
+	applyMatchedTierFromCtx(c, callLog)
 	go func() {
 		if err := h.db.Create(callLog).Error; err != nil {
 			h.logger.Error("v1 videos: 记录API调用日志失败", zap.Error(err))

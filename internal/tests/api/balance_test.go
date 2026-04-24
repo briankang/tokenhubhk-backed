@@ -85,12 +85,12 @@ func TestBalance_02_AdminRechargeUser(t *testing.T) {
 	beforeBalance := bal.Balance
 
 	// Admin recharges the user
-	rechargeAmount := 10.5
+	rechargeAmount := int64(105000)
 	rechargeResp, rechargeStatus, err := doPost(
-		fmt.Sprintf("%s/api/v1/admin/users/%d/recharge", baseURL, userID),
+		fmt.Sprintf("%s/api/v1/admin/users/%d/recharge-credits", baseURL, userID),
 		map[string]interface{}{
-			"amount": rechargeAmount,
-			"remark": "test recharge",
+			"credits": rechargeAmount,
+			"remark":  "test recharge",
 		},
 		adminToken,
 	)
@@ -109,7 +109,7 @@ func TestBalance_02_AdminRechargeUser(t *testing.T) {
 		t.Fatalf("parse recharge response: %v", err)
 	}
 
-	expected := beforeBalance + rechargeAmount
+	expected := beforeBalance + float64(rechargeAmount)
 	if afterBal.Balance < expected-0.001 || afterBal.Balance > expected+0.001 {
 		t.Errorf("expected balance ~%.6f after recharge, got %.6f", expected, afterBal.Balance)
 	}
@@ -171,10 +171,10 @@ func TestBalance_05_AdminUpdateQuotaConfig(t *testing.T) {
 	requireAdmin(t)
 
 	// Update quota config
-	newQuota := 2.5
+	newQuota := int64(25000)
 	resp, status, err := doPut(baseURL+"/api/v1/admin/quota-config", map[string]interface{}{
 		"defaultFreeQuota":  newQuota,
-		"registrationBonus": 0.5,
+		"registrationBonus": int64(5000),
 		"description":       "test updated quota",
 	}, adminToken)
 	if err != nil {
@@ -192,11 +192,7 @@ func TestBalance_05_AdminUpdateQuotaConfig(t *testing.T) {
 	newEmail := fmt.Sprintf("quotatest_%s@test.com", ts)
 	newPass := "Test@123456"
 
-	regResp, regStatus, regErr := doPost(baseURL+"/api/v1/auth/register", map[string]string{
-		"email":    newEmail,
-		"password": newPass,
-		"name":     "QuotaTest_" + ts,
-	}, "")
+	regResp, regStatus, regErr := doPost(baseURL+"/api/v1/auth/register", registerPayload(newEmail, newPass, "QuotaTest_"+ts), "")
 	if regErr != nil {
 		t.Fatalf("register failed: %v", regErr)
 	}
@@ -224,7 +220,7 @@ func TestBalance_05_AdminUpdateQuotaConfig(t *testing.T) {
 		t.Fatalf("parse balance: %v", err)
 	}
 
-	expectedTotal := newQuota + 0.5 // defaultFreeQuota + registrationBonus
+	expectedTotal := float64(newQuota + 5000) // defaultFreeQuota + registrationBonus
 	totalAvailable := bal.Balance + bal.FreeQuota
 	if totalAvailable < expectedTotal-0.01 || totalAvailable > expectedTotal+0.01 {
 		t.Errorf("expected new user balance ~%.2f, got %.6f (balance=%.6f freeQuota=%.6f)", expectedTotal, totalAvailable, bal.Balance, bal.FreeQuota)
@@ -233,8 +229,8 @@ func TestBalance_05_AdminUpdateQuotaConfig(t *testing.T) {
 
 	// Restore default quota config
 	_, _, _ = doPut(baseURL+"/api/v1/admin/quota-config", map[string]interface{}{
-		"defaultFreeQuota":  1.0,
-		"registrationBonus": 0.0,
+		"defaultFreeQuota":  int64(10000),
+		"registrationBonus": int64(0),
 		"description":       "default quota config",
 	}, adminToken)
 }

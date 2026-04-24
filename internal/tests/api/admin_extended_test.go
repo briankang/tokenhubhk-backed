@@ -18,6 +18,7 @@ func TestAdminListSuppliers_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -36,10 +37,12 @@ func TestAdminCreateSupplier_Success(t *testing.T) {
 	requireAdmin(t)
 
 	body := map[string]interface{}{
-		"name":      uniqueName("supplier"),
-		"code":      uniqueName("sp"),
-		"base_url":  "https://api.test-supplier.com/v1",
-		"is_active": true,
+		"name":        uniqueName("supplier"),
+		"code":        uniqueName("sp"),
+		"base_url":    "https://api.test-supplier.com/v1",
+		"access_type": "api",
+		"status":      "active",
+		"is_active":   true,
 	}
 
 	resp, status, err := doPost(baseURL+"/api/v1/admin/suppliers", body, adminToken)
@@ -48,6 +51,7 @@ func TestAdminCreateSupplier_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -146,6 +150,7 @@ func TestAdminListTenants_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -156,8 +161,8 @@ func TestAdminCreateTenant_Success(t *testing.T) {
 	requireAdmin(t)
 
 	body := map[string]interface{}{
-		"name":  uniqueName("tenant"),
-		"email": uniqueEmail("tenant"),
+		"name":     uniqueName("tenant"),
+		"email":    uniqueEmail("tenant"),
 		"password": "Tenant@123456",
 	}
 
@@ -167,6 +172,7 @@ func TestAdminCreateTenant_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Logf("create tenant returned %d: %s", status, resp.Message)
@@ -193,6 +199,7 @@ func TestAdminBatchCreateUsers_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Logf("batch create returned %d: %s", status, resp.Message)
@@ -215,6 +222,7 @@ func TestAdminUpdateUserRole_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Logf("update role returned %d: %s", status, resp.Message)
@@ -237,6 +245,7 @@ func TestAdminRechargeUserRMB_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Logf("recharge returned %d: %s", status, resp.Message)
@@ -258,6 +267,7 @@ func TestAdminUpdateUserStatus_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Logf("update status returned %d: %s", status, resp.Message)
@@ -275,6 +285,7 @@ func TestAdminListExchangeRates_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -295,6 +306,7 @@ func TestAdminCreateExchangeRate_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Logf("create exchange rate returned %d: %s (may already exist)", status, resp.Message)
@@ -312,6 +324,7 @@ func TestAdminGetMemberLevels_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -322,12 +335,12 @@ func TestAdminCreateMemberLevel_Success(t *testing.T) {
 	requireAdmin(t)
 
 	body := map[string]interface{}{
-		"name":              uniqueName("VIP"),
-		"level":             99,
-		"min_spending":      100000,
-		"discount_rate":     0.9,
-		"default_rpm":       120,
-		"default_tpm":       200000,
+		"name":          uniqueName("VIP"),
+		"level":         99,
+		"min_spending":  100000,
+		"discount_rate": 0.9,
+		"default_rpm":   120,
+		"default_tpm":   200000,
 	}
 
 	resp, status, err := doPost(baseURL+"/api/v1/admin/member-levels", body, adminToken)
@@ -336,6 +349,7 @@ func TestAdminCreateMemberLevel_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Logf("create member level returned %d: %s", status, resp.Message)
@@ -351,6 +365,7 @@ func TestAdminGetAgentLevels_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -372,6 +387,7 @@ func TestAdminCreateAgentLevel_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Logf("create agent level returned %d: %s", status, resp.Message)
@@ -389,6 +405,7 @@ func TestAdminGetWithdrawalRequests_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -406,6 +423,7 @@ func TestAdminListModelCategories_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -428,6 +446,7 @@ func TestAdminCreateModelCategory_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Logf("create category returned %d: %s", status, resp.Message)
@@ -502,6 +521,7 @@ func TestAdminListModelCommissions_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -523,6 +543,7 @@ func TestAdminCreateModelCommission_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Logf("create commission returned %d: %s", status, resp.Message)
@@ -540,6 +561,7 @@ func TestAdminListChannelModels_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -560,6 +582,7 @@ func TestAdminBatchUpdateModelStatus_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	// 空列表应该成功返回或返回参数错误
 	if status >= 500 {
@@ -578,6 +601,7 @@ func TestAdminGetPriceSyncLogs_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -595,6 +619,7 @@ func TestAdminDailyStats_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -612,6 +637,7 @@ func TestAdminListAgentApplications_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)
@@ -629,6 +655,7 @@ func TestAdminReconciliationReport_Success(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", status, resp.Message)

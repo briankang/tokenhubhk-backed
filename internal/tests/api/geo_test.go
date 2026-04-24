@@ -146,8 +146,8 @@ func TestDetectLocaleAPIEndpoint(t *testing.T) {
 	}
 
 	var result struct {
-		Code    int `json:"code"`
-		Data    struct {
+		Code int `json:"code"`
+		Data struct {
 			Locale  string `json:"locale"`
 			Country string `json:"country"`
 			Source  string `json:"source"`

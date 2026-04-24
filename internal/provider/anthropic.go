@@ -200,7 +200,7 @@ func (p *AnthropicProvider) convertRequest(req *ChatRequest, stream bool) *anthr
 	msgs := make([]anthropicMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		if m.Role == "system" {
-			systemText = m.Content
+			systemText = TextContent(m.Content)
 			continue
 		}
 		msgs = append(msgs, anthropicMessage{Role: m.Role, Content: m.Content})

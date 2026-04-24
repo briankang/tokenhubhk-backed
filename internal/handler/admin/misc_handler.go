@@ -14,12 +14,13 @@ import (
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 	"tokenhub-server/internal/service/audit"
+	reportSvc "tokenhub-server/internal/service/report"
 )
 
 // MiscHandler 杂项管理接口处理器（审计日志、每日统计、对账报告）
 type MiscHandler struct {
-	db         *gorm.DB
-	auditSvc   *audit.AuditService
+	db       *gorm.DB
+	auditSvc *audit.AuditService
 }
 
 // NewMiscHandler 创建杂项管理Handler实例
@@ -216,6 +217,41 @@ func (h *MiscHandler) ReconciliationReport(c *gin.Context) {
 		Where("type = 'CONSUME' AND DATE(created_at) = ?", today).
 		Select("COALESCE(SUM(ABS(amount)), 0)").Scan(&todayConsumed)
 
+	type billingSummary struct {
+		TotalRequests          int64   `json:"total_requests"`
+		SettledRequests        int64   `json:"settled_requests"`
+		DeductFailedRequests   int64   `json:"deduct_failed_requests"`
+		EstimatedRequests      int64   `json:"estimated_requests"`
+		ActualRevenueCredits   int64   `json:"actual_revenue_credits"`
+		ActualRevenueRMB       float64 `json:"actual_revenue_rmb"`
+		EstimatedCostCredits   int64   `json:"estimated_cost_credits"`
+		FrozenCredits          int64   `json:"frozen_credits"`
+		UnderCollectedCredits  int64   `json:"under_collected_credits"`
+		UnderCollectedRMB      float64 `json:"under_collected_rmb"`
+		PlatformCostRMB        float64 `json:"platform_cost_rmb"`
+		GrossProfitRMB         float64 `json:"gross_profit_rmb"`
+		MissingUsageRequests   int64   `json:"missing_usage_requests"`
+		MissingPlatformCostReq int64   `json:"missing_platform_cost_requests"`
+	}
+	var billing billingSummary
+	h.db.WithContext(ctx).Table("api_call_logs").
+		Select(
+			"COUNT(*) AS total_requests," +
+				"SUM(CASE WHEN COALESCE(billing_status,'settled') IN ('settled','no_charge') THEN 1 ELSE 0 END) AS settled_requests," +
+				"SUM(CASE WHEN billing_status = 'deduct_failed' THEN 1 ELSE 0 END) AS deduct_failed_requests," +
+				"SUM(CASE WHEN usage_estimated = TRUE OR usage_source = 'estimated' THEN 1 ELSE 0 END) AS estimated_requests," +
+				"COALESCE(SUM(CASE WHEN COALESCE(actual_cost_credits,0) > 0 THEN actual_cost_credits WHEN COALESCE(billing_status,'settled') = 'settled' THEN cost_credits ELSE 0 END),0) AS actual_revenue_credits," +
+				"COALESCE(SUM(CASE WHEN COALESCE(actual_cost_credits,0) > 0 THEN actual_cost_credits WHEN COALESCE(billing_status,'settled') = 'settled' THEN cost_credits ELSE 0 END),0)/10000.0 AS actual_revenue_rmb," +
+				"COALESCE(SUM(estimated_cost_credits),0) AS estimated_cost_credits," +
+				"COALESCE(SUM(frozen_credits),0) AS frozen_credits," +
+				"COALESCE(SUM(under_collected_credits),0) AS under_collected_credits," +
+				"COALESCE(SUM(under_collected_credits),0)/10000.0 AS under_collected_rmb," +
+				"COALESCE(SUM(platform_cost_rmb),0) AS platform_cost_rmb," +
+				"(COALESCE(SUM(CASE WHEN COALESCE(actual_cost_credits,0) > 0 THEN actual_cost_credits WHEN COALESCE(billing_status,'settled') = 'settled' THEN cost_credits ELSE 0 END),0)/10000.0 - COALESCE(SUM(platform_cost_rmb),0)) AS gross_profit_rmb," +
+				"SUM(CASE WHEN COALESCE(usage_source,'') = '' OR usage_source = 'unknown' THEN 1 ELSE 0 END) AS missing_usage_requests," +
+				"SUM(CASE WHEN COALESCE(platform_cost_rmb,0) = 0 AND COALESCE(total_tokens,0) > 0 THEN 1 ELSE 0 END) AS missing_platform_cost_requests",
+		).Scan(&billing)
+
 	response.Success(c, gin.H{
 		"expiredFreezes": gin.H{
 			"count": expiredFreezeCount,
@@ -233,10 +269,36 @@ func (h *MiscHandler) ReconciliationReport(c *gin.Context) {
 		},
 		"freezeSummary": freezeSummary,
 		"todayStats": gin.H{
-			"date":          today,
-			"recharge":      todayRecharge,
-			"consumed":      todayConsumed,
+			"date":     today,
+			"recharge": todayRecharge,
+			"consumed": todayConsumed,
 		},
-		"generatedAt": time.Now(),
+		"billingReconciliation": billing,
+		"generatedAt":           time.Now(),
 	})
+}
+
+// BillingReconciliationSnapshots returns persisted daily billing reconciliation snapshots.
+func (h *MiscHandler) BillingReconciliationSnapshots(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	svc := reportSvc.NewBillingReconciliationService(h.db)
+	list, total, err := svc.List(c.Request.Context(), page, pageSize)
+	if err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	response.PageResult(c, list, total, page, pageSize)
+}
+
+// CreateBillingReconciliationSnapshot builds and persists a snapshot for a date.
+func (h *MiscHandler) CreateBillingReconciliationSnapshot(c *gin.Context) {
+	date := c.DefaultQuery("date", time.Now().Format("2006-01-02"))
+	svc := reportSvc.NewBillingReconciliationService(h.db)
+	snap, err := svc.UpsertDate(c.Request.Context(), date)
+	if err != nil {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
+		return
+	}
+	response.Success(c, snap)
 }

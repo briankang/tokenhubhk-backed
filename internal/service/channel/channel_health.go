@@ -16,6 +16,7 @@ import (
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/logger"
 	pkgredis "tokenhub-server/internal/pkg/redis"
+	"tokenhub-server/internal/pkg/safego"
 )
 
 // HealthResult 单个渠道健康检查结果
@@ -53,12 +54,12 @@ func (c *ChannelHealthChecker) StartHealthCheck(ctx context.Context, interval ti
 
 	c.logger.Info("starting channel health checker", zap.Duration("interval", interval))
 
-	go func() {
+	safego.Go("channel-health-ticker", func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		// 执行初始检查
-		c.checkAll(ctx)
+		// 执行初始检查（单次执行也用 Run 隔离 panic）
+		safego.Run("channel-health-initial-check", func() { c.checkAll(ctx) })
 
 		for {
 			select {
@@ -66,13 +67,13 @@ func (c *ChannelHealthChecker) StartHealthCheck(ctx context.Context, interval ti
 				c.logger.Info("channel health checker stopped")
 				return
 			case <-ticker.C:
-				c.checkAll(ctx)
+				safego.Run("channel-health-tick", func() { c.checkAll(ctx) })
 			}
 		}
-	}()
+	})
 
 	// 启动自动恢复协程（每30分钟检查被禁用的渠道）
-	go func() {
+	safego.Go("channel-recovery-ticker", func() {
 		recoveryTicker := time.NewTicker(30 * time.Minute)
 		defer recoveryTicker.Stop()
 
@@ -81,10 +82,10 @@ func (c *ChannelHealthChecker) StartHealthCheck(ctx context.Context, interval ti
 			case <-ctx.Done():
 				return
 			case <-recoveryTicker.C:
-				c.tryRecoverDisabledChannels(ctx)
+				safego.Run("channel-recovery-tick", func() { c.tryRecoverDisabledChannels(ctx) })
 			}
 		}
-	}()
+	})
 }
 
 // checkAll 对所有活跃渠道执行健康检查

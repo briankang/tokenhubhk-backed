@@ -35,15 +35,20 @@ func (h *LevelAdminHandler) Register(rg *gin.RouterGroup) {
 	rg.POST("/users/batch-rate-limits", h.BatchSetUserRateLimits)
 }
 
-// BatchSetUserRateLimitsRequest 批量设置用户限流请求体
-// rpm/tpm 任一为 0 表示该字段不修改；user_ids 为目标用户 ID 列表
+// BatchSetUserRateLimitsRequest 批量设置用户限额请求体
+// 非零字段覆写对应列；ClearOverride=true 时 DELETE 该用户全部覆盖（回退到会员等级默认值）
 type BatchSetUserRateLimitsRequest struct {
-	UserIDs []uint `json:"user_ids" binding:"required,min=1"`
-	RPM     int    `json:"rpm"`
-	TPM     int    `json:"tpm"`
+	UserIDs         []uint `json:"user_ids" binding:"required,min=1"`
+	RPM             int    `json:"rpm"`
+	TPM             int    `json:"tpm"`
+	DailyLimit      int64  `json:"daily_limit"`
+	MonthlyLimit    int64  `json:"monthly_limit"`
+	MaxTokensPerReq int    `json:"max_tokens_per_req"`
+	MaxConcurrent   int    `json:"max_concurrent"`
+	ClearOverride   bool   `json:"clear_override"`
 }
 
-// BatchSetUserRateLimits 批量为指定用户设置自定义 RPM / TPM 覆盖
+// BatchSetUserRateLimits 批量为指定用户设置 UserQuotaConfig 覆盖
 // POST /api/v1/admin/users/batch-rate-limits
 func (h *LevelAdminHandler) BatchSetUserRateLimits(c *gin.Context) {
 	var req BatchSetUserRateLimitsRequest
@@ -51,11 +56,22 @@ func (h *LevelAdminHandler) BatchSetUserRateLimits(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
 		return
 	}
-	if req.RPM <= 0 && req.TPM <= 0 {
-		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "rpm 和 tpm 至少需指定一项 (>0)")
+	hasAny := req.RPM > 0 || req.TPM > 0 || req.DailyLimit > 0 || req.MonthlyLimit > 0 ||
+		req.MaxTokensPerReq > 0 || req.MaxConcurrent > 0 || req.ClearOverride
+	if !hasAny {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "至少需指定一项限额字段 (>0) 或 clear_override=true")
 		return
 	}
-	updated, err := h.memberSvc.BatchSetUserRateLimits(c.Request.Context(), req.UserIDs, req.RPM, req.TPM)
+	patch := membersvc.BatchQuotaPatch{
+		RPM:             req.RPM,
+		TPM:             req.TPM,
+		DailyLimit:      req.DailyLimit,
+		MonthlyLimit:    req.MonthlyLimit,
+		MaxTokensPerReq: req.MaxTokensPerReq,
+		MaxConcurrent:   req.MaxConcurrent,
+		ClearOverride:   req.ClearOverride,
+	}
+	updated, err := h.memberSvc.BatchSetUserQuota(c.Request.Context(), req.UserIDs, patch)
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return

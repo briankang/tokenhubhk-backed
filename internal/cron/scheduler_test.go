@@ -4,6 +4,12 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
+
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+
+	"tokenhub-server/internal/model"
 )
 
 func TestScheduler_TaskManagement(t *testing.T) {
@@ -125,6 +131,56 @@ func TestScheduler_SafeRunNamed_RunsEnabled(t *testing.T) {
 
 	if !executed {
 		t.Error("enabled task should have been executed")
+	}
+}
+
+func TestScheduler_RunBillingReconciliationForDate(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(
+		&model.ApiCallLog{},
+		&model.FreezeRecord{},
+		&model.UserBalance{},
+		&model.BillingReconciliationSnapshot{},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	day := time.Date(2026, 4, 24, 10, 0, 0, 0, time.Local)
+	if err := db.Create(&model.ApiCallLog{
+		RequestID:            "cron-recon-1",
+		UserID:               1,
+		TenantID:             1,
+		Status:               "success",
+		BillingStatus:        "settled",
+		CostCredits:          2000,
+		CostUnits:            20000000,
+		EstimatedCostCredits: 2500,
+		EstimatedCostUnits:   25000000,
+		TotalTokens:          20,
+		CreatedAt:            day,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Scheduler{
+		db:     db,
+		tasks:  make(map[string]*TaskInfo),
+		stopCh: make(chan struct{}),
+	}
+	if err := s.runBillingReconciliationForDate(context.Background(), "2026-04-24"); err != nil {
+		t.Fatal(err)
+	}
+
+	var snap model.BillingReconciliationSnapshot
+	if err := db.Where("date = ?", "2026-04-24").First(&snap).Error; err != nil {
+		t.Fatal(err)
+	}
+	if snap.TotalRequests != 1 || snap.ActualRevenueUnits != 20000000 || snap.EstimateVarianceUnits != 5000000 {
+		t.Fatalf("unexpected snapshot: requests=%d revenue_units=%d variance_units=%d",
+			snap.TotalRequests, snap.ActualRevenueUnits, snap.EstimateVarianceUnits)
 	}
 }
 

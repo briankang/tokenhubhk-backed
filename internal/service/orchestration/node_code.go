@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"tokenhub-server/internal/pkg/safego"
 	"tokenhub-server/internal/provider"
 )
 
@@ -54,7 +55,7 @@ func (n *CodeNode) Execute(ctx context.Context, input *NodeInput) (*NodeOutput, 
 // Stream 将Execute包装为单事件流（代码节点是同步的）
 func (n *CodeNode) Stream(ctx context.Context, input *NodeInput) (<-chan StreamEvent, error) {
 	ch := make(chan StreamEvent, 2)
-	go func() {
+	safego.Go("orchestration-code-stream", func() {
 		defer close(ch)
 
 		output, err := n.Execute(ctx, input)
@@ -77,7 +78,7 @@ func (n *CodeNode) Stream(ctx context.Context, input *NodeInput) (<-chan StreamE
 			Status:   "done",
 			Usage:    &output.Usage,
 		}
-	}()
+	})
 	return ch, nil
 }
 
@@ -86,7 +87,7 @@ func (n *CodeNode) transform(input *NodeInput) string {
 	// 获取最后一条消息作为基础输入
 	baseContent := ""
 	if len(input.Messages) > 0 {
-		baseContent = input.Messages[len(input.Messages)-1].Content
+		baseContent = provider.TextContent(input.Messages[len(input.Messages)-1].Content)
 	}
 
 	// 检查是否指定了上游节点输出作为数据源

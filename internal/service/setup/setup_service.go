@@ -53,41 +53,11 @@ func (s *SetupService) TestDatabaseConnection() error {
 	return nil
 }
 
-// RunMigrations 执行数据库迁移
-// 对所有已注册的模型执行 AutoMigrate
+// RunMigrations 执行数据库 schema 初始化
+// 委派给 database.RunSchemaInit：清理遗留 + AutoMigrate 全部 80+ 表
+// （比本文件硬编码列表完整且维护点唯一）
 func (s *SetupService) RunMigrations() error {
-	return s.db.AutoMigrate(
-		&model.SystemConfig{},
-		&model.Tenant{},
-		&model.User{},
-		&model.ApiKey{},
-		&model.Supplier{},
-		&model.ModelCategory{},
-		&model.AIModel{},
-		&model.ChannelTag{},
-		&model.Channel{},
-		&model.ChannelGroup{},
-		&model.BackupRule{},
-		&model.ModelPricing{},
-		&model.AgentLevelDiscount{},
-		&model.AgentPricing{},
-		&model.ChannelLog{},
-		&model.DailyStats{},
-		&model.Orchestration{},
-		&model.DocCategory{},
-		&model.Doc{},
-		&model.Payment{},
-		&model.AuditLog{},
-		&model.UserBalance{},
-		&model.QuotaConfig{},
-		&model.BalanceRecord{},
-		&model.ReferralConfig{},
-		&model.ReferralLink{},
-		&model.CommissionRecord{},
-		&model.PaymentProviderConfig{},
-		&model.BankAccount{},
-		&model.PaymentMethod{},
-	)
+	return database.RunSchemaInit(s.db)
 }
 
 // TestRedisConnection 测试 Redis 连接
@@ -160,13 +130,12 @@ func (s *SetupService) CreateAdminAccount(username, password, email string) erro
 		return fmt.Errorf("密码哈希生成失败: %w", err)
 	}
 
-	// 创建管理员用户
+	// 创建管理员用户（v4.0: 角色通过 user_roles 表分配）
 	adminUser := model.User{
 		TenantID:     tenant.ID,
 		Email:        email,
 		PasswordHash: string(hash),
 		Name:         username,
-		Role:         "ADMIN",
 		IsActive:     true,
 		Language:     "zh",
 	}
@@ -174,13 +143,22 @@ func (s *SetupService) CreateAdminAccount(username, password, email string) erro
 		return fmt.Errorf("创建管理员账号失败: %w", err)
 	}
 
+	// 分配 SUPER_ADMIN 角色（若 roles 表已种子化）
+	var superAdminID uint
+	s.db.Table("roles").Where("code = ?", "SUPER_ADMIN").Select("id").Scan(&superAdminID)
+	if superAdminID != 0 {
+		_ = s.db.Create(&model.UserRole{
+			UserID: adminUser.ID, RoleID: superAdminID,
+		}).Error
+	}
+
 	return nil
 }
 
-// ImportSeedData 导入种子数据
-// 调用 database.RunSeed 导入预置的供应商、模型、渠道等数据
+// ImportSeedData 导入全量种子数据
+// 调用 database.RunAllSeeds 写入所有预置的业务数据（供应商/分类/渠道/等级/参数/用例等）
 func (s *SetupService) ImportSeedData() error {
-	database.RunSeed(s.db)
+	database.RunAllSeeds(s.db)
 	return nil
 }
 

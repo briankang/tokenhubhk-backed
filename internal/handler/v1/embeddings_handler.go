@@ -27,6 +27,7 @@ import (
 	"tokenhub-server/internal/pkg/logger"
 	"tokenhub-server/internal/service/apikey"
 	balancesvc "tokenhub-server/internal/service/balance"
+	billingsvc "tokenhub-server/internal/service/billing"
 	channelsvc "tokenhub-server/internal/service/channel"
 	"tokenhub-server/internal/service/pricing"
 )
@@ -37,6 +38,7 @@ type EmbeddingsHandler struct {
 	channelRouter *channelsvc.ChannelRouter
 	apiKeySvc     *apikey.ApiKeyService
 	balanceSvc    *balancesvc.BalanceService
+	billingSvc    *billingsvc.Service
 	pricingCalc   *pricing.PricingCalculator
 	httpClient    *http.Client
 	logger        *zap.Logger
@@ -55,6 +57,7 @@ func NewEmbeddingsHandler(
 		channelRouter: channelRouter,
 		apiKeySvc:     apiKeySvc,
 		balanceSvc:    balSvc,
+		billingSvc:    billingsvc.NewService(db, pricingCalc, balSvc),
 		pricingCalc:   pricingCalc,
 		httpClient:    &http.Client{Timeout: 60 * time.Second},
 		logger:        logger.L,
@@ -93,7 +96,7 @@ type embeddingResponse struct {
 func (h *EmbeddingsHandler) CreateEmbedding(c *gin.Context) {
 	// 1. 认证
 	keyInfo, err := h.authenticateAPIKey(c)
-	if err != nil {
+	if err != nil || keyInfo == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": gin.H{"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"},
 		})
@@ -134,6 +137,28 @@ func (h *EmbeddingsHandler) CreateEmbedding(c *gin.Context) {
 
 	// 统计输入字符数，用于 per_million_characters 计费或 token 数兜底
 	charCount := countInputChars(req.Input)
+	freezeID := ""
+	if h.billingSvc != nil {
+		freeze, fErr := h.billingSvc.FreezeUnitUsage(c.Request.Context(), billingsvc.UnitUsageRequest{
+			RequestID: requestID,
+			UserID:    keyInfo.UserID,
+			TenantID:  keyInfo.TenantID,
+			ModelName: req.Model,
+			Usage: pricing.UsageInput{
+				InputTokens: charCount,
+				CharCount:   charCount,
+			},
+		})
+		if fErr != nil {
+			c.JSON(http.StatusPaymentRequired, gin.H{"error": gin.H{"message": "Insufficient balance", "type": "insufficient_quota"}})
+			return
+		}
+		if freeze != nil {
+			freezeID = freeze.FreezeID
+			c.Set("estimated_cost_credits", freeze.EstimatedCostCredits)
+			c.Set("estimated_cost_units", freeze.EstimatedCostUnits)
+		}
+	}
 
 	// 4. Failover
 	const maxRetries = 3
@@ -143,8 +168,8 @@ func (h *EmbeddingsHandler) CreateEmbedding(c *gin.Context) {
 	var lastStatus int
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		result, err := h.channelRouter.SelectChannelWithExcludes(
-			c.Request.Context(), req.Model, customChannelID, keyInfo.UserID, excludeChannelIDs)
+		result, err := h.channelRouter.SelectChannelForCapability(
+			c.Request.Context(), req.Model, customChannelID, keyInfo.UserID, model.CapabilityEmbedding, excludeChannelIDs)
 		if err != nil {
 			lastErr = fmt.Errorf("no channel for %s: %w", req.Model, err)
 			break
@@ -225,8 +250,8 @@ func (h *EmbeddingsHandler) CreateEmbedding(c *gin.Context) {
 			InputTokens: promptTokens,
 			CharCount:   charCount,
 		}
-		costCredits, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, usage, requestID)
-		h.recordApiCallLog(keyInfo, ch, requestID, req.Model, actualModel, c.ClientIP(),
+		costCredits, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, usage, requestID, freezeID)
+		h.recordApiCallLog(c, keyInfo, ch, requestID, req.Model, actualModel, c.ClientIP(),
 			int(latency), 200, costCredits, costRMB, rawBody, promptTokens, charCount)
 
 		h.logger.Info("v1 embeddings: 成功",
@@ -258,6 +283,7 @@ func (h *EmbeddingsHandler) CreateEmbedding(c *gin.Context) {
 		msg = lastErr.Error()
 	}
 	c.Header("X-Request-ID", requestID)
+	_ = releaseFrozenWithBillingService(c, h.billingSvc, freezeID)
 	c.JSON(statusCode, gin.H{
 		"error":      gin.H{"message": msg, "type": "server_error"},
 		"request_id": requestID,
@@ -298,8 +324,31 @@ func (h *EmbeddingsHandler) recordLog(channelID uint, modelName string, keyInfo 
 
 // calculateAndDeductCost 计费并扣费（支持 per_million_tokens 与 per_million_characters）
 func (h *EmbeddingsHandler) calculateAndDeductCost(
-	c *gin.Context, modelName string, keyInfo *apikey.ApiKeyInfo, usage pricing.UsageInput, requestID string,
+	c *gin.Context, modelName string, keyInfo *apikey.ApiKeyInfo, usage pricing.UsageInput, requestID string, freezeID string,
 ) (int64, float64) {
+	if h.billingSvc != nil {
+		out, err := h.billingSvc.SettleUnitUsage(c.Request.Context(), billingsvc.UnitUsageRequest{
+			RequestID: requestID,
+			UserID:    keyInfo.UserID,
+			TenantID:  keyInfo.TenantID,
+			ModelName: modelName,
+			Usage:     usage,
+			FreezeID:  freezeID,
+		})
+		if out == nil {
+			return 0, 0
+		}
+		applyUnitBillingOutcomeToContext(c, out)
+		if err != nil {
+			h.logger.Error("v1 embeddings 鎵ｈ垂澶辫触锛岄渶瑕佷汉宸ュ璐?",
+				zap.Error(err),
+				zap.String("request_id", requestID),
+				zap.Uint("user_id", keyInfo.UserID),
+				zap.String("model", modelName),
+				zap.Int64("cost_credits", out.CostCredits))
+		}
+		return out.CostCredits, out.CostRMB
+	}
 	if h.pricingCalc == nil {
 		return 0, 0
 	}
@@ -308,7 +357,7 @@ func (h *EmbeddingsHandler) calculateAndDeductCost(
 	if err := h.db.WithContext(ctx).Where("model_name = ? AND is_active = true", modelName).First(&aiModel).Error; err != nil {
 		return 0, 0
 	}
-	costResult, err := h.pricingCalc.CalculateCostByUnit(ctx, aiModel.ID, keyInfo.TenantID, 0, usage)
+	costResult, err := h.pricingCalc.CalculateCostByUnit(ctx, keyInfo.UserID, aiModel.ID, keyInfo.TenantID, 0, usage)
 	if err != nil || costResult == nil {
 		return 0, 0
 	}
@@ -327,7 +376,7 @@ func (h *EmbeddingsHandler) calculateAndDeductCost(
 
 // recordApiCallLog 异步写入 /v1/embeddings 的全链路日志
 func (h *EmbeddingsHandler) recordApiCallLog(
-	keyInfo *apikey.ApiKeyInfo, ch *model.Channel, requestID, requestModel, actualModel, clientIP string,
+	c *gin.Context, keyInfo *apikey.ApiKeyInfo, ch *model.Channel, requestID, requestModel, actualModel, clientIP string,
 	latencyMs, statusCode int, costCredits int64, costRMB float64, rawBody []byte, promptTokens, charCount int,
 ) {
 	callLog := &model.ApiCallLog{
@@ -357,6 +406,7 @@ func (h *EmbeddingsHandler) recordApiCallLog(
 	if rawBody != nil && len(rawBody) > 0 {
 		callLog.RequestBody = string(rawBody)
 	}
+	applyMatchedTierFromCtx(c, callLog)
 	go func() {
 		if err := h.db.Create(callLog).Error; err != nil {
 			h.logger.Error("v1 embeddings: 记录API调用日志失败", zap.Error(err))

@@ -94,12 +94,13 @@ func (h *AdminTenantHandler) Create(c *gin.Context) {
 			return fmt.Errorf("failed to create tenant: %w", err)
 		}
 
+		// v4.0: 代理角色(AGENT_L1)已移除；此处创建的用户默认为普通 USER，
+		// 权限由 user_roles 表控制（不再通过 users.role 字段）
 		adminUser := model.User{
 			TenantID:     tenant.ID,
 			Email:        req.AdminEmail,
 			PasswordHash: string(hashedPwd),
 			Name:         req.AdminName,
-			Role:         "AGENT_L1",
 			IsActive:     true,
 		}
 		if err := tx.Create(&adminUser).Error; err != nil {

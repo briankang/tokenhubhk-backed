@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"net"
 	"net/http"
 	"strings"
 
@@ -9,6 +10,42 @@ import (
 	"tokenhub-server/internal/pkg/response"
 	whitelabel "tokenhub-server/internal/service/whitelabel"
 )
+
+// privateCIDRs 私网/保留 IP 网段（来自 K8s Pod CIDR + VPC 内网 + loopback）
+// 命中时直接跳过 tenants 表查询，避免 ALB/kubelet 健康检查触发的 noisy SELECT
+var privateCIDRs = func() []*net.IPNet {
+	blocks := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"127.0.0.0/8",
+		"169.254.0.0/16",
+		"::1/128",
+		"fc00::/7",
+	}
+	out := make([]*net.IPNet, 0, len(blocks))
+	for _, c := range blocks {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()
+
+// isPrivateHost 判断 host 是否为私网/保留 IP（Pod IP / VPC ENI / loopback）
+// 非 IP 字符串（如正式域名）返回 false
+func isPrivateHost(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, block := range privateCIDRs {
+		if block.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
 
 // TenantResolveMiddleware 租户解析中间件，从请求 Host 头解析当前租户
 // 处理逻辑:
@@ -33,6 +70,13 @@ func TenantResolveMiddleware(resolver *whitelabel.DomainResolver, platformDomain
 
 		// 本地开发环境跳过
 		if host == "localhost" || host == "127.0.0.1" {
+			c.Next()
+			return
+		}
+
+		// 私网 IP（Pod IP、VPC 内网地址等）跳过 tenants 表查询
+		// 这类 Host 通常来自 ALB/kubelet 健康检查，永远不会是合法的租户域名
+		if isPrivateHost(host) {
 			c.Next()
 			return
 		}

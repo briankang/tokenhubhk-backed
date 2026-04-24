@@ -109,11 +109,18 @@ func (l *EventLogger) LogWithdrawalEventInput(ctx context.Context, evt Withdrawa
 
 func (l *EventLogger) write(ctx context.Context, evt PaymentEvent) {
 	if err := l.writeOnce(ctx, evt); err != nil {
-		logger.L.Warn("payment event log write failed",
+		log().Warn("payment event log write failed",
 			zap.String("event_type", evt.EventType),
 			zap.Error(err),
 		)
 	}
+}
+
+func log() *zap.Logger {
+	if logger.L == nil {
+		return zap.NewNop()
+	}
+	return logger.L
 }
 
 func (l *EventLogger) writeOnce(ctx context.Context, evt PaymentEvent) error {

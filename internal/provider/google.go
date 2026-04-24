@@ -179,14 +179,14 @@ func (p *GoogleProvider) convertRequest(req *ChatRequest) *geminiRequest {
 	for _, m := range req.Messages {
 		if m.Role == "system" {
 			systemContent = &geminiContent{
-				Parts: []geminiPart{{Text: m.Content}},
+				Parts: []geminiPart{{Text: TextContent(m.Content)}},
 			}
 			continue
 		}
 		role := mapGeminiRole(m.Role)
 		contents = append(contents, geminiContent{
 			Role:  role,
-			Parts: []geminiPart{{Text: m.Content}},
+			Parts: []geminiPart{{Text: TextContent(m.Content)}},
 		})
 	}
 

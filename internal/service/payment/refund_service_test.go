@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	goredis "github.com/redis/go-redis/v9"
@@ -14,7 +17,24 @@ import (
 	"tokenhub-server/internal/model"
 )
 
-// fakeGatewayInvoker 模拟网关调用
+func waitForPaymentEventLogCount(t *testing.T, db *gorm.DB, eventType string, want int64) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var cnt int64
+		db.Model(&model.PaymentEventLog{}).Where("event_type = ?", eventType).Count(&cnt)
+		if cnt == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d event log(s) for %s, got %d", want, eventType, cnt)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// fakeGatewayInvoker mocks gateway calls.
 type fakeGatewayInvoker struct {
 	shouldFail bool
 	called     int
@@ -38,10 +58,16 @@ func (f *fakeGatewayInvoker) InvokeGatewayRefund(ctx context.Context, payment *m
 
 func setupRefundTest(t *testing.T) (*RefundService, *gorm.DB, *goredis.Client, *miniredis.Miniredis, *fakeGatewayInvoker) {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	dbName := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
+	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", dbName)), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("db open: %v", err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db handle: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
 	// SQLite does not enforce FK; migrate only the tables needed
 	err = db.AutoMigrate(
 		&model.Payment{},
@@ -63,21 +89,21 @@ func setupRefundTest(t *testing.T) (*RefundService, *gorm.DB, *goredis.Client, *
 	return svc, db, rdb, mr, inv
 }
 
-// 辅助：创建一笔已完成支付
+// 鏉堝懎濮敍姘灡瀵よ桨绔寸粭鏂垮嚒鐎瑰本鍨氶弨顖欑帛
 func createCompletedPayment(t *testing.T, db *gorm.DB, userID uint, amount float64) *model.Payment {
 	t.Helper()
 	meta, _ := json.Marshal(map[string]interface{}{"order_no": "ORD123"})
 	p := &model.Payment{
-		UserID:   userID,
-		TenantID: 1,
-		Amount:   amount,
-		Currency: "CNY",
+		UserID:           userID,
+		TenantID:         1,
+		Amount:           amount,
+		Currency:         "CNY",
 		OriginalCurrency: "CNY",
-		Gateway:  "wechat",
-		Status:   model.PaymentStatusCompleted,
-		RMBAmount: amount,
-		CreditAmount: int64(amount * 10000),
-		Metadata: meta,
+		Gateway:          "wechat",
+		Status:           model.PaymentStatusCompleted,
+		RMBAmount:        amount,
+		CreditAmount:     int64(amount * 10000),
+		Metadata:         meta,
 	}
 	if err := db.Create(p).Error; err != nil {
 		t.Fatalf("create payment: %v", err)
@@ -85,14 +111,14 @@ func createCompletedPayment(t *testing.T, db *gorm.DB, userID uint, amount float
 	return p
 }
 
-// 辅助：创建用户余额
+// createUserBalance creates a user balance for refund tests.
 func createUserBalance(t *testing.T, db *gorm.DB, userID uint, balance int64) {
 	t.Helper()
 	ub := &model.UserBalance{
-		UserID:     userID,
-		TenantID:   1,
-		Balance:    balance,
-		Currency:   "CREDIT",
+		UserID:   userID,
+		TenantID: 1,
+		Balance:  balance,
+		Currency: "CREDIT",
 	}
 	if err := db.Create(ub).Error; err != nil {
 		t.Fatalf("create balance: %v", err)
@@ -115,12 +141,7 @@ func TestRefundService_SubmitUserRequest_Success(t *testing.T) {
 	if req.Status != model.RefundStatusPending {
 		t.Errorf("status = %s, want pending", req.Status)
 	}
-	// 事件日志应写入
-	var cnt int64
-	db.Model(&model.PaymentEventLog{}).Where("event_type = ?", model.EventRefundRequested).Count(&cnt)
-	if cnt != 1 {
-		t.Errorf("expected 1 event log, got %d", cnt)
-	}
+	waitForPaymentEventLogCount(t, db, model.EventRefundRequested, 1)
 }
 
 func TestRefundService_SubmitUserRequest_NotOwner(t *testing.T) {
@@ -128,7 +149,7 @@ func TestRefundService_SubmitUserRequest_NotOwner(t *testing.T) {
 	p := createCompletedPayment(t, db, 1, 100.0)
 
 	_, err := svc.SubmitUserRequest(context.Background(), SubmitUserRequestInput{
-		UserID:    999, // 非 owner
+		UserID:    999, // 闂?owner
 		PaymentID: uint64(p.ID),
 		AmountRMB: 50.0,
 		Reason:    "x should be rejected!!",
@@ -161,8 +182,7 @@ func TestRefundService_SubmitUserRequest_ExceedAmount(t *testing.T) {
 	_, err := svc.SubmitUserRequest(context.Background(), SubmitUserRequestInput{
 		UserID:    1,
 		PaymentID: uint64(p.ID),
-		AmountRMB: 200.0, // 超额
-		Reason:    "too much ten chars",
+		AmountRMB: 200.0, // 鐡掑懘顤?		Reason:    "too much ten chars",
 	})
 	if err == nil {
 		t.Errorf("expected amount check error")
@@ -173,7 +193,7 @@ func TestRefundService_SubmitUserRequest_DuplicatePending(t *testing.T) {
 	svc, db, _, _, _ := setupRefundTest(t)
 	p := createCompletedPayment(t, db, 1, 100.0)
 
-	// 先创建一笔 pending
+	// 閸忓牆鍨卞杞扮缁?pending
 	_, err := svc.SubmitUserRequest(context.Background(), SubmitUserRequestInput{
 		UserID:    1,
 		PaymentID: uint64(p.ID),
@@ -183,7 +203,7 @@ func TestRefundService_SubmitUserRequest_DuplicatePending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	// 再来一笔应失败
+	// A second pending refund for the same payment should fail.
 	_, err = svc.SubmitUserRequest(context.Background(), SubmitUserRequestInput{
 		UserID:    1,
 		PaymentID: uint64(p.ID),
@@ -198,9 +218,12 @@ func TestRefundService_SubmitUserRequest_DuplicatePending(t *testing.T) {
 func TestRefundService_RejectByAdmin_Success(t *testing.T) {
 	svc, db, _, _, _ := setupRefundTest(t)
 	p := createCompletedPayment(t, db, 1, 100.0)
-	req, _ := svc.SubmitUserRequest(context.Background(), SubmitUserRequestInput{
+	req, err := svc.SubmitUserRequest(context.Background(), SubmitUserRequestInput{
 		UserID: 1, PaymentID: uint64(p.ID), AmountRMB: 50, Reason: "reason tencharshere",
 	})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
 
 	if err := svc.RejectByAdmin(context.Background(), req.ID, 999, "denied reason"); err != nil {
 		t.Fatalf("reject: %v", err)
@@ -224,7 +247,7 @@ func TestRefundService_ApproveByAdmin_AlreadyRejected(t *testing.T) {
 	})
 	_ = svc.RejectByAdmin(context.Background(), req.ID, 1, "reject")
 
-	// 再通过应失败
+	// Approving a rejected refund should fail.
 	if err := svc.ApproveByAdmin(context.Background(), req.ID, 2, "approve"); err == nil {
 		t.Errorf("expected status transition error")
 	}

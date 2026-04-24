@@ -25,6 +25,7 @@ import (
 	"tokenhub-server/internal/provider"
 	"tokenhub-server/internal/service/apikey"
 	balancesvc "tokenhub-server/internal/service/balance"
+	billingsvc "tokenhub-server/internal/service/billing"
 	channelsvc "tokenhub-server/internal/service/channel"
 	codingsvc "tokenhub-server/internal/service/coding"
 	"tokenhub-server/internal/service/parammapping"
@@ -38,6 +39,7 @@ type AudioHandler struct {
 	channelRouter *channelsvc.ChannelRouter
 	apiKeySvc     *apikey.ApiKeyService
 	balanceSvc    *balancesvc.BalanceService
+	billingSvc    *billingsvc.Service
 	paramSvc      *parammapping.ParamMappingService
 	pricingCalc   *pricing.PricingCalculator
 	logger        *zap.Logger
@@ -59,6 +61,7 @@ func NewAudioHandler(
 		channelRouter: channelRouter,
 		apiKeySvc:     apiKeySvc,
 		balanceSvc:    balSvc,
+		billingSvc:    billingsvc.NewService(db, pricingCalc, balSvc),
 		paramSvc:      paramSvc,
 		pricingCalc:   pricingCalc,
 		logger:        logger.L,
@@ -84,7 +87,7 @@ type ttsRequest struct {
 func (h *AudioHandler) SynthesizeSpeech(c *gin.Context) {
 	// 1. 认证
 	keyInfo, err := h.authenticateAPIKey(c)
-	if err != nil {
+	if err != nil || keyInfo == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": gin.H{"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"},
 		})
@@ -127,6 +130,26 @@ func (h *AudioHandler) SynthesizeSpeech(c *gin.Context) {
 		}
 	}
 	start := time.Now()
+	ttsCharCount := len([]rune(req.Input))
+	ttsFreezeID := ""
+	if h.billingSvc != nil {
+		freeze, fErr := h.billingSvc.FreezeUnitUsage(c.Request.Context(), billingsvc.UnitUsageRequest{
+			RequestID: requestID,
+			UserID:    keyInfo.UserID,
+			TenantID:  keyInfo.TenantID,
+			ModelName: req.Model,
+			Usage:     pricing.UsageInput{CharCount: ttsCharCount},
+		})
+		if fErr != nil {
+			c.JSON(http.StatusPaymentRequired, gin.H{"error": gin.H{"message": "Insufficient balance", "type": "insufficient_quota"}})
+			return
+		}
+		if freeze != nil {
+			ttsFreezeID = freeze.FreezeID
+			c.Set("estimated_cost_credits", freeze.EstimatedCostCredits)
+			c.Set("estimated_cost_units", freeze.EstimatedCostUnits)
+		}
+	}
 
 	// 3. 余额
 	if h.balanceSvc != nil {
@@ -143,8 +166,8 @@ func (h *AudioHandler) SynthesizeSpeech(c *gin.Context) {
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		result, err := h.channelRouter.SelectChannelWithExcludes(
-			c.Request.Context(), req.Model, customChannelID, keyInfo.UserID, excludeChannelIDs)
+		result, err := h.channelRouter.SelectChannelForCapability(
+			c.Request.Context(), req.Model, customChannelID, keyInfo.UserID, model.CapabilityTTS, excludeChannelIDs)
 		if err != nil {
 			lastErr = fmt.Errorf("no channel for %s: %w", req.Model, err)
 			break
@@ -214,9 +237,9 @@ func (h *AudioHandler) SynthesizeSpeech(c *gin.Context) {
 		h.recordLog(ch.ID, actualModel, keyInfo, requestID, int(latency), 200, "")
 
 		// 计费：TTS 按字符数计费，使用 rune 长度避免中文字符计数偏差
-		charCount := len([]rune(req.Input))
-		costCredits, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, pricing.UsageInput{CharCount: charCount}, requestID)
-		h.recordApiCallLog(keyInfo, ch, requestID, req.Model, actualModel, "/v1/audio/speech", c.ClientIP(), int(latency), 200, costCredits, costRMB, rawBody, charCount, 0)
+		charCount := ttsCharCount
+		costCredits, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, pricing.UsageInput{CharCount: charCount}, requestID, ttsFreezeID)
+		h.recordApiCallLog(c, keyInfo, ch, requestID, req.Model, actualModel, "/v1/audio/speech", c.ClientIP(), int(latency), 200, costCredits, costRMB, rawBody, charCount, 0)
 
 		h.logger.Info("v1 tts: 合成成功",
 			zap.String("model", req.Model),
@@ -245,6 +268,7 @@ func (h *AudioHandler) SynthesizeSpeech(c *gin.Context) {
 		msg = lastErr.Error()
 	}
 	c.Header("X-Request-ID", requestID)
+	_ = releaseFrozenWithBillingService(c, h.billingSvc, ttsFreezeID)
 	c.JSON(http.StatusBadGateway, gin.H{
 		"error":      gin.H{"message": msg, "type": "server_error"},
 		"request_id": requestID,
@@ -255,7 +279,7 @@ func (h *AudioHandler) SynthesizeSpeech(c *gin.Context) {
 func (h *AudioHandler) TranscribeSpeech(c *gin.Context) {
 	// 1. 认证
 	keyInfo, err := h.authenticateAPIKey(c)
-	if err != nil {
+	if err != nil || keyInfo == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": gin.H{"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"},
 		})
@@ -306,6 +330,26 @@ func (h *AudioHandler) TranscribeSpeech(c *gin.Context) {
 		}
 	}
 	start := time.Now()
+	estimatedDurationSec := float64(len(audioBytes)) / 16000.0
+	asrFreezeID := ""
+	if h.billingSvc != nil {
+		freeze, fErr := h.billingSvc.FreezeUnitUsage(c.Request.Context(), billingsvc.UnitUsageRequest{
+			RequestID: requestID,
+			UserID:    keyInfo.UserID,
+			TenantID:  keyInfo.TenantID,
+			ModelName: modelName,
+			Usage:     pricing.UsageInput{DurationSec: estimatedDurationSec},
+		})
+		if fErr != nil {
+			c.JSON(http.StatusPaymentRequired, gin.H{"error": gin.H{"message": "Insufficient balance", "type": "insufficient_quota"}})
+			return
+		}
+		if freeze != nil {
+			asrFreezeID = freeze.FreezeID
+			c.Set("estimated_cost_credits", freeze.EstimatedCostCredits)
+			c.Set("estimated_cost_units", freeze.EstimatedCostUnits)
+		}
+	}
 
 	// 3. 余额
 	if h.balanceSvc != nil {
@@ -322,8 +366,8 @@ func (h *AudioHandler) TranscribeSpeech(c *gin.Context) {
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		result, err := h.channelRouter.SelectChannelWithExcludes(
-			c.Request.Context(), modelName, customChannelID, keyInfo.UserID, excludeChannelIDs)
+		result, err := h.channelRouter.SelectChannelForCapability(
+			c.Request.Context(), modelName, customChannelID, keyInfo.UserID, model.CapabilityASR, excludeChannelIDs)
 		if err != nil {
 			lastErr = fmt.Errorf("no channel for %s: %w", modelName, err)
 			break
@@ -390,15 +434,15 @@ func (h *AudioHandler) TranscribeSpeech(c *gin.Context) {
 		durationSec := resp.Duration
 		if durationSec <= 0 {
 			// 128 kbps = 16 KB/s；估算时长 = bytes / 16000，保守偏少不会超扣
-			durationSec = float64(len(audioBytes)) / 16000.0
+			durationSec = estimatedDurationSec
 			h.logger.Warn("v1 asr: 上游未返回 duration，按文件大小估算",
 				zap.String("request_id", requestID),
 				zap.Int("bytes", len(audioBytes)),
 				zap.Float64("estimated_sec", durationSec))
 		}
-		costCredits, costRMB := h.calculateAndDeductCost(c, modelName, keyInfo, pricing.UsageInput{DurationSec: durationSec}, requestID)
+		costCredits, costRMB := h.calculateAndDeductCost(c, modelName, keyInfo, pricing.UsageInput{DurationSec: durationSec}, requestID, asrFreezeID)
 		asrSummary := []byte(fmt.Sprintf(`{"model":"%s","bytes":%d,"language":"%s"}`, modelName, len(audioBytes), language))
-		h.recordApiCallLog(keyInfo, ch, requestID, modelName, actualModel, "/v1/audio/transcriptions", c.ClientIP(), int(latency), 200, costCredits, costRMB, asrSummary, 0, durationSec)
+		h.recordApiCallLog(c, keyInfo, ch, requestID, modelName, actualModel, "/v1/audio/transcriptions", c.ClientIP(), int(latency), 200, costCredits, costRMB, asrSummary, 0, durationSec)
 
 		h.logger.Info("v1 asr: 识别成功",
 			zap.String("model", modelName),
@@ -426,6 +470,7 @@ func (h *AudioHandler) TranscribeSpeech(c *gin.Context) {
 		msg = lastErr.Error()
 	}
 	c.Header("X-Request-ID", requestID)
+	_ = releaseFrozenWithBillingService(c, h.billingSvc, asrFreezeID)
 	c.JSON(http.StatusBadGateway, gin.H{
 		"error":      gin.H{"message": msg, "type": "server_error"},
 		"request_id": requestID,
@@ -464,36 +509,68 @@ func (h *AudioHandler) recordLog(channelID uint, modelName string, keyInfo *apik
 
 // calculateAndDeductCost 按计费单位计算费用并扣减余额
 func (h *AudioHandler) calculateAndDeductCost(
-	c *gin.Context, modelName string, keyInfo *apikey.ApiKeyInfo, usage pricing.UsageInput, requestID string,
+	c *gin.Context, modelName string, keyInfo *apikey.ApiKeyInfo, usage pricing.UsageInput, requestID string, freezeID string,
 ) (int64, float64) {
+	if h.billingSvc != nil {
+		out, err := h.billingSvc.SettleUnitUsage(c.Request.Context(), billingsvc.UnitUsageRequest{
+			RequestID: requestID,
+			UserID:    keyInfo.UserID,
+			TenantID:  keyInfo.TenantID,
+			ModelName: modelName,
+			Usage:     usage,
+			FreezeID:  freezeID,
+		})
+		if out == nil {
+			return 0, 0
+		}
+		applyUnitBillingOutcomeToContext(c, out)
+		if err != nil {
+			h.logger.Error("v1 audio 鎵ｈ垂澶辫触锛岄渶瑕佷汉宸ュ璐?",
+				zap.Error(err),
+				zap.String("request_id", requestID),
+				zap.Uint("user_id", keyInfo.UserID),
+				zap.String("model", modelName),
+				zap.Int64("cost_credits", out.CostCredits))
+		}
+		return out.CostCredits, out.CostRMB
+	}
 	if h.pricingCalc == nil {
 		return 0, 0
 	}
 	ctx := c.Request.Context()
-	var aiModel model.AIModel
-	if err := h.db.WithContext(ctx).Where("model_name = ? AND is_active = true", modelName).First(&aiModel).Error; err != nil {
+	aiModel, billedModel := findActiveModelByRequestOrActual(ctx, h.db, modelName, modelName)
+	if aiModel == nil {
 		return 0, 0
 	}
-	costResult, err := h.pricingCalc.CalculateCostByUnit(ctx, aiModel.ID, keyInfo.TenantID, 0, usage)
+	costResult, err := h.pricingCalc.CalculateCostByUnit(ctx, keyInfo.UserID, aiModel.ID, keyInfo.TenantID, 0, usage)
 	if err != nil || costResult == nil {
 		return 0, 0
 	}
 	if h.balanceSvc != nil && costResult.TotalCost > 0 {
-		if dErr := h.balanceSvc.DeductForRequest(ctx, keyInfo.UserID, keyInfo.TenantID, costResult.TotalCost, modelName, requestID); dErr != nil {
+		if dErr := h.balanceSvc.DeductForRequest(ctx, keyInfo.UserID, keyInfo.TenantID, costResult.TotalCost, billedModel, requestID); dErr != nil {
 			h.logger.Error("v1 audio 扣费失败，需要人工对账",
 				zap.Error(dErr),
 				zap.String("request_id", requestID),
 				zap.Uint("user_id", keyInfo.UserID),
-				zap.String("model", modelName),
+				zap.String("model", billedModel),
 				zap.Int64("cost_credits", costResult.TotalCost))
+			setUnitBillingContext(c, requestID, billedModel, aiModel, costResult, usage, "deduct_failed", 0, costResult.TotalCost)
+			return costResult.TotalCost, costResult.TotalCostRMB
 		}
 	}
+	status := "no_charge"
+	actualCredits := int64(0)
+	if costResult.TotalCost > 0 {
+		status = "settled"
+		actualCredits = costResult.TotalCost
+	}
+	setUnitBillingContext(c, requestID, billedModel, aiModel, costResult, usage, status, actualCredits, 0)
 	return costResult.TotalCost, costResult.TotalCostRMB
 }
 
 // recordApiCallLog 异步写入 /v1/audio/* 的全链路日志
 func (h *AudioHandler) recordApiCallLog(
-	keyInfo *apikey.ApiKeyInfo, ch *model.Channel, requestID, requestModel, actualModel, endpoint, clientIP string,
+	c *gin.Context, keyInfo *apikey.ApiKeyInfo, ch *model.Channel, requestID, requestModel, actualModel, endpoint, clientIP string,
 	latencyMs, statusCode int, costCredits int64, costRMB float64, rawBody []byte, charCount int, durationSec float64,
 ) {
 	callLog := &model.ApiCallLog{
@@ -507,7 +584,7 @@ func (h *AudioHandler) recordApiCallLog(
 		ActualModel:       actualModel,
 		ChannelID:         ch.ID,
 		ChannelName:       ch.Name,
-		SupplierName:      ch.Supplier.Name,
+		SupplierName:      resolveChannelSupplierName(c.Request.Context(), h.db, ch),
 		StatusCode:        statusCode,
 		TotalLatencyMs:    latencyMs,
 		UpstreamLatencyMs: latencyMs,
@@ -523,6 +600,7 @@ func (h *AudioHandler) recordApiCallLog(
 	if rawBody != nil && len(rawBody) > 0 {
 		callLog.RequestBody = string(rawBody)
 	}
+	applyMatchedTierFromCtx(c, callLog)
 	go func() {
 		if err := h.db.Create(callLog).Error; err != nil {
 			h.logger.Error("v1 audio: 记录API调用日志失败", zap.Error(err))

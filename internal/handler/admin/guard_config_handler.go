@@ -35,12 +35,7 @@ func (h *GuardConfigHandler) Register(rg *gin.RouterGroup) {
 // GET /api/v1/admin/guard-config
 func (h *GuardConfigHandler) GetConfig(c *gin.Context) {
 	cfg := h.svc.GetConfig(c.Request.Context())
-	// 不返回明文 secret (仅前端感知是否已设置)
-	safe := *cfg
-	if safe.CaptchaSecretEnc != "" {
-		safe.CaptchaSecretEnc = "***SET***"
-	}
-	response.Success(c, safe)
+	response.Success(c, cfg)
 }
 
 // UpdateConfig 更新风控配置
@@ -48,23 +43,22 @@ func (h *GuardConfigHandler) GetConfig(c *gin.Context) {
 // 字段边界见 v3.1 plan 的软校验表
 func (h *GuardConfigHandler) UpdateConfig(c *gin.Context) {
 	var req struct {
-		CaptchaEnabled         *bool   `json:"captchaEnabled"`
-		CaptchaProvider        *string `json:"captchaProvider"`
-		CaptchaSiteKey         *string `json:"captchaSiteKey"`
-		CaptchaSecretEnc       *string `json:"captchaSecretEnc"`
-		EmailOTPEnabled        *bool   `json:"emailOtpEnabled"`
-		EmailOTPLength         *int    `json:"emailOtpLength"`
-		EmailOTPTTLSeconds     *int    `json:"emailOtpTtlSeconds"`
-		IPRegLimitPerHour      *int    `json:"ipRegLimitPerHour"`
-		IPRegLimitPerDay       *int    `json:"ipRegLimitPerDay"`
-		EmailDomainDailyMax    *int    `json:"emailDomainDailyMax"`
-		FingerprintEnabled     *bool   `json:"fingerprintEnabled"`
-		FingerprintDailyMax    *int    `json:"fingerprintDailyMax"`
-		MinFormDwellSeconds    *int    `json:"minFormDwellSeconds"`
-		IPReputationEnabled    *bool   `json:"ipReputationEnabled"`
-		BlockVPN               *bool   `json:"blockVpn"`
-		BlockTor               *bool   `json:"blockTor"`
-		DisposableEmailBlocked *bool   `json:"disposableEmailBlocked"`
+		EmailOTPEnabled        *bool   `json:"email_otp_enabled"`
+		EmailOTPLength         *int    `json:"email_otp_length"`
+		EmailOTPTTLSeconds     *int    `json:"email_otp_ttl_seconds"`
+		IPRegLimitPerHour      *int    `json:"ip_reg_limit_per_hour"`
+		IPRegLimitPerDay       *int    `json:"ip_reg_limit_per_day"`
+		EmailDomainDailyMax    *int    `json:"email_domain_daily_max"`
+		FingerprintEnabled     *bool   `json:"fingerprint_enabled"`
+		FingerprintDailyMax    *int    `json:"fingerprint_daily_max"`
+		MinFormDwellSeconds    *int    `json:"min_form_dwell_seconds"`
+		IPReputationEnabled    *bool   `json:"ip_reputation_enabled"`
+		BlockVPN               *bool   `json:"block_vpn"`
+		BlockTor               *bool   `json:"block_tor"`
+		DisposableEmailBlocked *bool   `json:"disposable_email_blocked"`
+		FreeUserRPM            *int    `json:"free_user_rpm"`
+		FreeUserTPM            *int    `json:"free_user_tpm"`
+		FreeUserConcurrency    *int    `json:"free_user_concurrency"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, http.StatusBadRequest, errcode.ErrBadRequest)
@@ -73,23 +67,6 @@ func (h *GuardConfigHandler) UpdateConfig(c *gin.Context) {
 
 	cfg := h.svc.GetConfig(c.Request.Context())
 
-	if req.CaptchaEnabled != nil {
-		cfg.CaptchaEnabled = *req.CaptchaEnabled
-	}
-	if req.CaptchaProvider != nil {
-		v := *req.CaptchaProvider
-		if v != "turnstile" && v != "hcaptcha" && v != "recaptcha" {
-			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "captchaProvider must be turnstile|hcaptcha|recaptcha")
-			return
-		}
-		cfg.CaptchaProvider = v
-	}
-	if req.CaptchaSiteKey != nil {
-		cfg.CaptchaSiteKey = *req.CaptchaSiteKey
-	}
-	if req.CaptchaSecretEnc != nil && *req.CaptchaSecretEnc != "" && *req.CaptchaSecretEnc != "***SET***" {
-		cfg.CaptchaSecretEnc = *req.CaptchaSecretEnc
-	}
 	if req.EmailOTPEnabled != nil {
 		cfg.EmailOTPEnabled = *req.EmailOTPEnabled
 	}
@@ -164,17 +141,22 @@ func (h *GuardConfigHandler) UpdateConfig(c *gin.Context) {
 	if req.DisposableEmailBlocked != nil {
 		cfg.DisposableEmailBlocked = *req.DisposableEmailBlocked
 	}
+	if req.FreeUserRPM != nil {
+		cfg.FreeUserRPM = *req.FreeUserRPM
+	}
+	if req.FreeUserTPM != nil {
+		cfg.FreeUserTPM = *req.FreeUserTPM
+	}
+	if req.FreeUserConcurrency != nil {
+		cfg.FreeUserConcurrency = *req.FreeUserConcurrency
+	}
 
 	if err := h.svc.UpdateConfig(c.Request.Context(), cfg); err != nil {
 		response.Error(c, http.StatusInternalServerError, errcode.ErrInternal)
 		return
 	}
-	// 回显时屏蔽 secret
-	safe := *cfg
-	if safe.CaptchaSecretEnc != "" {
-		safe.CaptchaSecretEnc = "***SET***"
-	}
-	response.Success(c, safe)
+	
+	response.Success(c, cfg)
 }
 
 // ListDisposable 分页查询一次性邮箱域名

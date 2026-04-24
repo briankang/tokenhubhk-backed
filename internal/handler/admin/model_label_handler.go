@@ -25,26 +25,27 @@ func NewModelLabelHandler(db *gorm.DB) *ModelLabelHandler {
 // upsertLabelReq 单个标签新增/更新请求
 type upsertLabelReq struct {
 	LabelKey   string `json:"label_key"   binding:"required,max=50"`
-	LabelValue string `json:"label_value" binding:"required,max=100"`
+	LabelValue string `json:"label_value" binding:"max=100"`
 }
 
 // removeLabelReq 单个标签删除请求
 type removeLabelReq struct {
 	LabelKey   string `json:"label_key"   binding:"required,max=50"`
-	LabelValue string `json:"label_value" binding:"required,max=100"`
+	LabelValue string `json:"label_value" binding:"max=100"`
 }
 
 // batchAssignLabelReq 批量添加标签请求
 type batchAssignLabelReq struct {
 	ModelIDs   []uint `json:"model_ids"   binding:"required,min=1"`
 	LabelKey   string `json:"label_key"   binding:"required,max=50"`
-	LabelValue string `json:"label_value" binding:"required,max=100"`
+	LabelValue string `json:"label_value" binding:"max=100"`
 }
 
 // batchRemoveLabelReq 批量删除标签请求
 type batchRemoveLabelReq struct {
-	ModelIDs []uint `json:"model_ids" binding:"required,min=1"`
-	LabelKey string `json:"label_key" binding:"required,max=50"`
+	ModelIDs   []uint `json:"model_ids"   binding:"required,min=1"`
+	LabelKey   string `json:"label_key"   binding:"required,max=50"`
+	LabelValue string `json:"label_value"` // 可选：不传则删除该 key 下所有标签
 }
 
 // ListByModel GET /admin/ai-models/:id/labels
@@ -176,8 +177,12 @@ func (h *ModelLabelHandler) BatchRemove(c *gin.Context) {
 	}
 
 	// 硬删除：避免软删除残留占用唯一索引，导致后续重新打标冲突
-	result := h.db.Unscoped().Where("model_id IN ? AND label_key = ?", req.ModelIDs, req.LabelKey).
-		Delete(&model.ModelLabel{})
+	query := h.db.Unscoped().Where("model_id IN ? AND label_key = ?", req.ModelIDs, req.LabelKey)
+	// 如果指定了 label_value，则只删除精确匹配的标签
+	if req.LabelValue != "" {
+		query = query.Where("label_value = ?", req.LabelValue)
+	}
+	result := query.Delete(&model.ModelLabel{})
 	if result.Error != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, result.Error.Error())
 		return

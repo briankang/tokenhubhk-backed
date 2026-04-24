@@ -15,9 +15,11 @@ import (
 	"tokenhub-server/internal/pkg/credits"
 	pkgredis "tokenhub-server/internal/pkg/redis"
 	"tokenhub-server/internal/service/referral"
+	"tokenhub-server/internal/service/usercache"
 )
 
 const (
+	// balanceCachePrefix 兼容保留给 payment_service 的旧 DEL 调用（即将移除）
 	balanceCachePrefix = "balance:user:"
 	balanceCacheTTL    = 5 * time.Minute
 )
@@ -38,6 +40,7 @@ func NewBalanceService(db *gorm.DB, redis *goredis.Client) *BalanceService {
 }
 
 // GetBalance 获取指定用户的余额记录，若不存在则自动创建
+// v5.1: 读取时自动检查免费额度是否已过期（懒清理）
 func (s *BalanceService) GetBalance(ctx context.Context, userID, tenantID uint) (*model.UserBalance, error) {
 	var ub model.UserBalance
 	err := s.db.WithContext(ctx).Where("user_id = ?", userID).First(&ub).Error
@@ -56,27 +59,59 @@ func (s *BalanceService) GetBalance(ctx context.Context, userID, tenantID uint) 
 		}
 		return nil, fmt.Errorf("get balance: %w", err)
 	}
+	// v5.1: 懒清理过期免费额度
+	s.expireFreeQuotaIfNeeded(ctx, &ub)
 	return &ub, nil
 }
 
-// GetBalanceCached 带 Redis 缓存的余额查询
-func (s *BalanceService) GetBalanceCached(ctx context.Context, userID, tenantID uint) (*model.UserBalance, error) {
-	if s.redis != nil {
-		key := balanceCachePrefix + strconv.FormatUint(uint64(userID), 10)
-		// 尝试从缓存读取（仅检查是否存在）
-		val, err := s.redis.Get(ctx, key).Result()
-		if err == nil && val != "" {
-			// 缓存命中 — 仍查询数据库保证一致性
-		}
-		defer func() {
-			_ = s.redis.Set(ctx, key, "1", balanceCacheTTL).Err()
-		}()
+// expireFreeQuotaIfNeeded v5.1: 免费额度过期懒清理
+// 若 FreeQuotaExpiredAt 已过且仍有免费额度，则清零并记录 EXPIRED 流水
+func (s *BalanceService) expireFreeQuotaIfNeeded(ctx context.Context, ub *model.UserBalance) {
+	if ub.FreeQuotaExpiredAt == nil || ub.FreeQuota <= 0 {
+		return
 	}
-	return s.GetBalance(ctx, userID, tenantID)
+	if time.Now().Before(*ub.FreeQuotaExpiredAt) {
+		return
+	}
+	// 免费额度已过期，清零
+	expiredAmount := ub.FreeQuota
+	ub.FreeQuota = 0
+	ub.FreeQuotaRMB = 0
+
+	// 异步更新数据库（best-effort，失败不影响读取）
+	go func(ubID uint, expired int64) {
+		s.db.Model(&model.UserBalance{}).Where("id = ?", ubID).
+			Updates(map[string]interface{}{
+				"free_quota":     0,
+				"free_quota_rmb": 0,
+			})
+		// 记录过期流水
+		record := &model.BalanceRecord{
+			UserID:        ub.UserID,
+			TenantID:      ub.TenantID,
+			Type:          "EXPIRED",
+			Amount:        -expired,
+			AmountRMB:     -credits.CreditsToRMB(expired),
+			BeforeBalance: ub.Balance,
+			AfterBalance:  ub.Balance,
+			Remark:        "免费额度已过期自动清零",
+		}
+		s.db.Create(record)
+	}(ub.ID, expiredAmount)
 }
 
-// InvalidateCache 清除指定用户的余额缓存
+// GetBalanceCached 带 Redis 缓存的余额查询（user:balance:{uid}，3min TTL）
+// 写入侧（扣减/充值/退款/管理员调整）必须调用 InvalidateCache 保证下次读到最新值。
+func (s *BalanceService) GetBalanceCached(ctx context.Context, userID, tenantID uint) (*model.UserBalance, error) {
+	return usercache.GetOrLoadBalance[*model.UserBalance](ctx, userID, func(ctx context.Context) (*model.UserBalance, error) {
+		return s.GetBalance(ctx, userID, tenantID)
+	})
+}
+
+// InvalidateCache 清除指定用户的余额缓存（扣减/充值/退款等操作后调用）
 func (s *BalanceService) InvalidateCache(ctx context.Context, userID uint) {
+	usercache.InvalidateBalance(ctx, userID)
+	// 兼容：旧 key 仍可能有残留，一并删除（过渡期）
 	if s.redis != nil {
 		key := balanceCachePrefix + strconv.FormatUint(uint64(userID), 10)
 		_ = s.redis.Del(ctx, key).Err()
@@ -84,20 +119,32 @@ func (s *BalanceService) InvalidateCache(ctx context.Context, userID uint) {
 }
 
 // InitBalance 为新注册用户初始化余额，包含默认免费额度
-// 参数 freeCredits: 赠送的积分数量（int64）
+// v5.1: 同时设置免费额度过期时间（FreeQuotaExpiryDays 天后过期）
 func (s *BalanceService) InitBalance(ctx context.Context, userID, tenantID uint) error {
 	// 获取当前生效的额度配置
 	quota := s.getActiveQuotaConfig(ctx)
 	freeCredits := quota.DefaultFreeQuota + quota.RegistrationBonus
 
+	// v5.1: 计算免费额度过期时间
+	var expiredAt *time.Time
+	expiryDays := quota.FreeQuotaExpiryDays
+	if expiryDays <= 0 {
+		expiryDays = 7 // 默认 7 天
+	}
+	if freeCredits > 0 {
+		t := time.Now().AddDate(0, 0, expiryDays)
+		expiredAt = &t
+	}
+
 	ub := &model.UserBalance{
-		UserID:       userID,
-		TenantID:     tenantID,
-		Balance:      0,
-		BalanceRMB:   0,
-		FreeQuota:    freeCredits,
-		FreeQuotaRMB: credits.CreditsToRMB(freeCredits),
-		Currency:     "CREDIT",
+		UserID:             userID,
+		TenantID:           tenantID,
+		Balance:            0,
+		BalanceRMB:         0,
+		FreeQuota:          freeCredits,
+		FreeQuotaRMB:       credits.CreditsToRMB(freeCredits),
+		Currency:           "CREDIT",
+		FreeQuotaExpiredAt: expiredAt,
 	}
 
 	err := s.db.WithContext(ctx).Create(ub).Error
@@ -158,6 +205,8 @@ func (s *BalanceService) Recharge(ctx context.Context, userID, tenantID uint, cr
 		ub.Balance += creditsAmount
 		ub.BalanceRMB = credits.CreditsToRMB(ub.Balance)
 		ub.FreeQuotaRMB = credits.CreditsToRMB(ub.FreeQuota)
+		// v5.1: 累加累计充值额，用于判定 Free/Paid 用户
+		ub.TotalRecharged += creditsAmount
 
 		if err := tx.Save(&ub).Error; err != nil {
 			return fmt.Errorf("update balance: %w", err)
@@ -913,24 +962,14 @@ func (l *QuotaLimiter) GetUserQuotaConfig(ctx context.Context, userID uint) *mod
 	var cfg model.UserQuotaConfig
 	err := l.db.WithContext(ctx).Where("user_id = ?", userID).First(&cfg).Error
 	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			// 返回默认配置
-			return &model.UserQuotaConfig{
-				UserID:          userID,
-				DailyLimit:      0, // 0 = 无限制
-				MonthlyLimit:    0,
-				MaxTokensPerReq: 32768,
-				MaxConcurrent:   5,
-				CustomRPM:       0,
-			}
-		}
-		// 查询失败时返回默认配置
+		// 无自定义配置时，回退到管理后台配置的"默认用户额度"（Redis 动态加载）
+		d := LoadDefaultUserQuotaConfig()
 		return &model.UserQuotaConfig{
 			UserID:          userID,
-			DailyLimit:      0,
-			MonthlyLimit:    0,
-			MaxTokensPerReq: 32768,
-			MaxConcurrent:   5,
+			DailyLimit:      d.DailyLimit,
+			MonthlyLimit:    d.MonthlyLimit,
+			MaxTokensPerReq: d.MaxTokensPerReq,
+			MaxConcurrent:   d.MaxConcurrent,
 			CustomRPM:       0,
 		}
 	}

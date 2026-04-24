@@ -77,8 +77,10 @@ func TestReferralCodeRegistration(t *testing.T) {
 
 	regResp, regStatus, regErr := doPost(baseURL+"/api/v1/auth/register", map[string]string{
 		"email":         newEmail,
-		"password":      newPass,
+		"password":      authPassword(newEmail, newPass),
 		"name":          "RefTestUser_" + ts,
+		"email_code":    testMagicEmailCode,
+		"invite_code":   testInviteCode,
 		"referral_code": linkData.Code,
 	}, "")
 	if regErr != nil {

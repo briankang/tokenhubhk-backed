@@ -20,12 +20,17 @@ type TierPriceSelection struct {
 	OutputPricePerMillion int64   // 命中阶梯的输出售价（积分/百万 token）
 	InputPriceRMB         float64 // 每百万 token 输入价（人民币）
 	OutputPriceRMB        float64 // 每百万 token 输出价（人民币）
+	// 思考模式输出价（阿里云 qwen3.5-plus/qwen3.6-plus 等；0 = 不区分）
+	// 调用方根据请求是否处于思考模式选择使用 OutputPriceRMB 或 OutputPriceRMBThinking
+	OutputPriceRMBThinking        float64
+	OutputPricePerMillionThinking int64
 	MatchedTier           string  // 命中阶梯名称
 	MatchedTierIdx        int     // 命中阶梯下标（-1=未命中）
 	FromTier              bool    // true=从阶梯得出；false=回退到单价
 	// SellingOverride=true 表示阶梯明确指定了售价（非成本价推导），
 	// 此时跳过 FIXED/MARKUP 折扣链路，仅叠加 DISCOUNT 类型
-	SellingOverride bool
+	SellingOverride         bool
+	SellingOverrideThinking bool // 思考模式输出价是否为阶梯独立售价覆盖
 }
 
 // selectPriceForTokens 根据 (inputTokens, outputTokens) 选择阶梯价格
@@ -61,6 +66,18 @@ func (c *PricingCalculator) selectPriceForTokens(
 					result.OutputPriceRMB = outputRMB
 					result.InputPricePerMillion = credits.RMBToCredits(inputRMB)
 					result.OutputPricePerMillion = credits.RMBToCredits(outputRMB)
+					// 思考模式输出价：优先阶梯售价覆盖 → 模型级售价 → 阶梯成本价
+					thinkingRMB := mp.OutputPriceThinkingRMB
+					if tier.SellingOutputThinkingPrice != nil {
+						thinkingRMB = *tier.SellingOutputThinkingPrice
+						result.SellingOverrideThinking = true
+					} else if thinkingRMB == 0 && tier.OutputPriceThinking > 0 {
+						thinkingRMB = tier.OutputPriceThinking
+					}
+					if thinkingRMB > 0 {
+						result.OutputPriceRMBThinking = thinkingRMB
+						result.OutputPricePerMillionThinking = credits.RMBToCredits(thinkingRMB)
+					}
 					result.MatchedTier = tier.Name
 					result.MatchedTierIdx = idx
 					result.FromTier = true
@@ -73,6 +90,10 @@ func (c *PricingCalculator) selectPriceForTokens(
 					result.OutputPriceRMB = tier.OutputPrice
 					result.InputPricePerMillion = credits.RMBToCredits(tier.InputPrice)
 					result.OutputPricePerMillion = credits.RMBToCredits(tier.OutputPrice)
+					if tier.OutputPriceThinking > 0 {
+						result.OutputPriceRMBThinking = tier.OutputPriceThinking
+						result.OutputPricePerMillionThinking = credits.RMBToCredits(tier.OutputPriceThinking)
+					}
 					result.MatchedTier = tier.Name
 					result.MatchedTierIdx = idx
 					result.FromTier = true

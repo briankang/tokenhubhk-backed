@@ -42,9 +42,14 @@ type SubjectPerms struct {
 }
 
 // Has 判断是否拥有指定权限码
+// SUPER_ADMIN 短路：与 BuiltinRoles.AllPermissions=true 语义对齐；
+// 防止新增 routeMap 条目后未重新 seed 时 SUPER_ADMIN 丢失新权限导致自举失败。
 func (s *SubjectPerms) Has(code string) bool {
 	if s == nil {
 		return false
+	}
+	if s.IsSuperAdmin() {
+		return true
 	}
 	if s.codeSet == nil {
 		s.rebuildCodeSet()
@@ -57,6 +62,9 @@ func (s *SubjectPerms) Has(code string) bool {
 func (s *SubjectPerms) HasAny(codes ...string) bool {
 	if s == nil {
 		return false
+	}
+	if s.IsSuperAdmin() {
+		return true
 	}
 	if s.codeSet == nil {
 		s.rebuildCodeSet()
@@ -90,10 +98,17 @@ func (s *SubjectPerms) rebuildCodeSet() {
 }
 
 // Resolver 权限解析器：从 DB 加载用户角色并合并为 SubjectPerms，带 Redis 缓存
+//
+// 健壮性设计（v4.1 2026-04-21）：
+//   - Redis 操作独立 800ms 超时（redisTimeout）；失败视为 cache miss 不冒泡
+//   - DB 查询整体 2s 超时（dbTimeout）；超时返回明确错误，由上层 LoadSubjectPerms 降级为"无权限"放行
+//   - 目的：防止单 Pod Redis/DB 暂时变慢时，所有 /user/* 请求集中阻塞导致 readinessProbe 失败 → Pod 被标 NotReady → 502
 type Resolver struct {
-	db    *gorm.DB
-	redis *goredis.Client
-	ttl   time.Duration
+	db           *gorm.DB
+	redis        *goredis.Client
+	ttl          time.Duration
+	redisTimeout time.Duration // 单次 Redis 操作超时
+	dbTimeout    time.Duration // 整体 DB 查询超时
 }
 
 // Default 全局默认 Resolver 实例（在 bootstrap/main.go 初始化后赋值）
@@ -105,9 +120,11 @@ func NewResolver(db *gorm.DB, redis *goredis.Client) *Resolver {
 		panic("permission resolver: db is nil")
 	}
 	return &Resolver{
-		db:    db,
-		redis: redis,
-		ttl:   5 * time.Minute,
+		db:           db,
+		redis:        redis,
+		ttl:          5 * time.Minute,
+		redisTimeout: 800 * time.Millisecond,
+		dbTimeout:    2 * time.Second,
 	}
 }
 
@@ -117,15 +134,21 @@ func cacheKey(uid uint) string {
 }
 
 // Resolve 返回 userID 对应的 SubjectPerms，优先读 Redis，缓存未命中时查 DB 并回填
+//
+// 超时策略：
+//   - Redis Get/Set/Del 各自包一个 redisTimeout(800ms) 子 ctx，失败即放弃缓存走 DB
+//   - DB 整体 dbTimeout(2s) 子 ctx，超时返回 ErrTimeout 由上层降级处理
 func (r *Resolver) Resolve(ctx context.Context, userID uint) (*SubjectPerms, error) {
 	if userID == 0 {
 		return nil, errors.New("resolve: userID is zero")
 	}
 
-	// 1. 查 Redis 缓存
+	// 1. 查 Redis 缓存（独立短超时，失败不影响主流程）
 	if r.redis != nil {
 		key := cacheKey(userID)
-		raw, err := r.redis.Get(ctx, key).Result()
+		rctx, rcancel := context.WithTimeout(ctx, r.redisTimeout)
+		raw, err := r.redis.Get(rctx, key).Result()
+		rcancel()
 		if err == nil && raw != "" {
 			var cached SubjectPerms
 			if unmarshalErr := json.Unmarshal([]byte(raw), &cached); unmarshalErr == nil {
@@ -133,26 +156,39 @@ func (r *Resolver) Resolve(ctx context.Context, userID uint) (*SubjectPerms, err
 				return &cached, nil
 			}
 			// JSON 损坏：清掉缓存，走 DB 重建
-			_ = r.redis.Del(ctx, key).Err()
+			delCtx, delCancel := context.WithTimeout(ctx, r.redisTimeout)
+			_ = r.redis.Del(delCtx, key).Err()
+			delCancel()
+		} else if err != nil && !errors.Is(err, goredis.Nil) {
+			// Redis 非 key-miss 错误（网络/超时）记 debug 日志，不阻塞主流程
+			if logger.L != nil {
+				logger.L.Debug("resolver: redis get failed, fallback to db",
+					zap.Uint("user_id", userID),
+					zap.Error(err),
+				)
+			}
 		}
 	}
 
-	// 2. 从 DB 加载
-	perms, err := r.loadFromDB(ctx, userID)
+	// 2. 从 DB 加载（整体超时保护）
+	dbCtx, dbCancel := context.WithTimeout(ctx, r.dbTimeout)
+	defer dbCancel()
+	perms, err := r.loadFromDB(dbCtx, userID)
 	if err != nil {
 		return nil, err
 	}
 
-	// 3. 回填 Redis（Set 失败不影响返回值）
+	// 3. 回填 Redis（短超时，失败只 warn 不阻塞返回）
 	if r.redis != nil {
 		if data, marshalErr := json.Marshal(perms); marshalErr == nil {
-			if setErr := r.redis.Set(ctx, cacheKey(userID), string(data), r.ttl).Err(); setErr != nil {
-				if logger.L != nil {
-					logger.L.Warn("resolver: cache set failed",
-						zap.Uint("user_id", userID),
-						zap.Error(setErr),
-					)
-				}
+			setCtx, setCancel := context.WithTimeout(ctx, r.redisTimeout)
+			setErr := r.redis.Set(setCtx, cacheKey(userID), string(data), r.ttl).Err()
+			setCancel()
+			if setErr != nil && logger.L != nil {
+				logger.L.Warn("resolver: cache set failed",
+					zap.Uint("user_id", userID),
+					zap.Error(setErr),
+				)
 			}
 		}
 	}
@@ -168,9 +204,9 @@ type roleRow struct {
 
 // loadFromDB 从数据库一次性拉取用户的全部角色、权限码、数据范围并合并
 func (r *Resolver) loadFromDB(ctx context.Context, userID uint) (*SubjectPerms, error) {
-	// a. 用户信息（tenant_id + legacy role）
+	// a. 用户信息（仅 tenant_id；v4.0 users.role 已移除）
 	var user model.User
-	if err := r.db.WithContext(ctx).Select("id, tenant_id, role").First(&user, userID).Error; err != nil {
+	if err := r.db.WithContext(ctx).Select("id, tenant_id").First(&user, userID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, fmt.Errorf("resolve: user %d not found", userID)
 		}
@@ -188,26 +224,18 @@ func (r *Resolver) loadFromDB(ctx context.Context, userID uint) (*SubjectPerms, 
 		return nil, fmt.Errorf("resolve: load roles: %w", err)
 	}
 
-	// b.1 过渡期回退：若无 user_roles 记录（如 Phase 1 seed 之后注册的新用户），
-	// 按 users.role 字符串 + LegacyRoleMapping 动态获取对应角色。
-	// Phase 4 删除 users.role 字段后，此分支随之移除。
+	// b.1 兜底：若无 user_roles 记录（极端边界情况），默认为 USER 角色
 	if len(roles) == 0 {
-		fallbackCode, ok := LegacyRoleMapping[user.Role]
-		if !ok {
-			fallbackCode = "USER"
-		}
 		var fallback roleRow
 		if err := r.db.WithContext(ctx).Raw(`
 			SELECT id, code, data_scope FROM roles
 			WHERE code = ? AND deleted_at IS NULL
 			LIMIT 1
-		`, fallbackCode).Scan(&fallback).Error; err == nil && fallback.ID != 0 {
+		`, "USER").Scan(&fallback).Error; err == nil && fallback.ID != 0 {
 			roles = []roleRow{fallback}
 			if logger.L != nil {
-				logger.L.Debug("resolver: legacy role fallback",
+				logger.L.Debug("resolver: default USER role fallback",
 					zap.Uint("user_id", userID),
-					zap.String("legacy_role", user.Role),
-					zap.String("resolved", fallbackCode),
 				)
 			}
 		}

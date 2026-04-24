@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -331,12 +332,38 @@ func (s *CodingService) channelSupportsWildcard(ch model.Channel) bool {
 }
 
 // CreateProviderForChannel 根据渠道配置创建对应的 Provider 实例
-// 根据渠道 Type 字段动态匹配适配器
+// 根据渠道 Type / Endpoint / ApiProtocol 字段动态匹配适配器
 func (s *CodingService) CreateProviderForChannel(ch *model.Channel) provider.Provider {
 	cfg := provider.ProviderConfig{
 		APIKey:  ch.APIKey,
 		BaseURL: ch.Endpoint,
 		Timeout: 120,
+	}
+
+	switch s.supplierCodeForChannel(ch) {
+	case "aliyun_dashscope", "qwen", "dashscope":
+		return provider.NewQwenProvider(cfg)
+	case "volcengine", "talkingdata", "td_huoshan", "doubao":
+		return provider.NewDoubaoProvider(cfg)
+	case "baidu_qianfan", "qianfan":
+		return provider.NewQianfanProvider(cfg)
+	case "tencent_hunyuan", "hunyuan":
+		return provider.NewHunyuanProvider(cfg)
+	case "deepseek":
+		return provider.NewCodingDeepSeekProvider(cfg)
+	}
+
+	// 网宿 AI 网关：按 api_protocol 分派到统一 Wangsu 适配器
+	// endpoint 形如 https://aigateway.edgecloudapp.com/...
+	if containsStr(ch.Endpoint, "aigateway.edgecloudapp.com") {
+		proto := provider.WangsuProtoOpenAI
+		switch ch.ApiProtocol {
+		case "anthropic":
+			proto = provider.WangsuProtoAnthropic
+		case "google_gemini":
+			proto = provider.WangsuProtoGemini
+		}
+		return provider.NewWangsuProvider(ch.APIKey, ch.Endpoint, proto, 120)
 	}
 
 	// 根据渠道端点特征自动识别提供商类型
@@ -356,6 +383,22 @@ func (s *CodingService) CreateProviderForChannel(ch *model.Channel) provider.Pro
 }
 
 // containsStr 检查字符串是否包含子串
+func (s *CodingService) supplierCodeForChannel(ch *model.Channel) string {
+	if ch == nil {
+		return ""
+	}
+	if ch.Supplier.Code != "" {
+		return strings.ToLower(strings.TrimSpace(ch.Supplier.Code))
+	}
+	if s != nil && s.db != nil && ch.SupplierID != 0 {
+		var supplier model.Supplier
+		if err := s.db.Select("code").First(&supplier, ch.SupplierID).Error; err == nil {
+			return strings.ToLower(strings.TrimSpace(supplier.Code))
+		}
+	}
+	return ""
+}
+
 func containsStr(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && contains(s, substr))
 }

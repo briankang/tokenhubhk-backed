@@ -1,8 +1,11 @@
 package database
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -444,8 +447,8 @@ func seedBackupRules(tx *gorm.DB) error {
 		PrimaryGroupID: primary.ID,
 		BackupGroupIDs: mustJSON([]uint{backup.ID}),
 		SwitchRules: mustJSON(map[string]interface{}{
-			"type":                "consecutive_errors",
-			"consecutive_errors":  3,
+			"type":               "consecutive_errors",
+			"consecutive_errors": 3,
 			"window_seconds":     300,
 			"cooldown_seconds":   60,
 		}),
@@ -495,13 +498,11 @@ func seedAdminUser(tx *gorm.DB) error {
 		adminPass  = "admin123456"
 	)
 
-	// Check if already exists
-	var count int64
-	if err := tx.Model(&model.User{}).Where("email = ?", adminEmail).Count(&count).Error; err != nil {
+	var existing model.User
+	if err := tx.Where("email = ?", adminEmail).First(&existing).Error; err == nil {
+		return ensureDefaultAdminPasswordHash(tx, &existing, adminPass)
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return fmt.Errorf("check admin: %w", err)
-	}
-	if count > 0 {
-		return nil
 	}
 
 	// Ensure tenant exists
@@ -520,7 +521,7 @@ func seedAdminUser(tx *gorm.DB) error {
 		}
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(adminPass), 12)
+	hash, err := bcrypt.GenerateFromPassword([]byte(clientPasswordHash(adminEmail, adminPass)), 12)
 	if err != nil {
 		return fmt.Errorf("bcrypt hash: %w", err)
 	}
@@ -530,14 +531,36 @@ func seedAdminUser(tx *gorm.DB) error {
 		Email:        adminEmail,
 		PasswordHash: string(hash),
 		Name:         adminUser,
-		Role:         "ADMIN",
 		IsActive:     true,
 		Language:     "zh",
 	}
 	if err := tx.Create(&user).Error; err != nil {
 		return fmt.Errorf("create admin user: %w", err)
 	}
+	// v4.0: 用户角色由 permission.Seed() 回填为 SUPER_ADMIN
+	return nil
+}
 
+func clientPasswordHash(email, password string) string {
+	sum := sha256.Sum256([]byte(password + strings.ToLower(strings.TrimSpace(email))))
+	return fmt.Sprintf("%x", sum)
+}
+
+func ensureDefaultAdminPasswordHash(db *gorm.DB, user *model.User, defaultPassword string) error {
+	clientHash := clientPasswordHash(user.Email, defaultPassword)
+	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(clientHash)) == nil {
+		return nil
+	}
+	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(defaultPassword)) != nil {
+		return nil
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(clientHash), 12)
+	if err != nil {
+		return fmt.Errorf("hash default admin client password: %w", err)
+	}
+	if err := db.Model(&model.User{}).Where("id = ?", user.ID).Update("password_hash", string(hash)).Error; err != nil {
+		return fmt.Errorf("migrate default admin password hash: %w", err)
+	}
 	return nil
 }
 
@@ -581,6 +604,18 @@ func seedPaymentConfig(tx *gorm.DB) error {
 	}
 
 	return nil
+}
+
+// RunSeedPaymentConfig 独立初始化支付渠道配置，与 RunSeed 解耦。
+// 用途：PolarDB/生产环境 suppliers 非空时 RunSeed 会提前退出，本函数确保各环境均能完成支付配置初始化。
+func RunSeedPaymentConfig(db *gorm.DB) {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return seedPaymentConfig(tx)
+	}); err != nil {
+		logger.L.Error("seed: payment config failed", zap.Error(err))
+		return
+	}
+	logger.L.Info("seed: payment config initialized")
 }
 
 // ---------- Coding Plan 渠道 ----------

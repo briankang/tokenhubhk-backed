@@ -16,7 +16,7 @@ type MemberLevel struct {
 	MinTotalConsumeRMB  float64 `gorm:"type:decimal(16,4);default:0" json:"min_total_consume_rmb"`         // 累计消费门槛（人民币）
 	ModelDiscount       float64 `gorm:"type:decimal(5,2);not null;default:1.00" json:"model_discount"`     // 模型调用折扣率（0.80=8折，1.00=无折扣）
 	DefaultRPM          int     `gorm:"not null;default:60" json:"default_rpm"`                            // 每分钟请求数默认值（Requests Per Minute）
-	DefaultTPM          int     `gorm:"not null;default:100000" json:"default_tpm"`                        // 每分钟最大Token数默认值（Tokens Per Minute）
+	DefaultTPM          int     `gorm:"not null;default:500000" json:"default_tpm"`                        // 每分钟最大Token数默认值（Tokens Per Minute）
 	DegradeMonths       int     `gorm:"not null;default:3" json:"degrade_months"`                          // 连续不达标月数触发降级
 	IsActive            bool    `gorm:"not null;default:true" json:"is_active"`                            // 是否启用
 	CreatedAt           time.Time `json:"created_at"`

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"sort"
 	"sync"
 
 	"tokenhub-server/internal/model"
@@ -28,6 +30,33 @@ type mappingEntry struct {
 	TransformType   string
 	TransformRule   string
 	Supported       bool
+}
+
+type ParamCoverageItem struct {
+	ParamID     uint   `json:"param_id"`
+	ParamName   string `json:"param_name"`
+	DisplayName string `json:"display_name"`
+	Category    string `json:"category"`
+	ParamType   string `json:"param_type"`
+}
+
+type SupplierParamCoverage struct {
+	SupplierID          uint                `json:"supplier_id"`
+	SupplierCode        string              `json:"supplier_code"`
+	SupplierName        string              `json:"supplier_name"`
+	ActiveModelCount    int64               `json:"active_model_count"`
+	TotalParams         int                 `json:"total_params"`
+	SupportedMappings   int                 `json:"supported_mappings"`
+	UnsupportedMappings int                 `json:"unsupported_mappings"`
+	MissingMappings     int                 `json:"missing_mappings"`
+	CoveragePercent     float64             `json:"coverage_percent"`
+	MissingParams       []ParamCoverageItem `json:"missing_params"`
+	UnsupportedParams   []ParamCoverageItem `json:"unsupported_params"`
+}
+
+type ParamMappingCoverageReport struct {
+	TotalParams int                     `json:"total_params"`
+	Suppliers   []SupplierParamCoverage `json:"suppliers"`
 }
 
 // NewParamMappingService 创建参数映射服务
@@ -161,6 +190,92 @@ func (s *ParamMappingService) GetMappingsBySupplier(ctx context.Context, supplie
 	var mappings []model.SupplierParamMapping
 	err := s.db.WithContext(ctx).Where("supplier_code = ?", supplierCode).Find(&mappings).Error
 	return mappings, err
+}
+
+func (s *ParamMappingService) GetCoverageReport(ctx context.Context) (*ParamMappingCoverageReport, error) {
+	var params []model.PlatformParam
+	if err := s.db.WithContext(ctx).
+		Where("is_active = ?", true).
+		Order("category ASC, sort_order ASC, id ASC").
+		Find(&params).Error; err != nil {
+		return nil, err
+	}
+
+	var suppliers []model.Supplier
+	if err := s.db.WithContext(ctx).
+		Where("is_active = ?", true).
+		Order("sort_order ASC, id ASC").
+		Find(&suppliers).Error; err != nil {
+		return nil, err
+	}
+
+	report := &ParamMappingCoverageReport{
+		TotalParams: len(params),
+		Suppliers:   make([]SupplierParamCoverage, 0, len(suppliers)),
+	}
+	if len(params) == 0 || len(suppliers) == 0 {
+		return report, nil
+	}
+
+	paramByID := make(map[uint]model.PlatformParam, len(params))
+	for _, p := range params {
+		paramByID[p.ID] = p
+	}
+
+	for _, supplier := range suppliers {
+		var mappings []model.SupplierParamMapping
+		if err := s.db.WithContext(ctx).
+			Where("supplier_code = ?", supplier.Code).
+			Find(&mappings).Error; err != nil {
+			return nil, err
+		}
+
+		mapped := make(map[uint]model.SupplierParamMapping, len(mappings))
+		for _, m := range mappings {
+			if _, ok := paramByID[m.PlatformParamID]; ok {
+				mapped[m.PlatformParamID] = m
+			}
+		}
+
+		item := SupplierParamCoverage{
+			SupplierID:       supplier.ID,
+			SupplierCode:     supplier.Code,
+			SupplierName:     supplier.Name,
+			TotalParams:      len(params),
+			MissingParams:    make([]ParamCoverageItem, 0),
+			UnsupportedParams: make([]ParamCoverageItem, 0),
+		}
+		if err := s.db.WithContext(ctx).Model(&model.AIModel{}).
+			Where("supplier_id = ? AND status = ? AND is_active = ?", supplier.ID, "online", true).
+			Count(&item.ActiveModelCount).Error; err != nil {
+			return nil, err
+		}
+
+		for _, p := range params {
+			m, ok := mapped[p.ID]
+			if !ok {
+				item.MissingMappings++
+				item.MissingParams = append(item.MissingParams, toCoverageItem(p))
+				continue
+			}
+			if m.Supported {
+				item.SupportedMappings++
+			} else {
+				item.UnsupportedMappings++
+				item.UnsupportedParams = append(item.UnsupportedParams, toCoverageItem(p))
+			}
+		}
+		item.CoveragePercent = coveragePercent(item.SupportedMappings, item.TotalParams)
+		report.Suppliers = append(report.Suppliers, item)
+	}
+
+	sort.SliceStable(report.Suppliers, func(i, j int) bool {
+		if report.Suppliers[i].MissingMappings != report.Suppliers[j].MissingMappings {
+			return report.Suppliers[i].MissingMappings > report.Suppliers[j].MissingMappings
+		}
+		return report.Suppliers[i].SupplierCode < report.Suppliers[j].SupplierCode
+	})
+	return report, nil
 }
 
 // ─── 运行时参数转换 ───
@@ -369,6 +484,23 @@ func (s *ParamMappingService) invalidateCache() {
 	s.mu.Lock()
 	s.cache = make(map[string][]mappingEntry)
 	s.mu.Unlock()
+}
+
+func toCoverageItem(p model.PlatformParam) ParamCoverageItem {
+	return ParamCoverageItem{
+		ParamID:     p.ID,
+		ParamName:   p.ParamName,
+		DisplayName: p.DisplayName,
+		Category:    p.Category,
+		ParamType:   p.ParamType,
+	}
+}
+
+func coveragePercent(supported, total int) float64 {
+	if total <= 0 {
+		return 0
+	}
+	return math.Round(float64(supported)/float64(total)*10000) / 100
 }
 
 // toBool 将 interface{} 转为 bool

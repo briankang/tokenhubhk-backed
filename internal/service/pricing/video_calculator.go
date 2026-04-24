@@ -32,6 +32,7 @@ type VideoUsageInput struct {
 // 由调用方继续走标准路径。
 func (c *PricingCalculator) CalculateVideoCost(
 	ctx context.Context,
+	userID uint,
 	aiModel *model.AIModel,
 	tenantID uint,
 	agentLevel int,
@@ -71,7 +72,7 @@ func (c *PricingCalculator) CalculateVideoCost(
 	}
 
 	// 走 CalculateCost 链路（input=0, output=tokens）→ 自动享受阶梯/折扣
-	return c.CalculateCost(ctx, aiModel.ID, tenantID, agentLevel, 0, int(tokens))
+	return c.CalculateCost(ctx, userID, aiModel.ID, tenantID, agentLevel, 0, int(tokens))
 }
 
 // parseVideoPricingConfig 从 JSON 解析 VideoPricingConfig

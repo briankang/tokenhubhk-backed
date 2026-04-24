@@ -15,12 +15,20 @@ import (
 
 // Claims JWT Token 的声明体
 // v4.0: 移除 Role 字段 —— 权限来源改为 user_roles 表，由 LoadSubjectPerms 动态解析。
-// 兼容：旧 token 含 Role 字段仍可解析（json 反序列化忽略未知字段）。
+// v4.1: 新增 TokenType 字段区分 access/refresh token，防止 refresh token 被用于 API 访问。
+// 兼容：旧 token 不含 TokenType 字段时视为 access token（向后兼容过渡期）。
 type Claims struct {
-	UserID   uint `json:"user_id"`
-	TenantID uint `json:"tenant_id"`
+	UserID    uint   `json:"user_id"`
+	TenantID  uint   `json:"tenant_id"`
+	TokenType string `json:"token_type,omitempty"` // "access" | "refresh"；空值视为 "access"
 	jwt.RegisteredClaims
 }
+
+// TokenTypeAccess / TokenTypeRefresh JWT 令牌类型常量
+const (
+	TokenTypeAccess  = "access"
+	TokenTypeRefresh = "refresh"
+)
 
 // Auth JWT 认证中间件：解析 Bearer Token 并注入 userId/tenantId 到 ctx
 func Auth() gin.HandlerFunc {
@@ -34,6 +42,14 @@ func Auth() gin.HandlerFunc {
 
 		claims, err := parseToken(token)
 		if err != nil {
+			response.Error(c, http.StatusUnauthorized, errcode.ErrTokenInvalid)
+			c.Abort()
+			return
+		}
+
+		// 拒绝将 refresh token 用于 API 访问（FINDING-1 修复）
+		// 空 token_type 为向后兼容的旧 access token，允许通过
+		if claims.TokenType == TokenTypeRefresh {
 			response.Error(c, http.StatusUnauthorized, errcode.ErrTokenInvalid)
 			c.Abort()
 			return

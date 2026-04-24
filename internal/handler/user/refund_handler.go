@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"tokenhub-server/internal/pkg/ctxutil"
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 	paymentsvc "tokenhub-server/internal/service/payment"
@@ -43,16 +44,14 @@ func (h *RefundHandler) Submit(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, errcode.ErrBadRequest)
 		return
 	}
-	userID, _ := c.Get("userId")
-	tenantID, _ := c.Get("tenantId")
-	uid := uint64(userID.(uint))
-	tid := uint64(0)
-	if tenantID != nil {
-		tid = uint64(tenantID.(uint))
+	uid, ok := ctxutil.MustUserID(c)
+	if !ok {
+		return
 	}
+	tid := uint64(ctxutil.TenantID(c))
 
 	r, err := h.svc.SubmitUserRequest(c.Request.Context(), paymentsvc.SubmitUserRequestInput{
-		UserID:      uid,
+		UserID:      uint64(uid),
 		TenantID:    tid,
 		PaymentID:   req.PaymentID,
 		AmountRMB:   req.AmountRMB,
@@ -70,11 +69,14 @@ func (h *RefundHandler) Submit(c *gin.Context) {
 
 // List 列出当前用户的退款申请
 func (h *RefundHandler) List(c *gin.Context) {
-	userID, _ := c.Get("userId")
+	uid, ok := ctxutil.MustUserID(c)
+	if !ok {
+		return
+	}
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 
-	list, total, err := h.svc.ListUserRequests(c.Request.Context(), uint64(userID.(uint)), page, pageSize)
+	list, total, err := h.svc.ListUserRequests(c.Request.Context(), uint64(uid), page, pageSize)
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return
@@ -84,6 +86,10 @@ func (h *RefundHandler) List(c *gin.Context) {
 
 // Get 单条退款申请详情
 func (h *RefundHandler) Get(c *gin.Context) {
+	uid, ok := ctxutil.MustUserID(c)
+	if !ok {
+		return
+	}
 	idStr := c.Param("id")
 	id, err := strconv.ParseUint(idStr, 10, 64)
 	if err != nil {
@@ -95,8 +101,7 @@ func (h *RefundHandler) Get(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusNotFound, errcode.ErrNotFound.Code, "refund not found")
 		return
 	}
-	userID, _ := c.Get("userId")
-	if r.UserID != uint64(userID.(uint)) {
+	if r.UserID != uint64(uid) {
 		response.ErrorMsg(c, http.StatusForbidden, 20010, "forbidden")
 		return
 	}

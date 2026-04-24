@@ -63,6 +63,7 @@ type ScrapedModel struct {
 	DisplayName string           `json:"display_name"`   // 展示名称
 	InputPrice  float64          `json:"input_price"`    // 基础输入价格（单位由 PricingUnit 决定）
 	OutputPrice float64          `json:"output_price"`   // 基础输出价格（单位由 PricingUnit 决定）
+	OutputPriceThinking float64  `json:"output_price_thinking,omitempty"` // 思考模式输出价（阿里云 qwen3.5-plus/qwen3.6-plus 等；0=不区分）
 	PriceTiers  []model.PriceTier `json:"price_tiers"`   // 阶梯价格
 	Currency    string           `json:"currency"`       // 币种
 	PricingUnit string           `json:"pricing_unit"`   // 计费单位: per_million_tokens(默认)/per_image/per_second/per_minute/per_10k_characters/per_million_characters/per_call/per_hour
@@ -92,6 +93,7 @@ type PriceDiffItem struct {
 	CurrentOutputRMB  float64           `json:"current_output_rmb"`
 	NewInputRMB       float64           `json:"new_input_rmb"`
 	NewOutputRMB      float64           `json:"new_output_rmb"`
+	NewOutputThinkingRMB float64        `json:"new_output_thinking_rmb,omitempty"` // 思考模式输出成本价（0=不区分）
 	ActualInputRMB    float64           `json:"actual_input_rmb"`    // 折扣后实际价格
 	ActualOutputRMB   float64           `json:"actual_output_rmb"`   // 折扣后实际价格
 	InputChangeRatio  float64           `json:"input_change_ratio"`  // 百分比变动
@@ -135,6 +137,7 @@ type PriceUpdateRequest struct {
 	DisplayName  string            `json:"display_name,omitempty"`  // 展示名称（可选，默认等于 ModelName）
 	InputCostRMB  float64          `json:"input_cost_rmb"`
 	OutputCostRMB float64          `json:"output_cost_rmb"`
+	OutputCostThinkingRMB float64  `json:"output_cost_thinking_rmb,omitempty"` // 思考模式输出成本价
 	PriceTiers   []model.PriceTier `json:"price_tiers,omitempty"`
 	PricingUnit  string            `json:"pricing_unit,omitempty"`  // 计费单位
 	ModelType    string            `json:"model_type,omitempty"`    // 模型类型
@@ -192,6 +195,8 @@ func NewPriceScraperService(db *gorm.DB) *PriceScraperService {
 	s.scrapers["qianfan"] = NewQianfanScraper(qianfanKey)
 	// 注册腾讯混元爬虫（OpenAI 兼容 API + 硬编码价格）
 	s.scrapers["hunyuan"] = NewHunyuanScraper(hunyuanKey)
+	// 注册 TalkingData 灵犀（TD 云牍）爬虫：纯文件价格（源 = 模型成本方案 xlsx）
+	s.scrapers["talkingdata"] = NewTalkingDataScraper()
 	return s
 }
 
@@ -363,6 +368,10 @@ func (s *PriceScraperService) ApplyPrices(ctx context.Context, supplierID uint, 
 				"input_cost_rmb":  u.InputCostRMB,
 				"output_cost_rmb": u.OutputCostRMB,
 				"last_synced_at":  time.Now(),
+			}
+			// 思考模式输出成本价（阿里云 qwen3.x-plus 等；0 = 不区分，保持 DB 既有值）
+			if u.OutputCostThinkingRMB > 0 {
+				updateFields["output_cost_thinking_rmb"] = u.OutputCostThinkingRMB
 			}
 
 			// 更新计费单位、模型类型、变体（如果有）
@@ -582,6 +591,12 @@ func (s *PriceScraperService) matchScraper(name, code string) (Scraper, string) 
 		return s.scrapers["hunyuan"], "hunyuan"
 	}
 
+	// TalkingData 灵犀（TD 云牍）匹配
+	if strings.Contains(codeLower, "talkingdata") || strings.Contains(nameLower, "talkingdata") ||
+		strings.Contains(nameLower, "灵犀") || strings.Contains(nameLower, "云牍") {
+		return s.scrapers["talkingdata"], "talkingdata"
+	}
+
 	return nil, ""
 }
 
@@ -668,6 +683,7 @@ func (s *PriceScraperService) buildDiffResult(supplier model.Supplier, scraped *
 			ModelName:    sm.ModelName,
 			NewInputRMB:  sm.InputPrice,
 			NewOutputRMB: sm.OutputPrice,
+			NewOutputThinkingRMB: sm.OutputPriceThinking,
 			PriceTiers:   sm.PriceTiers,
 			PricingUnit:  sm.PricingUnit,
 			ModelType:    sm.ModelType,
@@ -868,11 +884,12 @@ func (s *PriceScraperService) insertNewModel(tx *gorm.DB, supplierID uint, suppl
 		ModelType:     modelType,
 		PricingUnit:   pricingUnit,
 		Variant:       u.Variant,
-		InputCostRMB:  u.InputCostRMB,
-		OutputCostRMB: u.OutputCostRMB,
-		Currency:      "CREDIT", // 与现有模型默认值保持一致
-		LastSyncedAt:  &now,
-		Tags:          tags,
+		InputCostRMB:          u.InputCostRMB,
+		OutputCostRMB:         u.OutputCostRMB,
+		OutputCostThinkingRMB: u.OutputCostThinkingRMB,
+		Currency:              "CREDIT", // 与现有模型默认值保持一致
+		LastSyncedAt:          &now,
+		Tags:                  tags,
 	}
 
 	// 缓存定价字段

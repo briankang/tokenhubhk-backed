@@ -12,6 +12,7 @@ import (
 
 	goredis "github.com/redis/go-redis/v9"
 	"tokenhub-server/internal/pkg/logger"
+	"tokenhub-server/internal/pkg/safego"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -67,7 +68,7 @@ func SSEWriter(c *gin.Context, reader StreamReader, includeUsage bool) (*SSEResu
 	// 启动心跳 goroutine，主循环退出时通过 done channel 通知其结束
 	done := make(chan struct{})
 	defer close(done)
-	go func() {
+	safego.Go("sse-heartbeat", func() {
 		ticker := time.NewTicker(sseHeartbeatInterval)
 		defer ticker.Stop()
 		for {
@@ -85,7 +86,7 @@ func SSEWriter(c *gin.Context, reader StreamReader, includeUsage bool) (*SSEResu
 				writeMu.Unlock()
 			}
 		}
-	}()
+	})
 
 	buildResult := func() *SSEResult {
 		thinkingOnly := reasoningChars > 0 && contentChars == 0

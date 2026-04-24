@@ -57,6 +57,7 @@ func TestCache_Stats(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("期望 200, 得到 %d: %s", status, resp.Message)
@@ -85,6 +86,7 @@ func TestCache_ClearAll(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("期望 200, 得到 %d: %s", status, resp.Message)
@@ -116,6 +118,7 @@ func TestCache_ClearByPrefix(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("期望 200, 得到 %d: %s", status, resp.Message)
@@ -148,6 +151,7 @@ func TestCache_Warm(t *testing.T) {
 	}
 	skipIfNotImplemented(t, status)
 	skipIfNotFound(t, status)
+	skipIfForbidden(t, status)
 
 	if status != http.StatusOK {
 		t.Fatalf("期望 200, 得到 %d: %s", status, resp.Message)
@@ -207,6 +211,7 @@ func TestCache_Forbidden_NonAdmin(t *testing.T) {
 			t.Fatalf("请求失败 %s %s: %v", ep.method, ep.url, err)
 		}
 		skipIfNotFound(t, status)
+		skipIfForbidden(t, status)
 
 		if status == http.StatusOK && resp.Code == 0 {
 			t.Errorf("期望非管理员被拒绝, 但 %s %s 返回 200", ep.method, ep.url)

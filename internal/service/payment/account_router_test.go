@@ -129,7 +129,9 @@ func TestAccountRouter_ExcludeIDs(t *testing.T) {
 
 func TestAccountRouter_InactiveAccountSkipped(t *testing.T) {
 	db, rdb, _ := setupTestDBAndRedis(t)
-	db.Create(&model.PaymentProviderAccount{ProviderType: "STRIPE", AccountName: "Inactive", IsActive: false, Weight: 10})
+	acc := model.PaymentProviderAccount{ProviderType: "STRIPE", AccountName: "Inactive", IsActive: false, Weight: 10}
+	db.Create(&acc)
+	db.Model(&model.PaymentProviderAccount{}).Where("id = ?", acc.ID).Update("is_active", false)
 	r := NewAccountRouter(db, rdb)
 	_, err := r.SelectAccount(context.Background(), SelectAccountRequest{ProviderType: "STRIPE"})
 	if err == nil {
@@ -205,7 +207,7 @@ func TestAccountRouter_MatchCSV(t *testing.T) {
 		target string
 		want   bool
 	}{
-		{"", "USD", true},  // 空 csv = 全部
+		{"", "USD", true}, // 空 csv = 全部
 		{"USD", "USD", true},
 		{"USD,EUR", "EUR", true},
 		{"USD,EUR", "JPY", false},

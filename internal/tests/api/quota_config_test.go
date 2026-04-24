@@ -24,10 +24,10 @@ type quotaConfigData struct {
 // ---- 用户余额数据结构 ----
 
 type userBalanceData struct {
-	Balance    int64   `json:"balance"`
-	BalanceRMB float64 `json:"balanceRmb"`
-	FreeQuota  int64   `json:"freeQuota"`
-	TotalConsumed int64 `json:"totalConsumed"`
+	Balance       int64   `json:"balance"`
+	BalanceRMB    float64 `json:"balanceRmb"`
+	FreeQuota     int64   `json:"freeQuota"`
+	TotalConsumed int64   `json:"totalConsumed"`
 }
 
 // ============================================================

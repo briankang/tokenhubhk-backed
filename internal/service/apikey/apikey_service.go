@@ -17,6 +17,8 @@ import (
 	"gorm.io/gorm"
 
 	"tokenhub-server/internal/model"
+	"tokenhub-server/internal/pkg/safego"
+	"tokenhub-server/internal/service/usercache"
 )
 
 const (
@@ -211,6 +213,7 @@ func (s *ApiKeyService) GenerateWithOptions(ctx context.Context, userID, tenantI
 		return nil, fmt.Errorf("failed to save api key: %w", err)
 	}
 
+	usercache.InvalidateApiKeys(ctx, userID)
 	return &ApiKeyResult{
 		ID:        record.ID,
 		Name:      record.Name,
@@ -237,13 +240,14 @@ func (s *ApiKeyService) Verify(ctx context.Context, key string) (*ApiKeyInfo, er
 		cacheKey := cacheKeyPrefix + hashStr
 		var info ApiKeyInfo
 		if err := s.getFromCache(ctx, cacheKey, &info); err == nil {
-			// 异步更新最后使用时间（火并忘记模式）
-			go func() {
-				bgCtx := context.Background()
+			// 异步更新最后使用时间（fire-and-forget）— safego 防 panic + 短超时防连接池饥饿
+			safego.Go("apikey-update-last-used", func() {
+				bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
 				_ = s.db.WithContext(bgCtx).Model(&model.ApiKey{}).
 					Where("key_hash = ?", hashStr).
 					Update("last_used_at", time.Now()).Error
-			}()
+			})
 			return &info, nil
 		}
 	}
@@ -385,7 +389,8 @@ func (s *ApiKeyService) setActive(ctx context.Context, id uint, userID uint, act
 	if result.RowsAffected == 0 {
 		return fmt.Errorf("api key not found or not owned by user")
 	}
-	// 缓存失效：等待自然过期（通过 hash 不可直接获得）
+	// 失效用户维度的 API Key 列表缓存
+	usercache.InvalidateApiKeys(ctx, userID)
 	return nil
 }
 
@@ -404,6 +409,7 @@ func (s *ApiKeyService) SoftDelete(ctx context.Context, id uint, userID uint) er
 	if result.RowsAffected == 0 {
 		return fmt.Errorf("api key not found or not owned by user")
 	}
+	usercache.InvalidateApiKeys(ctx, userID)
 	return nil
 }
 
@@ -458,7 +464,7 @@ func (s *ApiKeyService) Update(ctx context.Context, id uint, userID uint, opts U
 		return fmt.Errorf("api key not found or not owned by user")
 	}
 
-	// 缓存失效：等待自然过期
+	usercache.InvalidateApiKeys(ctx, userID)
 	return nil
 }
 

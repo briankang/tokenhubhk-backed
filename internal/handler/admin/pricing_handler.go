@@ -158,7 +158,7 @@ func (h *PricingHandler) GetPriceMatrix(c *gin.Context) {
 		return
 	}
 
-	matrix, err := h.calculator.GetPriceMatrix(c.Request.Context(), req.TenantID, req.AgentLevel)
+	matrix, err := h.calculator.GetPriceMatrix(c.Request.Context(), 0, req.TenantID, req.AgentLevel)
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, 50001, err.Error())
 		return
@@ -186,7 +186,7 @@ func (h *PricingHandler) CalculatePrice(c *gin.Context) {
 	// If tokens are provided, calculate cost; otherwise just return price
 	if req.InputTokens > 0 || req.OutputTokens > 0 {
 		cost, err := h.calculator.CalculateCost(
-			c.Request.Context(), req.ModelID, req.TenantID, req.AgentLevel,
+			c.Request.Context(), 0, req.ModelID, req.TenantID, req.AgentLevel,
 			req.InputTokens, req.OutputTokens,
 		)
 		if err != nil {
@@ -197,7 +197,7 @@ func (h *PricingHandler) CalculatePrice(c *gin.Context) {
 		return
 	}
 
-	price, err := h.calculator.CalculatePrice(c.Request.Context(), req.ModelID, req.TenantID, req.AgentLevel)
+	price, err := h.calculator.CalculatePrice(c.Request.Context(), 0, req.ModelID, req.TenantID, req.AgentLevel)
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, 50001, err.Error())
 		return

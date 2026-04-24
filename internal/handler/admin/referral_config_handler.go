@@ -59,6 +59,7 @@ func (h *ReferralConfigHandler) UpdateConfig(c *gin.Context) {
 		MinPaidCreditsUnlock *int64   `json:"minPaidCreditsUnlock"`
 		MinWithdrawAmount    *int64   `json:"minWithdrawAmount"`
 		SettleDays           *int     `json:"settleDays"`
+		RequireInviteCode    *bool    `json:"requireInviteCode"`
 		IsActive             *bool    `json:"isActive"`
 		// 兼容字段(v3.x 弃用,保留以避免破坏性改动)
 		PersonalCashbackRate *float64 `json:"personalCashbackRate"`
@@ -119,6 +120,9 @@ func (h *ReferralConfigHandler) UpdateConfig(c *gin.Context) {
 			return
 		}
 		cfg.SettleDays = v
+	}
+	if req.RequireInviteCode != nil {
+		cfg.RequireInviteCode = *req.RequireInviteCode
 	}
 	if req.IsActive != nil {
 		cfg.IsActive = *req.IsActive

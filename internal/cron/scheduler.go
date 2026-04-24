@@ -11,18 +11,27 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	aimodelsvc "tokenhub-server/internal/service/aimodel"
 	"tokenhub-server/internal/model"
 	pkgredis "tokenhub-server/internal/pkg/redis"
+	aimodelsvc "tokenhub-server/internal/service/aimodel"
 	"tokenhub-server/internal/service/audit"
+	"tokenhub-server/internal/service/authlog"
 	channelsvc "tokenhub-server/internal/service/channel"
+	emailsvc "tokenhub-server/internal/service/email"
 	"tokenhub-server/internal/service/member"
 	"tokenhub-server/internal/service/modeldiscovery"
+	ratelimitsvc "tokenhub-server/internal/service/ratelimit"
 	reportSvc "tokenhub-server/internal/service/report"
 )
 
 // AuditRetentionDays 审计日志保留天数（30 天前的记录每日 04:00 自动清理）
 const AuditRetentionDays = 30
+
+// RateLimitEventRetentionDays 限流 429 事件保留天数（7 天前的记录每日 04:30 自动清理）
+const RateLimitEventRetentionDays = 7
+
+// AuthLogRetentionDays 用户认证日志保留天数（90 天前的记录每日 04:45 自动清理）
+const AuthLogRetentionDays = 90
 
 // shanghaiLoc 上海时区，所有定时任务均使用该时区计算执行时间
 var shanghaiLoc *time.Location
@@ -38,14 +47,16 @@ func init() {
 
 // Scheduler 定时任务调度器，管理所有周期性后台任务
 type Scheduler struct {
-	memberSvc        *member.MemberLevelService
-	discoverySvc     *modeldiscovery.DiscoveryService
-	capabilityTester *aimodelsvc.CapabilityTester    // Phase 2：能力测试自动触发
-	auditSvc         *audit.AuditService             // v3.3 审计日志清理
-	aggSvc           *reportSvc.UserDailyAggService  // 用户调用日表聚合
-	db               *gorm.DB
-	redis            *goredis.Client
-	stopCh           chan struct{} // 停止信号通道
+	memberSvc         *member.MemberLevelService
+	discoverySvc      *modeldiscovery.DiscoveryService
+	capabilityTester  *aimodelsvc.CapabilityTester   // Phase 2：能力测试自动触发
+	auditSvc          *audit.AuditService            // v3.3 审计日志清理
+	rateLimitEventSvc *ratelimitsvc.EventRecorder    // 限流 429 事件清理
+	authLogSvc        *authlog.Recorder              // 用户认证日志清理
+	aggSvc            *reportSvc.UserDailyAggService // 用户调用日表聚合
+	db                *gorm.DB
+	redis             *goredis.Client
+	stopCh            chan struct{} // 停止信号通道
 
 	// 任务状态管理
 	tasksMu sync.RWMutex
@@ -59,7 +70,7 @@ type TaskInfo struct {
 	Description string    `json:"description"`
 	Enabled     bool      `json:"enabled"`
 	LastRun     time.Time `json:"last_run,omitempty"`
-	LastErr      string    `json:"last_error,omitempty"`
+	LastErr     string    `json:"last_error,omitempty"`
 }
 
 // NewScheduler 创建定时任务调度器实例
@@ -95,6 +106,16 @@ func WithAuditService(svc *audit.AuditService) SchedulerOption {
 	return func(s *Scheduler) { s.auditSvc = svc }
 }
 
+// WithRateLimitEventRecorder 注入限流事件记录器（每日清理 7 天前数据）
+func WithRateLimitEventRecorder(svc *ratelimitsvc.EventRecorder) SchedulerOption {
+	return func(s *Scheduler) { s.rateLimitEventSvc = svc }
+}
+
+// WithAuthLogRecorder 注入用户认证日志记录器（每日清理 90 天前数据）
+func WithAuthLogRecorder(svc *authlog.Recorder) SchedulerOption {
+	return func(s *Scheduler) { s.authLogSvc = svc }
+}
+
 // WithUserDailyAggService 注入用户调用日表聚合服务
 func WithUserDailyAggService(svc *reportSvc.UserDailyAggService) SchedulerOption {
 	return func(s *Scheduler) { s.aggSvc = svc }
@@ -119,10 +140,18 @@ func (s *Scheduler) Start() {
 		"分批删除7天前的api_call_logs和channel_logs，每批5000条+50ms间隔，避免锁表影响业务", true)
 	s.registerTask("audit_cleanup", fmt.Sprintf("每日04:00: 清理%d天前审计日志", AuditRetentionDays),
 		fmt.Sprintf("分批删除%d天前的audit_logs审计记录，每批1000条，控制审计表数据量", AuditRetentionDays), true)
+	s.registerTask("rate_limit_event_cleanup", fmt.Sprintf("每日04:00: 清理%d天前限流事件", RateLimitEventRetentionDays),
+		fmt.Sprintf("分批删除%d天前的rate_limit_events 429事件记录", RateLimitEventRetentionDays), true)
+	s.registerTask("auth_log_cleanup", fmt.Sprintf("每日04:00: 清理%d天前认证日志", AuthLogRetentionDays),
+		fmt.Sprintf("分批删除%d天前的user_auth_logs登录/注册/登出事件记录", AuthLogRetentionDays), true)
+	s.registerTask("email_log_cleanup", "每日04:00: 清理30天前邮件发送日志",
+		"分批删除30天前的email_send_logs记录，控制邮件日志表数据量", true)
 	s.registerTask("inflight_reset", "每5分钟: 重置渠道在途请求计数",
 		"删除Redis中channel:inflight和stream:active:global计数键，防止容器崩溃后残留计数导致负载路由偏差", true)
 	s.registerTask("daily_user_agg", "每日01:00: 用户调用日表聚合",
 		"从api_call_logs聚合前一天数据，按用户×模型×日期写入user_daily_stats，在7天清理前完成持久化", s.aggSvc != nil)
+	s.registerTask("daily_billing_reconciliation", "每日01:10: 扣费对账快照",
+		"按日汇总api_call_logs的实扣收入、平台成本、少收、扣费失败和估算usage等指标，保存到日对账快照表", true)
 
 	// 启动每小时任务（冻结超时释放）
 	go s.runEveryHour()
@@ -138,17 +167,33 @@ func (s *Scheduler) Start() {
 	if s.aggSvc != nil {
 		go s.runDailyAgg()
 	}
+	// 启动扣费对账快照任务（每日01:10），不依赖用户日表聚合服务。
+	go s.runDailyBillingReconciliation()
 	zap.L().Info("定时任务调度器已启动",
 		zap.String("timezone", shanghaiLoc.String()),
 		zap.String("hourly", "每小时整点: 冻结超时释放"),
-		zap.String("daily", "01:00: 用户日表聚合, 06:00: 佣金结算, 07:00: 模型同步, 08:00: 路由巡检"),
+		zap.String("daily", "01:00: 用户日表聚合, 01:10: 扣费对账快照, 06:00: 佣金结算, 07:00: 模型同步, 08:00: 路由巡检"),
 		zap.String("weekly", "每周日03:00: 价格自动更新"),
 		zap.String("monthly", "每月1号: 消费轮转+会员降级"),
 	)
 }
 
 // registerTask 注册定时任务到状态表
-func (s *Scheduler) registerTask(name, schedule, description string, enabled bool) {
+func (s *Scheduler) registerTask(name, schedule string, args ...interface{}) {
+	description := ""
+	enabled := true
+	if len(args) == 1 {
+		if v, ok := args[0].(bool); ok {
+			enabled = v
+		}
+	} else if len(args) >= 2 {
+		if v, ok := args[0].(string); ok {
+			description = v
+		}
+		if v, ok := args[1].(bool); ok {
+			enabled = v
+		}
+	}
 	s.tasksMu.Lock()
 	defer s.tasksMu.Unlock()
 	s.tasks[name] = &TaskInfo{Name: name, Schedule: schedule, Description: description, Enabled: enabled}
@@ -338,8 +383,9 @@ func (s *Scheduler) runDaily() {
 
 // runMonthly 每月1号按时间顺序执行各月度任务
 // 时间安排：
-//   00:00 月消费轮转
-//   02:00 会员降级检查
+//
+//	00:00 月消费轮转
+//	02:00 会员降级检查
 func (s *Scheduler) runMonthly() {
 	// 月度任务列表，按执行时间（小时）升序排列
 	type monthlyTask struct {
@@ -423,7 +469,78 @@ func (s *Scheduler) runLogsCleanup() {
 		s.safeRunNamed("audit_cleanup", "清理30天前审计日志", func(ctx context.Context) error {
 			return s.cleanupOldAuditLogs(ctx)
 		})
+
+		// 清理 7 天前限流事件
+		s.safeRunNamed("rate_limit_event_cleanup", "清理7天前限流事件", func(ctx context.Context) error {
+			return s.cleanupOldRateLimitEvents(ctx)
+		})
+
+		// 清理 90 天前用户认证日志
+		s.safeRunNamed("auth_log_cleanup", "清理90天前认证日志", func(ctx context.Context) error {
+			return s.cleanupOldAuthLogs(ctx)
+		})
+
+		// 清理 30 天前邮件发送日志
+		s.safeRunNamed("email_log_cleanup", "清理30天前邮件发送日志", func(ctx context.Context) error {
+			return s.cleanupOldEmailLogs(ctx)
+		})
 	}
+}
+
+// cleanupOldEmailLogs 清理 email_send_logs 表 30 天前记录
+func (s *Scheduler) cleanupOldEmailLogs(ctx context.Context) error {
+	if emailsvc.Default == nil {
+		return nil
+	}
+	before := time.Now().AddDate(0, 0, -30)
+	_, err := emailsvc.Default.CleanupLogsBefore(ctx, before)
+	return err
+}
+
+// cleanupOldAuthLogs 清理 user_auth_logs 表中 AuthLogRetentionDays 天前的记录
+func (s *Scheduler) cleanupOldAuthLogs(ctx context.Context) error {
+	svc := s.authLogSvc
+	if svc == nil {
+		svc = authlog.Default
+	}
+	if svc == nil {
+		zap.L().Warn("auth_log cleanup skipped: recorder not available")
+		return nil
+	}
+	start := time.Now()
+	deleted, err := svc.DeleteOlderThan(ctx, AuthLogRetentionDays)
+	if err != nil {
+		return fmt.Errorf("清理认证日志失败（已删 %d 条）: %w", deleted, err)
+	}
+	zap.L().Info("认证日志清理完成",
+		zap.Int("retention_days", AuthLogRetentionDays),
+		zap.Int64("deleted", deleted),
+		zap.Duration("duration", time.Since(start)),
+	)
+	return nil
+}
+
+// cleanupOldRateLimitEvents 清理 rate_limit_events 表中 RateLimitEventRetentionDays 天前记录
+func (s *Scheduler) cleanupOldRateLimitEvents(ctx context.Context) error {
+	svc := s.rateLimitEventSvc
+	if svc == nil {
+		svc = ratelimitsvc.Default
+	}
+	if svc == nil {
+		zap.L().Warn("rate_limit_event cleanup skipped: recorder not available")
+		return nil
+	}
+	start := time.Now()
+	deleted, err := svc.DeleteOlderThan(ctx, RateLimitEventRetentionDays)
+	if err != nil {
+		return fmt.Errorf("清理限流事件失败（已删 %d 条）: %w", deleted, err)
+	}
+	zap.L().Info("限流事件清理完成",
+		zap.Int("retention_days", RateLimitEventRetentionDays),
+		zap.Int64("deleted", deleted),
+		zap.Duration("duration", time.Since(start)),
+	)
+	return nil
 }
 
 // cleanupOldAuditLogs 清理 audit_logs 表中 AuditRetentionDays 天前的记录
@@ -530,9 +647,9 @@ func (s *Scheduler) runInflightReset() {
 
 // settleCommissions 自动结算超过7天的PENDING佣金
 // 逻辑：
-//   1. 查询所有 status=PENDING 且 created_at < 7天前 的 CommissionRecord
-//   2. 批量更新 status 为 SETTLED
-//   3. 记录结算数量日志
+//  1. 查询所有 status=PENDING 且 created_at < 7天前 的 CommissionRecord
+//  2. 批量更新 status 为 SETTLED
+//  3. 记录结算数量日志
 func (s *Scheduler) settleCommissions(ctx context.Context) error {
 	// 7天前的时间点
 	sevenDaysAgo := time.Now().Add(-7 * 24 * time.Hour)
@@ -555,10 +672,10 @@ func (s *Scheduler) settleCommissions(ctx context.Context) error {
 
 // releaseFrozenRecords 释放超时的冻结记录
 // 逻辑：
-//   1. 查询所有 status=FROZEN 且 created_at < 1小时前 的 FreezeRecord
-//   2. 对每条记录：减少 UserBalance.frozen_amount，归还冻结金额到余额
-//   3. 更新 FreezeRecord.status 为 RELEASED
-//   4. 使用事务确保一致性
+//  1. 查询所有 status=FROZEN 且 created_at < 1小时前 的 FreezeRecord
+//  2. 对每条记录：减少 UserBalance.frozen_amount，归还冻结金额到余额
+//  3. 更新 FreezeRecord.status 为 RELEASED
+//  4. 使用事务确保一致性
 func (s *Scheduler) releaseFrozenRecords(ctx context.Context) error {
 	// 5分钟前的时间点（与 balance_service.go 中的 freezeExpiry 一致）
 	fiveMinutesAgo := time.Now().Add(-5 * time.Minute)
@@ -613,7 +730,6 @@ func (s *Scheduler) releaseFrozenRecords(ctx context.Context) error {
 
 	return nil
 }
-
 
 // ==================== 工具方法 ====================
 
@@ -706,6 +822,42 @@ func (s *Scheduler) runDailyAgg() {
 	}
 }
 
+// runDailyBillingReconciliation 每日 01:10 执行扣费对账快照，独立于用户日表聚合。
+func (s *Scheduler) runDailyBillingReconciliation() {
+	for {
+		now := time.Now().In(shanghaiLoc)
+		next := time.Date(now.Year(), now.Month(), now.Day(), 1, 10, 0, 0, shanghaiLoc)
+		if now.After(next) {
+			next = next.AddDate(0, 0, 1)
+		}
+		waitDuration := next.Sub(now)
+		zap.L().Info("扣费对账快照任务等待中", zap.Time("next_run", next), zap.Duration("wait", waitDuration))
+		select {
+		case <-time.After(waitDuration):
+		case <-s.stopCh:
+			return
+		}
+		s.safeRunNamed("daily_billing_reconciliation", "扣费对账快照", func(ctx context.Context) error {
+			date := time.Now().In(shanghaiLoc).AddDate(0, 0, -1).Format("2006-01-02")
+			return s.runBillingReconciliationForDate(ctx, date)
+		})
+	}
+}
+
+func (s *Scheduler) runBillingReconciliationForDate(ctx context.Context, date string) error {
+	svc := reportSvc.NewBillingReconciliationService(s.db)
+	snap, err := svc.UpsertDate(ctx, date)
+	if err != nil {
+		return err
+	}
+	zap.L().Info("扣费对账快照完成",
+		zap.String("date", date),
+		zap.String("health", snap.ReconciliationHealth),
+		zap.Int64("requests", snap.TotalRequests),
+	)
+	return nil
+}
+
 // ==================== 热卖模型抽样能力检测 ====================
 
 // SelectHotModelSample 按 model_type 随机抽取热卖模型（每种类型1个），供 Handler 调用
@@ -774,4 +926,3 @@ func (s *Scheduler) runCapabilityTestForModels(ctx context.Context, modelIDs []u
 			zap.Error(err))
 	}
 }
-

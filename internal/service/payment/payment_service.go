@@ -13,6 +13,7 @@ import (
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/credits"
 	"tokenhub-server/internal/service/referral"
+	"tokenhub-server/internal/service/usercache"
 )
 
 // PaymentService 支付业务服务，管理订单创建、回调处理、查询和退款
@@ -518,10 +519,8 @@ func (s *PaymentService) creditUserBalance(ctx context.Context, userID, tenantID
 		return err
 	}
 
-	// 清理 BalanceService 的 Redis 缓存（key 与 BalanceService.GetBalanceCached 对齐）
-	if s.redis != nil {
-		_ = s.redis.Del(ctx, fmt.Sprintf("balance:%d", userID)).Err()
-	}
+	// 清理用户维度余额缓存（user:balance:{uid}），下次查询会回源到最新值
+	usercache.InvalidateBalance(ctx, userID)
 	return nil
 }
 

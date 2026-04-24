@@ -505,33 +505,31 @@ func getHunyuanSupplementaryPrices() []ScrapedModel {
 		},
 
 		// ---- 图像生成（按月用量分档，数据源 https://cloud.tencent.com/document/product/1729/105925） ----
-		// 混元生图：月用量 <1万: ¥0.5/张；≥1万: 阶梯化降价
-		// 注意：阶梯字段表达"单次请求的输入 token 数"语义，此处 InputMin/Max 借用为"月累计调用张数"，
-		// 计费引擎调用 SelectTier 时会传入调用方统计的月累计调用数作为 inputTokens 参数来命中阶梯。
+		// 策略：按"后付费最高档"定价（即 0 < 月用量 < 1万档），避免因月用量档位未知导致低估成本价
+		// 混元生图：全阶梯统一 0.5元/张（无阶梯差异）
 		{
 			ModelName:   "hunyuan-image",
 			DisplayName: "Hunyuan Image",
-			InputPrice:  0.5, // 首阶梯单价作为展示
+			InputPrice:  0.5, // 固定单价，所有阶梯均 0.5
 			OutputPrice: 0,
 			Currency:    "CNY",
 			PricingUnit: PricingUnitPerImage,
 			ModelType:   "ImageGeneration",
-			PriceTiers: []model.PriceTier{
-				{Name: "月用量<1万张", InputMax: i64Hunyuan(10000), InputPrice: 0.5},
-				{Name: "月用量≥1万张", InputMin: 10000, InputPrice: 0.099},
-			},
+			// 不写 PriceTiers：全阶梯同价，无需阶梯数据，避免与 UI 误导性阶梯显示
 		},
-		// 混元文生图轻量版：¥0.099/张起（大用量 ¥0.066）
+		// 混元文生图轻量版：¥0.099/张（最高档）→ 0.094 → 0.088 → 0.066
 		{
 			ModelName:   "hunyuan-dit",
 			DisplayName: "Hunyuan DiT (轻量版)",
-			InputPrice:  0.099,
+			InputPrice:  0.099, // 最高档：0 < 月用量 < 1万
 			OutputPrice: 0,
 			Currency:    "CNY",
 			PricingUnit: PricingUnitPerImage,
 			ModelType:   "ImageGeneration",
 			PriceTiers: []model.PriceTier{
-				{Name: "月用量<100万张", InputMax: i64Hunyuan(1000000), InputPrice: 0.099},
+				{Name: "月用量<1万张", InputMax: i64Hunyuan(10000), InputPrice: 0.099},
+				{Name: "1万≤月用量<10万", InputMin: 10000, InputMax: i64Hunyuan(100000), InputPrice: 0.094},
+				{Name: "10万≤月用量<100万", InputMin: 100000, InputMax: i64Hunyuan(1000000), InputPrice: 0.088},
 				{Name: "月用量≥100万张", InputMin: 1000000, InputPrice: 0.066},
 			},
 		},
@@ -539,7 +537,7 @@ func getHunyuanSupplementaryPrices() []ScrapedModel {
 		{
 			ModelName:   "hunyuan-image-lite",
 			DisplayName: "Hunyuan Image Lite",
-			InputPrice:  0.099,
+			InputPrice:  0.099, // 最高档
 			OutputPrice: 0,
 			Currency:    "CNY",
 			PricingUnit: PricingUnitPerImage,

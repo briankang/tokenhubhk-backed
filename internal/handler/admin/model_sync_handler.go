@@ -47,11 +47,11 @@ func NewModelSyncHandler(db *gorm.DB, bridge ...*taskqueue.SSEBridge) *ModelSync
 
 // syncAllResponse 同步全部模型的响应（含检测结果）
 type syncAllResponse struct {
-	Results         []modeldiscovery.SyncResult `json:"results"`
-	Total           int                         `json:"total"`
-	ModelsChecked   int                         `json:"models_checked"`
-	ModelsAvailable int                         `json:"models_available"`
-	ModelsUnavailable int                       `json:"models_unavailable"`
+	Results           []modeldiscovery.SyncResult `json:"results"`
+	Total             int                         `json:"total"`
+	ModelsChecked     int                         `json:"models_checked"`
+	ModelsAvailable   int                         `json:"models_available"`
+	ModelsUnavailable int                         `json:"models_unavailable"`
 }
 
 // SyncAll 全量同步所有活跃接入点的模型
@@ -114,10 +114,10 @@ func (h *ModelSyncHandler) SyncAll(c *gin.Context) {
 		uid = id
 	}
 	details := map[string]interface{}{
-		"channels_synced": result.Total,
-		"models_found":    totalFound,
-		"models_added":    totalAdded,
-		"models_checked":  resp.ModelsChecked,
+		"channels_synced":  result.Total,
+		"models_found":     totalFound,
+		"models_added":     totalAdded,
+		"models_checked":   resp.ModelsChecked,
 		"models_available": resp.ModelsAvailable,
 	}
 	detailsJSON, _ := json.Marshal(details)
@@ -244,6 +244,21 @@ func (h *ModelSyncHandler) BatchUpdateModelStatus(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
+		return
+	}
+
+	if *req.IsActive {
+		svc := aimodel.NewAIModelService(h.db)
+		for _, id := range req.IDs {
+			if err := svc.SetStatus(c.Request.Context(), id, "online"); err != nil {
+				response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, fmt.Sprintf("model %d preflight failed: %v", id, err))
+				return
+			}
+		}
+		response.Success(c, gin.H{
+			"message":  "批量更新成功",
+			"affected": len(req.IDs),
+		})
 		return
 	}
 
@@ -376,15 +391,28 @@ func (h *ModelSyncHandler) BatchUpdateSellingPrice(c *gin.Context) {
 	skipped := 0
 	cacheUpdated := 0
 	tiersUpdated := 0
+	skippedReasons := make(map[string]int) // 聚合跳过原因
 	for _, m := range models {
-		// 跳过成本价为0的模型，避免创建无意义的0元售价记录
-		if m.InputCostRMB == 0 && m.OutputCostRMB == 0 {
+		// 取成本价基准：若顶层为 0，fallback 到 price_tiers[0].{InputPrice, OutputPrice}
+		// 这样大量爬虫场景下只有阶梯数据、顶层 InputCostRMB/OutputCostRMB=0 的模型也能参与批量售价
+		inputCost := m.InputCostRMB
+		outputCost := m.OutputCostRMB
+		if inputCost == 0 && outputCost == 0 && len(m.PriceTiers) > 0 {
+			var data model.PriceTiersData
+			if err := json.Unmarshal(m.PriceTiers, &data); err == nil && len(data.Tiers) > 0 {
+				t0 := data.Tiers[0]
+				inputCost = t0.InputPrice
+				outputCost = t0.OutputPrice
+			}
+		}
+		if inputCost == 0 && outputCost == 0 {
 			skipped++
+			skippedReasons["no_cost_price"]++
 			continue
 		}
 
-		sellingInputRMB := float64(int(m.InputCostRMB*req.Discount*10000+0.5)) / 10000
-		sellingOutputRMB := float64(int(m.OutputCostRMB*req.Discount*10000+0.5)) / 10000
+		sellingInputRMB := float64(int(inputCost*req.Discount*10000+0.5)) / 10000
+		sellingOutputRMB := float64(int(outputCost*req.Discount*10000+0.5)) / 10000
 
 		var pricing model.ModelPricing
 		err := h.db.Where("model_id = ?", m.ID).First(&pricing).Error
@@ -404,18 +432,19 @@ func (h *ModelSyncHandler) BatchUpdateSellingPrice(c *gin.Context) {
 		updated++
 
 		// 可选：同步调整缓存价（仅对支持缓存的模型生效）
-		if req.ApplyCache && m.SupportsCache && m.InputCostRMB > 0 {
+		// 使用 fallback 后的 inputCost（若顶层为 0 则来自 price_tiers[0]）
+		if req.ApplyCache && m.SupportsCache && inputCost > 0 {
 			cacheUpdates := map[string]interface{}{}
 			if req.CacheImplicitRatio > 0 {
-				cacheUpdates["cache_input_price_rmb"] = math.Round(m.InputCostRMB*req.CacheImplicitRatio*1000000) / 1000000
+				cacheUpdates["cache_input_price_rmb"] = math.Round(inputCost*req.CacheImplicitRatio*1000000) / 1000000
 			}
 			// explicit/both 模式才更新显式价与写入价
 			if m.CacheMechanism == "both" || m.CacheMechanism == "explicit" {
 				if req.CacheExplicitRatio > 0 {
-					cacheUpdates["cache_explicit_input_price_rmb"] = math.Round(m.InputCostRMB*req.CacheExplicitRatio*1000000) / 1000000
+					cacheUpdates["cache_explicit_input_price_rmb"] = math.Round(inputCost*req.CacheExplicitRatio*1000000) / 1000000
 				}
 				if req.CacheWriteRatio > 0 {
-					cacheUpdates["cache_write_price_rmb"] = math.Round(m.InputCostRMB*req.CacheWriteRatio*1000000) / 1000000
+					cacheUpdates["cache_write_price_rmb"] = math.Round(inputCost*req.CacheWriteRatio*1000000) / 1000000
 				}
 			}
 			if len(cacheUpdates) > 0 {
@@ -446,11 +475,12 @@ func (h *ModelSyncHandler) BatchUpdateSellingPrice(c *gin.Context) {
 
 	invalidatePublicModelsCache()
 	response.Success(c, gin.H{
-		"message":       "批量售价更新成功",
-		"updated":       updated,
-		"skipped":       skipped,
-		"cache_updated": cacheUpdated,
-		"tiers_updated": tiersUpdated,
+		"message":         "批量售价更新成功",
+		"updated":         updated,
+		"skipped":         skipped,
+		"skipped_reasons": skippedReasons, // {"no_cost_price": N} 便于前端提示具体原因
+		"cache_updated":   cacheUpdated,
+		"tiers_updated":   tiersUpdated,
 	})
 }
 

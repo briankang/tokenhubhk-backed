@@ -21,9 +21,9 @@ type TTSRequest struct {
 
 // TTSResponse 语音合成响应
 type TTSResponse struct {
-	Audio       []byte `json:"-"`                       // 原始音频字节（调用方自行转 base64 或保存）
-	ContentType string `json:"content_type"`            // audio/mpeg / audio/wav 等
-	RequestID   string `json:"request_id,omitempty"`    // 上游请求 ID
+	Audio       []byte `json:"-"`                    // 原始音频字节（调用方自行转 base64 或保存）
+	ContentType string `json:"content_type"`         // audio/mpeg / audio/wav 等
+	RequestID   string `json:"request_id,omitempty"` // 上游请求 ID
 }
 
 // SpeechSynthesizer 语音合成（TTS）能力接口

@@ -10,6 +10,7 @@ import (
 
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/logger"
+	"tokenhub-server/internal/pkg/safego"
 	"tokenhub-server/internal/provider"
 	channelsvc "tokenhub-server/internal/service/channel"
 )
@@ -140,7 +141,7 @@ func (e *OrchestrationEngine) Stream(ctx context.Context, orchID uint, messages 
 	ctx, cancel := context.WithTimeout(ctx, totalTimeout)
 
 	ch := make(chan StreamEvent, 64)
-	go func() {
+	safego.Go("orchestration-engine-stream", func() {
 		defer cancel()
 		defer close(ch)
 
@@ -154,7 +155,7 @@ func (e *OrchestrationEngine) Stream(ctx context.Context, orchID uint, messages 
 		default:
 			ch <- StreamEvent{Status: "error", Error: fmt.Errorf("unsupported mode: %s", orch.Mode)}
 		}
-	}()
+	})
 
 	return ch, nil
 }
@@ -500,7 +501,7 @@ func (e *OrchestrationEngine) selectRouterStep(steps []OrchestrationStep, messag
 	if len(messages) == 0 {
 		return nil
 	}
-	lastMsg := messages[len(messages)-1].Content
+	lastMsg := provider.TextContent(messages[len(messages)-1].Content)
 	msgLen := len(lastMsg)
 
 	for i := range steps {

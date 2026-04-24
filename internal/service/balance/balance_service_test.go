@@ -180,7 +180,7 @@ func TestBalanceService_HasSufficientBalance(t *testing.T) {
 	_ = svc.InitBalance(ctx, userID, tenantID)
 	_, _ = svc.Recharge(ctx, userID, tenantID, 100000, "sufficient balance test", "ut-suf-001")
 
-	has, err := svc.HasSufficientBalance(ctx, userID)
+	has, _, err := svc.HasSufficientBalance(ctx, userID)
 	if err != nil {
 		t.Fatalf("HasSufficientBalance failed: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestBalanceService_ListRecords(t *testing.T) {
 	svc := balance.NewBalanceService(testDB, testRedis)
 	ctx := context.Background()
 
-	records, err := svc.ListRecords(ctx, 1, 1, 10)
+	records, _, err := svc.ListRecords(ctx, 1, 1, 10)
 	if err != nil {
 		t.Fatalf("ListRecords failed: %v", err)
 	}
@@ -217,10 +217,7 @@ func TestBalanceService_QuotaConfig(t *testing.T) {
 	ctx := context.Background()
 
 	// 获取配额配置
-	cfg, err := svc.GetQuotaConfig(ctx)
-	if err != nil {
-		t.Fatalf("GetQuotaConfig failed: %v", err)
-	}
+	cfg := svc.GetQuotaConfig(ctx)
 
 	if cfg == nil {
 		t.Log("no quota config found (may not be initialized)")
@@ -250,8 +247,8 @@ func TestBalanceService_FreezeAndSettle(t *testing.T) {
 		t.Fatalf("FreezeBalance failed: %v", err)
 	}
 
-	if freezeID == 0 {
-		t.Fatal("freeze ID should not be 0")
+	if freezeID == "" {
+		t.Fatal("freeze ID should not be empty")
 	}
 
 	// 结算（实际消费 3000）

@@ -28,6 +28,10 @@ type Payment struct {
 	RefundedAmount    float64 `gorm:"type:decimal(16,2);default:0" json:"refunded_amount"`      // 累计已退款金额（支持部分退款）
 	RefundCount       int     `gorm:"default:0" json:"refund_count"`                            // 退款次数
 
+	// === 发票状态追踪（v4.2 新增，配合 invoice_requests 表）===
+	InvoiceStatus    string `gorm:"type:varchar(16);default:'none';index" json:"invoice_status"` // none/requested/issued/voided
+	InvoiceRequestID *uint  `gorm:"index" json:"invoice_request_id,omitempty"`                   // 关联的最新 InvoiceRequest.ID
+
 	Tenant Tenant `gorm:"foreignKey:TenantID" json:"tenant,omitempty"` // 关联租户
 	User   User   `gorm:"foreignKey:UserID" json:"user,omitempty"`     // 关联用户
 }

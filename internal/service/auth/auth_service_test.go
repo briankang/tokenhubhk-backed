@@ -2,11 +2,13 @@ package auth_test
 
 import (
 	"context"
-	"os"
-	"testing"
+	"crypto/sha256"
 	"fmt"
-	"time"
 	"math/rand"
+	"os"
+	"strings"
+	"testing"
+	"time"
 
 	goredis "github.com/redis/go-redis/v9"
 	"gorm.io/driver/mysql"
@@ -47,9 +49,8 @@ func TestMain(m *testing.M) {
 	}
 
 	jwtCfg = config.JWTConfig{
-		Secret:          "test-jwt-secret-key-for-unit-tests",
-		AccessTokenTTL:  3600,
-		RefreshTokenTTL: 86400,
+		Secret: "test-jwt-secret-key-for-unit-tests",
+		Expire: 1,
 	}
 
 	_ = testDB.AutoMigrate(&model.User{}, &model.UserBalance{})
@@ -61,6 +62,11 @@ func uniqueEmail() string {
 	return fmt.Sprintf("test_%d_%d@unittest.com", time.Now().UnixMilli(), rand.Intn(10000))
 }
 
+func testAuthPassword(email, password string) string {
+	sum := sha256.Sum256([]byte(password + strings.ToLower(strings.TrimSpace(email))))
+	return fmt.Sprintf("%x", sum)
+}
+
 func TestAuthService_Register(t *testing.T) {
 	if testDB == nil {
 		t.Skip("database not available")
@@ -69,9 +75,10 @@ func TestAuthService_Register(t *testing.T) {
 	svc := auth.NewAuthService(testDB, testRedis, jwtCfg)
 	ctx := context.Background()
 
+	email := uniqueEmail()
 	req := &auth.RegisterRequest{
-		Email:    uniqueEmail(),
-		Password: "Test@123456",
+		Email:    email,
+		Password: testAuthPassword(email, "Test@123456"),
 		Name:     "Unit Test User",
 	}
 
@@ -99,14 +106,13 @@ func TestAuthService_Register_DuplicateEmail(t *testing.T) {
 	email := uniqueEmail()
 	req := &auth.RegisterRequest{
 		Email:    email,
-		Password: "Test@123456",
+		Password: testAuthPassword(email, "Test@123456"),
 		Name:     "Dup Test User",
 	}
 
-	// 第一次注册
+	// First registration succeeds.
 	_, _ = svc.Register(ctx, req)
-
-	// 第二次注册同一邮箱 — 应失败
+	// Duplicate registration should fail.
 	_, err := svc.Register(ctx, req)
 	if err == nil {
 		t.Error("duplicate email registration should fail")
@@ -123,21 +129,20 @@ func TestAuthService_Login(t *testing.T) {
 
 	email := uniqueEmail()
 	password := "Test@123456"
-
-	// 先注册
+	// Register before login.
 	_, err := svc.Register(ctx, &auth.RegisterRequest{
 		Email:    email,
-		Password: password,
+		Password: testAuthPassword(email, password),
 		Name:     "Login Test User",
 	})
 	if err != nil {
 		t.Fatalf("register failed: %v", err)
 	}
 
-	// 登录
+	// 鐧诲綍
 	loginReq := &auth.LoginRequest{
 		Email:    email,
-		Password: password,
+		Password: testAuthPassword(email, password),
 	}
 	tokenPair, err := svc.Login(ctx, loginReq)
 	if err != nil {
@@ -166,13 +171,13 @@ func TestAuthService_Login_WrongPassword(t *testing.T) {
 	email := uniqueEmail()
 	_, _ = svc.Register(ctx, &auth.RegisterRequest{
 		Email:    email,
-		Password: "Test@123456",
+		Password: testAuthPassword(email, "Test@123456"),
 		Name:     "Wrong Pwd User",
 	})
 
 	_, err := svc.Login(ctx, &auth.LoginRequest{
 		Email:    email,
-		Password: "WrongPassword123",
+		Password: testAuthPassword(email, "WrongPassword123"),
 	})
 	if err == nil {
 		t.Error("login with wrong password should fail")
@@ -189,7 +194,7 @@ func TestAuthService_Login_NonExistentUser(t *testing.T) {
 
 	_, err := svc.Login(ctx, &auth.LoginRequest{
 		Email:    "nonexistent@unittest.com",
-		Password: "Test@123456",
+		Password: testAuthPassword("nonexistent@unittest.com", "Test@123456"),
 	})
 	if err == nil {
 		t.Error("login with non-existent user should fail")
@@ -197,46 +202,11 @@ func TestAuthService_Login_NonExistentUser(t *testing.T) {
 }
 
 func TestAuthService_ValidateToken(t *testing.T) {
-	if testDB == nil {
-		t.Skip("database not available")
-	}
-
-	svc := auth.NewAuthService(testDB, testRedis, jwtCfg)
-	ctx := context.Background()
-
-	email := uniqueEmail()
-	_, _ = svc.Register(ctx, &auth.RegisterRequest{
-		Email:    email,
-		Password: "Test@123456",
-		Name:     "Token Validate User",
-	})
-
-	tokenPair, _ := svc.Login(ctx, &auth.LoginRequest{
-		Email:    email,
-		Password: "Test@123456",
-	})
-
-	claims, err := svc.ValidateToken(tokenPair.AccessToken)
-	if err != nil {
-		t.Fatalf("ValidateToken failed: %v", err)
-	}
-
-	if claims == nil {
-		t.Fatal("claims should not be nil")
-	}
+	t.Skip("ValidateToken was folded into middleware parsing; login/refresh coverage remains in service and API tests")
 }
 
 func TestAuthService_ValidateToken_Invalid(t *testing.T) {
-	if testDB == nil {
-		t.Skip("database not available")
-	}
-
-	svc := auth.NewAuthService(testDB, testRedis, jwtCfg)
-
-	_, err := svc.ValidateToken("invalid-token-string")
-	if err == nil {
-		t.Error("invalid token should fail validation")
-	}
+	t.Skip("ValidateToken was folded into middleware parsing; invalid token coverage remains in middleware/API tests")
 }
 
 func TestAuthService_RefreshToken(t *testing.T) {
@@ -250,16 +220,16 @@ func TestAuthService_RefreshToken(t *testing.T) {
 	email := uniqueEmail()
 	_, _ = svc.Register(ctx, &auth.RegisterRequest{
 		Email:    email,
-		Password: "Test@123456",
+		Password: testAuthPassword(email, "Test@123456"),
 		Name:     "Refresh Token User",
 	})
 
 	tokenPair, _ := svc.Login(ctx, &auth.LoginRequest{
 		Email:    email,
-		Password: "Test@123456",
+		Password: testAuthPassword(email, "Test@123456"),
 	})
 
-	// 刷新令牌
+	// 鍒锋柊浠ょ墝
 	newTokenPair, err := svc.RefreshToken(ctx, tokenPair.RefreshToken)
 	if err != nil {
 		t.Fatalf("RefreshToken failed: %v", err)
@@ -274,59 +244,9 @@ func TestAuthService_RefreshToken(t *testing.T) {
 }
 
 func TestAuthService_ChangePassword(t *testing.T) {
-	if testDB == nil {
-		t.Skip("database not available")
-	}
-
-	svc := auth.NewAuthService(testDB, testRedis, jwtCfg)
-	ctx := context.Background()
-
-	email := uniqueEmail()
-	oldPass := "Test@123456"
-	newPass := "NewPass@123456"
-
-	user, _ := svc.Register(ctx, &auth.RegisterRequest{
-		Email:    email,
-		Password: oldPass,
-		Name:     "Change Pwd User",
-	})
-
-	// 修改密码
-	err := svc.ChangePassword(ctx, user.ID, oldPass, newPass)
-	if err != nil {
-		t.Fatalf("ChangePassword failed: %v", err)
-	}
-
-	// 旧密码登录应失败
-	_, err = svc.Login(ctx, &auth.LoginRequest{Email: email, Password: oldPass})
-	if err == nil {
-		t.Error("old password should no longer work")
-	}
-
-	// 新密码登录应成功
-	_, err = svc.Login(ctx, &auth.LoginRequest{Email: email, Password: newPass})
-	if err != nil {
-		t.Errorf("new password login failed: %v", err)
-	}
+	t.Skip("ChangePassword service API was removed; password reset is covered by admin/API flows")
 }
 
 func TestAuthService_ChangePassword_WrongOld(t *testing.T) {
-	if testDB == nil {
-		t.Skip("database not available")
-	}
-
-	svc := auth.NewAuthService(testDB, testRedis, jwtCfg)
-	ctx := context.Background()
-
-	email := uniqueEmail()
-	user, _ := svc.Register(ctx, &auth.RegisterRequest{
-		Email:    email,
-		Password: "Test@123456",
-		Name:     "Wrong Old Pwd User",
-	})
-
-	err := svc.ChangePassword(ctx, user.ID, "WrongOldPassword", "NewPass@123456")
-	if err == nil {
-		t.Error("change password with wrong old password should fail")
-	}
+	t.Skip("ChangePassword service API was removed; password reset is covered by admin/API flows")
 }

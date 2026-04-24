@@ -12,6 +12,10 @@ type ModelPricing struct {
 	InputPriceRMB       float64    `gorm:"type:decimal(16,4);default:0" json:"input_price_rmb"`         // 输入售价 (每百万token人民币)
 	OutputPricePerToken int64      `gorm:"type:bigint;default:0" json:"output_price_per_token"`         // 输出售价 (每百万token积分)
 	OutputPriceRMB      float64    `gorm:"type:decimal(16,4);default:0" json:"output_price_rmb"`        // 输出售价 (每百万token人民币)
+	// OutputPriceThinkingRMB / OutputPriceThinkingPerToken:
+	// 思考模式输出售价（0 = 不区分，与 OutputPriceRMB 相同）
+	OutputPriceThinkingRMB      float64 `gorm:"type:decimal(16,4);default:0" json:"output_price_thinking_rmb"`
+	OutputPriceThinkingPerToken int64   `gorm:"type:bigint;default:0" json:"output_price_thinking_per_token"`
 	Currency            string     `gorm:"type:varchar(10);default:'CREDIT'" json:"currency"`           // 币种 CREDIT
 	EffectiveFrom       *time.Time `json:"effective_from,omitempty"`                                    // 生效时间
 	PriceTiers          JSON       `gorm:"type:json" json:"price_tiers,omitempty"`                     // 阶梯价格配置（平台定价，JSON 格式的 PriceTiersData）

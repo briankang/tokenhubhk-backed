@@ -15,23 +15,10 @@ func RunSeedLevels(db *gorm.DB) {
 	seedExchangeRates(db)
 }
 
-// seedMemberLevels 写入 V0-V4 五个会员等级种子数据
-// v3.2 起：仅当 member_levels 表为空时执行（避免每次重启覆盖管理员配置）
-//
-// 如需强制刷新种子（如新增 V5 等级），管理员可：
-//   1. 通过「管理后台 → 会员等级」单独编辑
-//   2. 或在 mysql 中清空 member_levels 表后重启
+// seedMemberLevels 写入/更新 V0-V4 五个会员等级种子数据
+// v4.2 起：每次重启均执行 upsert，确保所有环境保持最新的 RPM/TPM/折扣默认值。
+// 更新逻辑：按 level_code 匹配，存在则更新全量字段，不存在则创建。
 func seedMemberLevels(db *gorm.DB) {
-	// 幂等保护：表非空则跳过整个 seed
-	var existingCount int64
-	if err := db.Model(&model.MemberLevel{}).Count(&existingCount).Error; err != nil {
-		fmt.Printf("[seed] member_levels count check failed: %v\n", err)
-		return
-	}
-	if existingCount > 0 {
-		// 已存在数据，跳过 seed（管理员可能已自定义）
-		return
-	}
 	// V0-V4 会员等级配置，消费门槛递增，折扣率递减，限流配额递增
 	// 金额单位：积分(credits)，1 RMB = 10,000 credits
 	levels := []model.MemberLevel{
@@ -43,7 +30,7 @@ func seedMemberLevels(db *gorm.DB) {
 			MinTotalConsumeRMB: 0,
 			ModelDiscount:      1.00,
 			DefaultRPM:         30,
-			DefaultTPM:         50000,
+			DefaultTPM:         200000,
 			DegradeMonths:      3,
 			IsActive:           true,
 		},
@@ -55,7 +42,7 @@ func seedMemberLevels(db *gorm.DB) {
 			MinTotalConsumeRMB: 100,
 			ModelDiscount:      0.95,
 			DefaultRPM:         60,
-			DefaultTPM:         100000,
+			DefaultTPM:         500000,
 			DegradeMonths:      3,
 			IsActive:           true,
 		},
@@ -67,7 +54,7 @@ func seedMemberLevels(db *gorm.DB) {
 			MinTotalConsumeRMB: 500,
 			ModelDiscount:      0.90,
 			DefaultRPM:         120,
-			DefaultTPM:         200000,
+			DefaultTPM:         1500000,
 			DegradeMonths:      3,
 			IsActive:           true,
 		},
@@ -79,7 +66,7 @@ func seedMemberLevels(db *gorm.DB) {
 			MinTotalConsumeRMB: 2000,
 			ModelDiscount:      0.85,
 			DefaultRPM:         300,
-			DefaultTPM:         500000,
+			DefaultTPM:         5000000,
 			DegradeMonths:      3,
 			IsActive:           true,
 		},
@@ -91,7 +78,7 @@ func seedMemberLevels(db *gorm.DB) {
 			MinTotalConsumeRMB: 10000,
 			ModelDiscount:      0.80,
 			DefaultRPM:         600,
-			DefaultTPM:         1000000,
+			DefaultTPM:         10000000,
 			DegradeMonths:      3,
 			IsActive:           true,
 		},

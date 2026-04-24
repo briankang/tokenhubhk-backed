@@ -96,10 +96,10 @@ func TestChannelRouter_RecordSuccessAndFailure(t *testing.T) {
 	router := channel.NewChannelRouter(testDB, testRedis, groupSvc, backupSvc)
 
 	// 记录成功和失败不应 panic
-	router.RecordSuccess(1)
-	router.RecordFailure(1)
-	router.RecordSuccess(999)
-	router.RecordFailure(999)
+	router.RecordResult(1, true, 10, 200)
+	router.RecordResult(1, false, 10, 500)
+	router.RecordResult(999, true, 10, 200)
+	router.RecordResult(999, false, 10, 500)
 }
 
 // ========== ChannelService 测试 ==========
@@ -179,7 +179,7 @@ func TestChannelGroupService_CRUD(t *testing.T) {
 	}
 
 	// 列出分组
-	groups, err := svc.List(ctx)
+	groups, _, err := svc.List(ctx, 1, 20)
 	if err != nil {
 		t.Fatalf("List groups failed: %v", err)
 	}

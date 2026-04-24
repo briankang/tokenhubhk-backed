@@ -105,18 +105,18 @@ type openAIModelID struct {
 // VolcengineModel 火山引擎扩展模型信息
 // 火山引擎 /api/v3/models 返回的模型对象包含丰富的元数据
 type VolcengineModel struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`    // 模型显示名称
-	Version string `json:"version"` // 版本号
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	Domain  string `json:"domain"` // 领域: LLM/VLM/Embedding 等
-	Status  string `json:"status"` // 状态: Active/Deprecated 等
+	ID         string `json:"id"`
+	Name       string `json:"name"`    // 模型显示名称
+	Version    string `json:"version"` // 版本号
+	Object     string `json:"object"`
+	Created    int64  `json:"created"`
+	Domain     string `json:"domain"` // 领域: LLM/VLM/Embedding 等
+	Status     string `json:"status"` // 状态: Active/Deprecated 等
 	Modalities struct {
 		InputModalities  []string `json:"input_modalities"`  // 输入模态: ["text","image"]
 		OutputModalities []string `json:"output_modalities"` // 输出模态: ["text"]
 	} `json:"modalities"`
-	TaskType    []string        `json:"task_type"`    // 任务类型列表
+	TaskType    []string `json:"task_type"` // 任务类型列表
 	TokenLimits struct {
 		ContextWindow           int `json:"context_window"`
 		MaxInputTokenLength     int `json:"max_input_token_length"`
@@ -446,29 +446,25 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 			if priceMissing && isSupplierWithoutPriceAPI(channel.Supplier.Code) {
 				isActive = false
 			}
-			tags := pricescraper.AugmentTagsForPricing(InferModelTags(modelName, channel.Supplier.Code), isFree, priceMissing)
 
 			aiModel := model.AIModel{
-				ModelName:      modelName,
-				DisplayName:    modelName,
-				CategoryID:     defaultCategoryID,
-				SupplierID:     channel.SupplierID,
-				Status:         "offline",
-				Source:         "auto",
-				IsActive:       isActive,
-				LastSyncedAt:   &now,
-				ModelType:      modelType,
-				PricingUnit:    pricingUnit,
-				ApiCreatedAt:   m.Created,
-				Tags:           tags,
+				ModelName:    modelName,
+				DisplayName:  modelName,
+				CategoryID:   defaultCategoryID,
+				SupplierID:   channel.SupplierID,
+				Status:       "offline",
+				Source:       "auto",
+				IsActive:     isActive,
+				LastSyncedAt: &now,
+				ModelType:    modelType,
+				PricingUnit:  pricingUnit,
+				ApiCreatedAt: m.Created,
 			}
-			// 强制流式的模型（如阿里云 qwq/qvq 系列）在创建时即标记 features.requires_stream=true
-			// handler 会自动将非流式请求升级为流式，避免上游 400 "only support stream mode"
-			if MatchStreamOnly(modelName) {
-				if featsJSON, err := json.Marshal(map[string]interface{}{"requires_stream": true}); err == nil {
-					aiModel.Features = featsJSON
-				}
-			}
+			// 初始化 features：先继承供应商默认能力，再叠加强制流式标记
+			aiModel.Features = mergeSupplierDefaultFeatures(channel.Supplier.DefaultFeatures, channel.Supplier.Code, modelName, modelType, nil, nil)
+			// 基础品牌标签 + 能力衍生标签 + 定价标签
+			baseTags := InferModelTagsWithFeatures(modelName, channel.Supplier.Code, modelType, aiModel.Features)
+			aiModel.Tags = pricescraper.AugmentTagsForPricing(baseTags, isFree, priceMissing)
 			if err := s.db.Create(&aiModel).Error; err != nil {
 				if strings.Contains(err.Error(), "Duplicate") || strings.Contains(err.Error(), "UNIQUE") {
 					aiModelSet[modelName] = true
@@ -634,11 +630,11 @@ func (s *DiscoveryService) syncVolcengineModels(channel model.Channel, models []
 				ContextWindow:    volcFields.contextWindow,
 				MaxInputTokens:   volcFields.maxInputTokens,
 				MaxOutputTokens:  volcFields.maxOutputTokens,
-				Features:         volcFields.features,
+				Features:         mergeVolcengineFeatures(volcFields.features, channel.Supplier.DefaultFeatures, channel.Supplier.Code, modelName, inferredType, volcFields.inputModalities, volcFields.taskTypes),
 				SupplierStatus:   volcFields.supplierStatus,
 				ApiCreatedAt:     volcFields.apiCreatedAt,
-				Tags:             InferModelTags(modelName, channel.Supplier.Code),
 			}
+			aiModel.Tags = InferModelTagsWithFeatures(modelName, channel.Supplier.Code, inferredType, aiModel.Features)
 
 			if err := s.db.Create(&aiModel).Error; err != nil {
 				if strings.Contains(err.Error(), "Duplicate") || strings.Contains(err.Error(), "UNIQUE") {
@@ -688,15 +684,15 @@ type volcengineFields struct {
 // buildVolcengineFields 从火山引擎模型数据构建 AIModel 扩展字段
 func (s *DiscoveryService) buildVolcengineFields(m VolcengineModel) volcengineFields {
 	f := volcengineFields{
-		displayName:    m.Name,
-		version:        m.Version,
-		domain:         m.Domain,
-		modelType:      m.Domain, // 火山引擎 Domain 就是模型类型（LLM/VLM/Embedding 等）
-		contextWindow:  m.TokenLimits.ContextWindow,
-		maxInputTokens: m.TokenLimits.MaxInputTokenLength,
+		displayName:     m.Name,
+		version:         m.Version,
+		domain:          m.Domain,
+		modelType:       m.Domain, // 火山引擎 Domain 就是模型类型（LLM/VLM/Embedding 等）
+		contextWindow:   m.TokenLimits.ContextWindow,
+		maxInputTokens:  m.TokenLimits.MaxInputTokenLength,
 		maxOutputTokens: m.TokenLimits.MaxOutputTokenLength,
-		supplierStatus: m.Status,
-		apiCreatedAt:   m.Created,
+		supplierStatus:  m.Status,
+		apiCreatedAt:    m.Created,
 	}
 
 	// 如果 display_name 为空，使用 ID 作为兜底
@@ -901,6 +897,134 @@ func InferModelTags(modelName string, supplierCode string) string {
 // inferTagsFromModelName 根据模型名称推断搜索标签（无供应商信息时使用）
 func inferTagsFromModelName(modelName string) string {
 	return InferModelTags(modelName, "")
+}
+
+// InferModelTagsWithFeatures 在品牌标签基础上叠加 features 能力标签
+func InferModelTagsWithFeatures(modelName, supplierCode string, modelType string, features model.JSON) string {
+	base := InferModelTags(modelName, supplierCode)
+	seen := make(map[string]bool)
+	var tags []string
+	for _, t := range strings.Split(base, ",") {
+		t = strings.TrimSpace(t)
+		if t != "" && !seen[t] {
+			seen[t] = true
+			tags = append(tags, t)
+		}
+	}
+	addTag := func(tag string) {
+		if !seen[tag] {
+			seen[tag] = true
+			tags = append(tags, tag)
+		}
+	}
+
+	// 从 features JSON 追加能力标签
+	if len(features) > 0 {
+		var feats map[string]interface{}
+		if json.Unmarshal(features, &feats) == nil {
+			if v, _ := feats["supports_thinking"].(bool); v {
+				addTag("推理增强")
+			}
+			if v, _ := feats["supports_web_search"].(bool); v {
+				addTag("联网搜索")
+			}
+			if v, _ := feats["supports_vision"].(bool); v {
+				addTag("视觉理解")
+			}
+			if v, _ := feats["supports_function_call"].(bool); v {
+				addTag("工具调用")
+			}
+			if v, _ := feats["supports_json_mode"].(bool); v {
+				addTag("JSON输出")
+			}
+		}
+	}
+
+	// 从模型类型追加分类标签
+	switch strings.ToUpper(modelType) {
+	case "EMBEDDING":
+		addTag("文本嵌入")
+	case "VIDEOGENERATION":
+		addTag("视频生成")
+	case "IMAGEGENERATION":
+		addTag("图像生成")
+	case "TTS":
+		addTag("语音合成")
+	case "ASR":
+		addTag("语音识别")
+	}
+
+	if len(tags) == 0 {
+		return ""
+	}
+	return strings.Join(tags, ",")
+}
+
+// mergeSupplierDefaultFeatures 合并供应商默认能力 + 强制流式标记
+// 优先级：MatchStreamOnly 覆盖 > 供应商默认值
+// 若 supplierDefaults 为空且模型不需要强制流式，则返回空 JSON
+func mergeSupplierDefaultFeatures(supplierDefaults model.JSON, supplierCode, modelName, modelType string, inputModalities, taskTypes model.JSON) model.JSON {
+	feats := make(map[string]interface{})
+
+	// 1. 继承供应商默认能力
+	if len(supplierDefaults) > 0 {
+		_ = json.Unmarshal(supplierDefaults, &feats)
+	}
+
+	// 1.5 根据模型名称推断能力（补全或覆盖默认值）
+	InferFeaturesForModel(supplierCode, modelName, modelType, inputModalities, taskTypes, feats)
+
+	// 2. 强制流式标记覆盖
+	if MatchStreamOnly(modelName) {
+		feats["requires_stream"] = true
+	}
+
+	if len(feats) == 0 {
+		return nil
+	}
+	out, err := json.Marshal(feats)
+	if err != nil {
+		return nil
+	}
+	return model.JSON(out)
+}
+
+// mergeVolcengineFeatures 将火山引擎 API 返回的能力信息与供应商默认值合并
+// Volcengine API 的字段优先级最高，其次是供应商默认值，最后是 MatchStreamOnly
+func mergeVolcengineFeatures(volcFeatures model.JSON, supplierDefaults model.JSON, supplierCode, modelName, modelType string, inputModalities, taskTypes model.JSON) model.JSON {
+	feats := make(map[string]interface{})
+
+	// 1. 先叠入供应商默认值
+	if len(supplierDefaults) > 0 {
+		_ = json.Unmarshal(supplierDefaults, &feats)
+	}
+
+	// 2. Volcengine API 的能力字段覆盖默认值
+	if len(volcFeatures) > 0 {
+		var volcMap map[string]interface{}
+		if json.Unmarshal(volcFeatures, &volcMap) == nil {
+			for k, v := range volcMap {
+				feats[k] = v
+			}
+		}
+	}
+
+	// 2.5 按模型名/类型做保守修正，避免供应商默认能力过度传播。
+	InferFeaturesForModel(supplierCode, modelName, modelType, inputModalities, taskTypes, feats)
+
+	// 3. 强制流式标记覆盖
+	if MatchStreamOnly(modelName) {
+		feats["requires_stream"] = true
+	}
+
+	if len(feats) == 0 {
+		return nil
+	}
+	out, err := json.Marshal(feats)
+	if err != nil {
+		return nil
+	}
+	return model.JSON(out)
 }
 
 // autoCreateRouteForDefault 为新增的 ChannelModel 自动创建默认 CustomChannel 路由

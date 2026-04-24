@@ -65,6 +65,13 @@ func (h *SupportAdminHandler) Register(rg *gin.RouterGroup) {
 	rg.POST("/support/knowledge/rebuild", h.RebuildKnowledge)
 	rg.POST("/support/knowledge/rebuild/:source_type/:id", h.RebuildKnowledgeSource)
 	rg.GET("/support/knowledge/stats", h.KnowledgeStats)
+
+	// --- AI 客服模型候选配置（Fallback 链 + 联网搜索开关等）---
+	rg.GET("/support/model-profiles", h.ListModelProfiles)
+	rg.POST("/support/model-profiles", h.CreateModelProfile)
+	rg.PUT("/support/model-profiles/:id", h.UpdateModelProfile)
+	rg.DELETE("/support/model-profiles/:id", h.DeleteModelProfile)
+	rg.PATCH("/support/model-profiles/:id/toggle", h.ToggleModelProfile)
 }
 
 // ================= 状态 =================

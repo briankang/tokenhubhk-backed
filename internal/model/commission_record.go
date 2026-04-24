@@ -22,6 +22,7 @@ type CommissionRecord struct {
 	// --- v3.1 新增字段 ---
 	AttributionID *uint      `gorm:"index" json:"attributionId"`                  // 关联 ReferralAttribution.ID
 	OverrideID    *uint      `gorm:"index" json:"overrideId"`                     // 关联 UserCommissionOverride.ID,NULL=用默认比例
+	RuleID        *uint      `gorm:"index" json:"ruleId"`                         // 关联 CommissionRule.ID,NULL=未命中规则(走 override/默认)
 	EffectiveRate float64    `gorm:"type:decimal(5,4);default:0" json:"effectiveRate"` // 实际生效比例(审计用,记录当时的 rate)
 	Credited      bool       `gorm:"default:false;index" json:"credited"`         // 是否已入账到用户余额
 	SettleAt      *time.Time `json:"settleAt"`                                    // SETTLED 时间

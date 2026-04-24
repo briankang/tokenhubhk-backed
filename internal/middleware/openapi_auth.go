@@ -18,6 +18,7 @@ import (
 	"tokenhub-server/internal/pkg/errcode"
 	pkgredis "tokenhub-server/internal/pkg/redis"
 	"tokenhub-server/internal/pkg/response"
+	"tokenhub-server/internal/pkg/safego"
 )
 
 const (
@@ -108,13 +109,14 @@ func OpenAPIAuth(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// 异步更新 lastUsedAt
-		go func() {
-			bgCtx := context.Background()
+		// 异步更新 lastUsedAt — safego 防 panic，短超时防连接池饥饿
+		safego.Go("openapi-update-last-used", func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
 			_ = db.WithContext(bgCtx).Model(&model.ApiKey{}).
 				Where("id = ?", apiKey.ID).
 				Update("last_used_at", time.Now()).Error
-		}()
+		})
 
 		c.Next()
 	}

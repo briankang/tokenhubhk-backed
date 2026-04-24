@@ -9,7 +9,9 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -48,10 +50,15 @@ func LoadSubjectPerms(resolver *permissionsvc.Resolver) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		perms, err := resolver.Resolve(c.Request.Context(), uid)
+		// 超时保护：Resolver 内部已有 redis 800ms + db 2s 超时，
+		// 这里作为兜底再包一层 3s 总 ctx（cover goroutine 调度 + DNS 等），避免极端情况阻塞整个请求链
+		resolveCtx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+		defer cancel()
+		perms, err := resolver.Resolve(resolveCtx, uid)
 		if err != nil {
+			// 降级策略：DB/Redis 不可用时不阻塞请求，让后续中间件/handler 按"无权限"走（/user/* 路由自身会返回 401，/public/* 不受影响）
 			if logger.L != nil {
-				logger.L.Warn("LoadSubjectPerms: resolve failed",
+				logger.L.Warn("LoadSubjectPerms: resolve failed, continuing without perms",
 					zap.Uint("user_id", uid),
 					zap.Error(err),
 				)
@@ -105,6 +112,16 @@ func PermissionGate() gin.HandlerFunc {
 			response.Error(c, http.StatusForbidden, errcode.ErrPermissionDenied)
 			c.Abort()
 			return
+		}
+
+		// SUPER_ADMIN 短路：拥有此角色的用户绕过所有权限检查。
+		// 语义上 SUPER_ADMIN 等价 root，不受 role_permissions 表状态影响
+		// （例如新增权限码尚未 seed 到 DB 时，仍能调用）
+		for _, role := range perms.RoleCodes {
+			if role == "SUPER_ADMIN" {
+				c.Next()
+				return
+			}
 		}
 
 		if !perms.Has(meta.Action) {

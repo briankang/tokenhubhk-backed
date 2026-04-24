@@ -1,6 +1,7 @@
 package user
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -10,6 +11,7 @@ import (
 	"tokenhub-server/internal/pkg/logger"
 	"tokenhub-server/internal/pkg/response"
 	permissionsvc "tokenhub-server/internal/service/permission"
+	"tokenhub-server/internal/service/usercache"
 	usersvc "tokenhub-server/internal/service/user"
 )
 
@@ -34,6 +36,7 @@ func (h *ProfileHandler) SetResolver(r *permissionsvc.Resolver) {
 
 // GetProfile 获取用户个人资料 GET /api/v1/user/profile
 // v4.0: 响应中透出 permissions/data_scope/role_codes 字段，供前端 RBAC UI 消费
+// 缓存：user:profile:{uid}，5min TTL；UpdateProfile / ChangePassword / 角色变更时失效
 func (h *ProfileHandler) GetProfile(c *gin.Context) {
 	userID, ok := c.Get("userId")
 	if !ok {
@@ -47,21 +50,34 @@ func (h *ProfileHandler) GetProfile(c *gin.Context) {
 		return
 	}
 
-	user, err := h.svc.GetByID(c.Request.Context(), uid)
+	out, err := usercache.GetOrLoadProfile[map[string]any](c.Request.Context(), uid, func(ctx context.Context) (map[string]any, error) {
+		return h.buildProfile(ctx, uid)
+	})
 	if err != nil {
 		response.ErrorMsg(c, http.StatusNotFound, errcode.ErrUserNotFound.Code, err.Error())
 		return
 	}
 
+	response.Success(c, out)
+}
+
+// buildProfile 聚合用户信息 + 权限（供 loader 回源使用）
+func (h *ProfileHandler) buildProfile(ctx context.Context, uid uint) (map[string]any, error) {
+	user, err := h.svc.GetByID(ctx, uid)
+	if err != nil {
+		return nil, err
+	}
+
 	// 构造响应（用 map 方式注入 user 字段 + 权限字段，避免改 model.User 结构）
-	out := gin.H{
+	out := map[string]any{
 		"id":            user.ID,
 		"tenant_id":     user.TenantID,
 		"email":         user.Email,
 		"name":          user.Name,
-		"role":          user.Role, // 兼容：旧字段仍返回，前端过渡期继续可用
+		// v4.0: user.Role 字段已移除；前端应改用 role_codes[]
 		"is_active":     user.IsActive,
 		"language":      user.Language,
+		"country_code":  user.CountryCode, // v5.0 注册地区，只读
 		"last_login_at": user.LastLoginAt,
 		"referral_code": user.ReferralCode,
 		"created_at":    user.CreatedAt,
@@ -74,7 +90,7 @@ func (h *ProfileHandler) GetProfile(c *gin.Context) {
 		resolver = permissionsvc.Default
 	}
 	if resolver != nil {
-		perms, resolveErr := resolver.Resolve(c.Request.Context(), uid)
+		perms, resolveErr := resolver.Resolve(ctx, uid)
 		if resolveErr != nil {
 			if logger.L != nil {
 				logger.L.Warn("profile: resolve permissions failed",
@@ -82,9 +98,8 @@ func (h *ProfileHandler) GetProfile(c *gin.Context) {
 					zap.Error(resolveErr),
 				)
 			}
-			// 失败时返回空权限，保持响应结构稳定
 			out["permissions"] = []string{}
-			out["data_scope"] = gin.H{"type": permissionsvc.DataScopeOwnOnly}
+			out["data_scope"] = map[string]any{"type": permissionsvc.DataScopeOwnOnly}
 			out["role_codes"] = []string{}
 		} else {
 			out["permissions"] = perms.Codes
@@ -92,8 +107,7 @@ func (h *ProfileHandler) GetProfile(c *gin.Context) {
 			out["role_codes"] = perms.RoleCodes
 		}
 	}
-
-	response.Success(c, out)
+	return out, nil
 }
 
 // UpdateProfile 更新用户个人资料 PUT /api/v1/user/profile
@@ -123,6 +137,9 @@ func (h *ProfileHandler) UpdateProfile(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
 		return
 	}
+
+	// 失效 profile 缓存（service 层也会调用，handler 兜底）
+	usercache.InvalidateProfile(c.Request.Context(), uid)
 
 	response.Success(c, gin.H{"message": "profile updated"})
 }
@@ -154,6 +171,9 @@ func (h *ProfileHandler) ChangePassword(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
 		return
 	}
+
+	// 密码变更后失效全部用户缓存（profile 含 role / 下次重新拉）
+	usercache.InvalidateAll(c.Request.Context(), uid)
 
 	response.Success(c, gin.H{"message": "password changed"})
 }

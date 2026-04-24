@@ -20,6 +20,7 @@ import (
 	"tokenhub-server/internal/middleware"
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/logger"
+	"tokenhub-server/internal/pkg/safego"
 	"tokenhub-server/internal/service/modeldiscovery"
 )
 
@@ -180,7 +181,8 @@ func (mc *ModelChecker) BatchCheck(ctx context.Context, progressCh chan<- BatchC
 
 	for i, m := range models {
 		wg.Add(1)
-		go func(idx int, aiModel model.AIModel) {
+		idx, aiModel := i, m // 兼容 Go<1.22 的 range 变量捕获
+		safego.Go("model-checker-batch", func() {
 			defer wg.Done()
 			sem <- struct{}{}        // 获取令牌
 			defer func() { <-sem }() // 释放令牌
@@ -248,7 +250,7 @@ func (mc *ModelChecker) BatchCheck(ctx context.Context, progressCh chan<- BatchC
 					Disabled:  int(atomic.LoadInt64(&disabled)),
 				}
 			}
-		}(i, m)
+		})
 	}
 
 	wg.Wait()
@@ -335,7 +337,8 @@ func (mc *ModelChecker) CheckByIDs(ctx context.Context, modelIDs []uint, progres
 
 	for i, m := range models {
 		wg.Add(1)
-		go func(idx int, aiModel model.AIModel) {
+		idx, aiModel := i, m // 兼容 Go<1.22 range 变量捕获
+		safego.Go("model-checker-preview", func() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -386,7 +389,7 @@ func (mc *ModelChecker) CheckByIDs(ctx context.Context, modelIDs []uint, progres
 					Disabled:  int(atomic.LoadInt64(&disabled)),
 				}
 			}
-		}(i, m)
+		})
 	}
 
 	wg.Wait()
@@ -1612,7 +1615,7 @@ func (mc *ModelChecker) runCheckTask(taskID uint) {
 
 	// 创建进度通道，启动 goroutine 将实时进度写入数据库（节流：每 2 秒最多写一次）
 	progressCh := make(chan BatchCheckProgress, 100)
-	go func() {
+	safego.Go("model-checker-progress-writer", func() {
 		var lastWrite time.Time
 		for p := range progressCh {
 			// 节流：2 秒内最多写一次，除非是最后一条（Checked == Total）
@@ -1634,7 +1637,7 @@ func (mc *ModelChecker) runCheckTask(taskID uint) {
 				"progress_msg":   msg,
 			})
 		}
-	}()
+	})
 
 	results, err := mc.BatchCheck(ctx, progressCh)
 

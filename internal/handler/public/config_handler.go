@@ -40,6 +40,7 @@ type ReferralConfigPublicResponse struct {
 	MinPaidCreditsUnlock int64   `json:"minPaidCreditsUnlock"` // 解锁门槛（积分）
 	MinWithdrawAmount    int64   `json:"minWithdrawAmount"`    // 最低提现（积分）
 	SettleDays           int     `json:"settleDays"`           // 结算天数
+	RequireInviteCode    bool    `json:"requireInviteCode"`    // 注册是否强制要求邀请码
 }
 
 // QuotaConfigPublicResponse 注册赠送配置公开响应
@@ -68,6 +69,7 @@ func (h *ConfigHandler) GetReferralConfig(c *gin.Context) {
 		MinPaidCreditsUnlock: cfg.MinPaidCreditsUnlock,
 		MinWithdrawAmount:    cfg.MinWithdrawAmount,
 		SettleDays:           cfg.SettleDays,
+		RequireInviteCode:    cfg.RequireInviteCode,
 	}
 	response.Success(c, resp)
 }

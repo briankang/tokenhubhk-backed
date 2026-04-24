@@ -89,7 +89,7 @@ func TestApiKeyService_Validate(t *testing.T) {
 	}
 
 	// 验证该 key
-	info, err := svc.Validate(ctx, result.Key)
+	info, err := svc.Verify(ctx, result.Key)
 	if err != nil {
 		t.Fatalf("Validate failed: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestApiKeyService_List(t *testing.T) {
 	svc := apikey.NewApiKeyService(testDB, testRedis, "test-secret-key-for-aes-256")
 	ctx := context.Background()
 
-	keys, err := svc.List(ctx, 1)
+	keys, _, err := svc.List(ctx, 1, 1, 20)
 	if err != nil {
 		t.Fatalf("List failed: %v", err)
 	}
@@ -139,8 +139,8 @@ func TestApiKeyService_Revoke(t *testing.T) {
 		t.Fatalf("Revoke failed: %v", err)
 	}
 
-	// 验证已吊销（Validate 应该失败）
-	_, err = svc.Validate(ctx, result.Key)
+	// 验证已吊销（Verify 应该失败）
+	_, err = svc.Verify(ctx, result.Key)
 	if err == nil {
 		t.Error("revoked key should not be validatable")
 	}
@@ -154,7 +154,7 @@ func TestApiKeyService_Validate_InvalidKey(t *testing.T) {
 	svc := apikey.NewApiKeyService(testDB, testRedis, "test-secret-key-for-aes-256")
 	ctx := context.Background()
 
-	_, err := svc.Validate(ctx, "sk-invalid-key-that-does-not-exist")
+	_, err := svc.Verify(ctx, "sk-invalid-key-that-does-not-exist")
 	if err == nil {
 		t.Error("invalid key should fail validation")
 	}

@@ -81,9 +81,9 @@ type oaiStreamOption struct {
 }
 
 type openAIMessage struct {
-	Role             string `json:"role"`
-	Content          string `json:"content"`
-	ReasoningContent string `json:"reasoning_content,omitempty"` // 深度思考内容（豆包/Qwen3/DeepSeek-R1等）
+	Role             string      `json:"role"`
+	Content          interface{} `json:"content"` // string 或多模态数组（OpenAI 标准兼容）
+	ReasoningContent string      `json:"reasoning_content,omitempty"` // 深度思考内容（豆包/Qwen3/DeepSeek-R1等）
 }
 
 // openAIResponse is the native OpenAI response format.

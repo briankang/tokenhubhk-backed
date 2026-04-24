@@ -42,16 +42,20 @@ func getUserIDFromToken(t *testing.T, tok string) uint {
 func registerWithReferral(t *testing.T, email, pass, referralCode string) (token string, userID uint) {
 	t.Helper()
 	body := map[string]string{
-		"email":    email,
-		"password": pass,
-		"name":     "RefUser",
+		"email":       email,
+		"password":    authPassword(email, pass),
+		"name":        "RefUser",
+		"email_code":  testMagicEmailCode,
+		"invite_code": testInviteCode,
 	}
 	if referralCode != "" {
 		// 将邀请码作为额外字段发送（后端注册接口接受 referral_code）
 		_, status, err := doPost(baseURL+"/api/v1/auth/register", map[string]interface{}{
 			"email":         email,
-			"password":      pass,
+			"password":      authPassword(email, pass),
 			"name":          "RefUser",
+			"email_code":    testMagicEmailCode,
+			"invite_code":   testInviteCode,
 			"referral_code": referralCode,
 		}, "")
 		if err != nil || status != http.StatusOK {

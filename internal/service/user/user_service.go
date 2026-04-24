@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 
 	"tokenhub-server/internal/model"
+	"tokenhub-server/internal/service/usercache"
 )
 
 const bcryptCost = 12
@@ -42,7 +45,7 @@ func (s *UserService) GetByID(ctx context.Context, id uint) (*model.User, error)
 }
 
 // List 分页查询用户列表，可按租户 ID 过滤
-func (s *UserService) List(ctx context.Context, tenantID uint, page, pageSize int) ([]model.User, int64, error) {
+func (s *UserService) List(ctx context.Context, tenantID uint, search string, page, pageSize int) ([]model.User, int64, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -54,6 +57,15 @@ func (s *UserService) List(ctx context.Context, tenantID uint, page, pageSize in
 	query := s.db.WithContext(ctx).Model(&model.User{})
 	if tenantID > 0 {
 		query = query.Where("tenant_id = ?", tenantID)
+	}
+	search = strings.TrimSpace(search)
+	if search != "" {
+		like := "%" + escapeLike(search) + "%"
+		if id, err := strconv.ParseUint(search, 10, 64); err == nil && id > 0 {
+			query = query.Where("id = ? OR email LIKE ? OR name LIKE ?", id, like, like)
+		} else {
+			query = query.Where("email LIKE ? OR name LIKE ?", like, like)
+		}
 	}
 
 	if err := query.Count(&total).Error; err != nil {
@@ -70,6 +82,13 @@ func (s *UserService) List(ctx context.Context, tenantID uint, page, pageSize in
 }
 
 // Update 根据用户 ID 更新指定字段，禁止直接修改敏感字段
+func escapeLike(value string) string {
+	value = strings.ReplaceAll(value, "\\", "\\\\")
+	value = strings.ReplaceAll(value, "%", "\\%")
+	value = strings.ReplaceAll(value, "_", "\\_")
+	return value
+}
+
 func (s *UserService) Update(ctx context.Context, id uint, updates map[string]interface{}) error {
 	if id == 0 {
 		return fmt.Errorf("user id is required")
@@ -139,6 +158,7 @@ func (s *UserService) ChangePassword(ctx context.Context, id uint, oldPwd, newPw
 	if err := s.db.WithContext(ctx).Model(&model.User{}).Where("id = ?", user.ID).Update("password_hash", string(hash)).Error; err != nil {
 		return fmt.Errorf("failed to update password: %w", err)
 	}
+	usercache.InvalidateAll(ctx, id)
 	return nil
 }
 
@@ -166,5 +186,6 @@ func (s *UserService) UpdateProfile(ctx context.Context, id uint, name, language
 	if result.RowsAffected == 0 {
 		return fmt.Errorf("user not found")
 	}
+	usercache.InvalidateProfile(ctx, id)
 	return nil
 }

@@ -73,10 +73,6 @@ func TestRegistrationGuard_TableName(t *testing.T) {
 // TestRegistrationGuard_AllFieldsSettable 验证所有 7 层防御字段可读写
 func TestRegistrationGuard_AllFieldsSettable(t *testing.T) {
 	g := RegistrationGuard{
-		CaptchaEnabled:         true,
-		CaptchaProvider:        "turnstile",
-		CaptchaSiteKey:         "key",
-		CaptchaSecretEnc:       "enc",
 		EmailOTPEnabled:        true,
 		EmailOTPLength:         6,
 		EmailOTPTTLSeconds:     300,

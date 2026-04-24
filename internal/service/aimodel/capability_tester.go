@@ -18,6 +18,7 @@ import (
 
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/logger"
+	"tokenhub-server/internal/pkg/safego"
 	"tokenhub-server/internal/service/aimodel/test_assets"
 )
 
@@ -191,10 +192,14 @@ func (t *CapabilityTester) RunTests(ctx context.Context, in RunTestsInput, progr
 			sem = uxSem
 		}
 
-		go func(p pair, sem chan struct{}) {
+		// safego 包装：防止单个测试 goroutine panic 拖死整个批量任务
+		// sem 是 for 内 switch 块赋值的局部变量，每次迭代都是新变量，无需显式拷贝
+		p := p // 兼容 Go<1.22 的 range 变量捕获
+		semLocal := sem
+		safego.Go("capability-tester-worker", func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+			semLocal <- struct{}{}
+			defer func() { <-semLocal }()
 
 			route, hasRoute := routeMap[p.Model.ModelName]
 			if !hasRoute && p.Case.ModelType != "ux_flow" {
@@ -249,7 +254,7 @@ func (t *CapabilityTester) RunTests(ctx context.Context, in RunTestsInput, progr
 			}
 
 			t.pushProgress(progressCh, &task, len(pairs), &passed, &failed, &skipped, &regression)
-		}(p, sem)
+		})
 	}
 
 	wg.Wait()

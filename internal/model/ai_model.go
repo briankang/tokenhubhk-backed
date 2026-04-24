@@ -55,7 +55,10 @@ type AIModel struct {
 	InputCostRMB        float64 `gorm:"type:decimal(16,4);default:0" json:"input_cost_rmb"`          // 输入成本价 (每百万token人民币)
 	OutputPricePerToken int64   `gorm:"type:bigint;default:0" json:"output_price_per_token"`         // 输出成本价 (每百万token积分)
 	OutputCostRMB       float64 `gorm:"type:decimal(16,4);default:0" json:"output_cost_rmb"`         // 输出成本价 (每百万token人民币)
-	Currency            string  `gorm:"type:varchar(10);default:'CREDIT'" json:"currency"`           // 币种 CREDIT
+	// OutputCostThinkingRMB: 思考模式输出成本价（元/百万token）
+	// 0 = 不区分思考模式（默认与 OutputCostRMB 相同计费）；>0 = 思考模式走独立价格（如阿里云 qwen3.5-plus 思考链 12 元/M，非思考 0.6 元/M）
+	OutputCostThinkingRMB float64 `gorm:"type:decimal(16,4);default:0" json:"output_cost_thinking_rmb"` // 思考模式输出成本价
+	Currency              string  `gorm:"type:varchar(10);default:'CREDIT'" json:"currency"`             // 币种 CREDIT
 	Source              string     `gorm:"type:varchar(20);default:'manual'" json:"source"`           // manual=手动创建, auto=自动发现
 	LastSyncedAt        *time.Time `json:"last_synced_at,omitempty"`                                  // 上次自动同步时间
 
@@ -93,6 +96,8 @@ type AIModel struct {
 	Tags             string  `gorm:"type:varchar(500)" json:"tags,omitempty"`                 // 搜索标签（逗号分隔，如 "DeepSeek,深度求索"），支持跨供应商搜索
 	CallCount        int64   `gorm:"type:bigint;default:0;index" json:"call_count"`           // 累计调用次数
 	Discount         float64 `gorm:"type:decimal(5,4);default:0" json:"discount"`             // 模型独立折扣（0=未设置，继承供应商折扣；>0 如0.85=85折）
+	// v5.1: 标记免费层可用模型（Free 用户仅能调用 IsFreeTier=true 的模型，充值 >=10 元后解锁全部模型）
+	IsFreeTier       bool    `gorm:"default:false" json:"is_free_tier"`
 
 	Category ModelCategory `gorm:"foreignKey:CategoryID" json:"category,omitempty"` // 关联分类
 	Supplier Supplier      `gorm:"foreignKey:SupplierID" json:"supplier,omitempty"` // 关联供应商

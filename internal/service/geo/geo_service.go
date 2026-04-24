@@ -11,7 +11,9 @@ import (
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
+
 	"tokenhub-server/internal/config"
+	"tokenhub-server/internal/pkg/safego"
 )
 
 // ========================================================================
@@ -165,7 +167,7 @@ func (s *GeoService) raceProviders(
 	ch := make(chan result, len(providers))
 	for _, p := range providers {
 		p := p
-		go func() {
+		safego.Go("geo-provider-race", func() {
 			cc, err := p.fn(ctx, ip)
 			if err == nil && cc != "" {
 				select {
@@ -179,7 +181,7 @@ func (s *GeoService) raceProviders(
 				case <-ctx.Done():
 				}
 			}
-		}()
+		})
 	}
 
 	failed := 0

@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 )
@@ -27,7 +28,9 @@ func TestUpdateProfile_Success(t *testing.T) {
 
 	newName := uniqueName("updated")
 	resp, statusCode, err := doPut(baseURL+"/api/v1/user/profile", map[string]string{
-		"name": newName,
+		"name":        newName,
+		"email_code":  testMagicEmailCode,
+		"invite_code": testInviteCode,
 	}, userToken)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
@@ -45,11 +48,7 @@ func TestChangePassword_Success(t *testing.T) {
 	oldPass := "Test@123456"
 	newPass := "NewPass@789"
 
-	_, statusCode, _ := doPost(baseURL+"/api/v1/auth/register", map[string]string{
-		"email":    email,
-		"password": oldPass,
-		"name":     "ChPwdUser",
-	}, "")
+	_, statusCode, _ := doPost(baseURL+"/api/v1/auth/register", registerPayload(email, oldPass, "ChPwdUser"), "")
 	skipIfNotImplemented(t, statusCode)
 
 	token, err := loginUser(email, oldPass)
@@ -59,8 +58,8 @@ func TestChangePassword_Success(t *testing.T) {
 
 	// Change password
 	resp, statusCode, err := doPost(baseURL+"/api/v1/user/change-password", map[string]string{
-		"old_password": oldPass,
-		"new_password": newPass,
+		"old_password": authPassword(email, oldPass),
+		"new_password": authPassword(email, newPass),
 	}, token)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
@@ -111,6 +110,50 @@ func TestAdminListUsers_Success(t *testing.T) {
 	}
 }
 
+func TestAdminListUsers_SearchByKeyword(t *testing.T) {
+	requireAdmin(t)
+
+	email := uniqueEmail("admin_search")
+	name := uniqueName("AdminSearchUser")
+	createResp, createStatus, err := doPost(baseURL+"/api/v1/admin/users/batch", map[string]interface{}{
+		"users": []map[string]interface{}{
+			{
+				"email":    email,
+				"name":     name,
+				"password": "Test@123456",
+				"role":     "USER",
+			},
+		},
+	}, adminToken)
+	if err != nil {
+		t.Fatalf("create user request failed: %v", err)
+	}
+	skipIfNotImplemented(t, createStatus)
+	skipIfNotFound(t, createStatus)
+	skipIfForbidden(t, createStatus)
+	if createStatus != http.StatusOK {
+		t.Fatalf("expected create 200, got %d: %s", createStatus, createResp.Message)
+	}
+
+	resp, statusCode, err := doGet(baseURL+"/api/v1/admin/users?page=1&page_size=20&search="+email, adminToken)
+	if err != nil {
+		t.Fatalf("search by email request failed: %v", err)
+	}
+	if statusCode != http.StatusOK {
+		t.Fatalf("expected search by email 200, got %d: %s", statusCode, resp.Message)
+	}
+	assertUserSearchContainsOnly(t, resp, email, "")
+
+	resp, statusCode, err = doGet(baseURL+"/api/v1/admin/users?page=1&page_size=20&search="+name, adminToken)
+	if err != nil {
+		t.Fatalf("search by name request failed: %v", err)
+	}
+	if statusCode != http.StatusOK {
+		t.Fatalf("expected search by name 200, got %d: %s", statusCode, resp.Message)
+	}
+	assertUserSearchContainsOnly(t, resp, email, name)
+}
+
 func TestUserListUsers_Forbidden(t *testing.T) {
 	requireUser(t)
 
@@ -127,4 +170,25 @@ func TestUserListUsers_Forbidden(t *testing.T) {
 	if statusCode != http.StatusForbidden && statusCode != http.StatusUnauthorized {
 		t.Logf("got status %d (expected 403 or 401)", statusCode)
 	}
+}
+
+func assertUserSearchContainsOnly(t *testing.T, resp *apiResponse, expectedEmail, expectedName string) {
+	t.Helper()
+	page, err := parsePageData(resp)
+	if err != nil {
+		t.Fatalf("parse page data: %v", err)
+	}
+	var users []struct {
+		Email string `json:"email"`
+		Name  string `json:"name"`
+	}
+	if err := json.Unmarshal(page.List, &users); err != nil {
+		t.Fatalf("parse users: %v", err)
+	}
+	for _, u := range users {
+		if u.Email == expectedEmail && (expectedName == "" || u.Name == expectedName) {
+			return
+		}
+	}
+	t.Fatalf("expected search results to include %s/%s, got %d users", expectedEmail, expectedName, len(users))
 }

@@ -14,10 +14,12 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 
+	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/errcode"
 	pkgredis "tokenhub-server/internal/pkg/redis"
 	"tokenhub-server/internal/pkg/response"
 	membersvc "tokenhub-server/internal/service/member"
+	ratelimitsvc "tokenhub-server/internal/service/ratelimit"
 )
 
 // ========== 多层级限流中间件 ==========
@@ -27,9 +29,10 @@ const (
 	// rateLimitWindow 滑动窗口大小：1分钟
 	rateLimitWindow = 60 * time.Second
 	// 默认各级别限流阈值
-	defaultIPRPM      = 30   // IP级：未认证请求 30 req/min
-	defaultUserRPM    = 120  // 用户级：已认证用户 120 req/min
-	defaultAPIKeyRPM  = 60   // API Key级：Open API 60 req/min
+	// 指导原则：IP 宽松（共享出口防误伤） + 用户适中（Dashboard 并发留余量） + API Key 收紧（被盗快速熔断）
+	defaultIPRPM      = 600  // IP级：10 QPS 余量，CGNAT/办公室出口 IP 共享不误伤
+	defaultUserRPM    = 300  // 用户级：Dashboard 首屏并发 20+ 留 10 倍余量
+	defaultAPIKeyRPM  = 120  // API Key级：企业 Key 默认 2 QPS，高需求管理后台单独调高
 	defaultGlobalQPS  = 1000 // 全局 QPS 上限
 )
 
@@ -135,6 +138,7 @@ func MultiLevelRateLimiter() gin.HandlerFunc {
 		// 层级1：全局 QPS 上限保护
 		if !checkGlobalQPS(cfg.GlobalQPS) {
 			setRateLimitHeaders(c, cfg.GlobalQPS, 0, time.Now().Add(time.Second).Unix())
+			recordRateLimitEvent(c, "global", "qps", "global_qps", cfg.GlobalQPS, 1)
 			response.Error(c, http.StatusTooManyRequests, errcode.ErrRateLimit)
 			c.Abort()
 			return
@@ -244,6 +248,9 @@ func slidingWindowCheck(ctx context.Context, redis *goredis.Client, key string, 
 			secondsUntilReset = 1
 		}
 		c.Header("Retry-After", strconv.FormatInt(secondsUntilReset, 10))
+		// 异步记录 429 事件
+		subjectType, subjectID, rule := parseRateLimitKey(key)
+		recordRateLimitEvent(c, subjectType, subjectID, rule, limit, int(rateLimitWindow.Seconds()))
 		response.ErrorMsg(c, http.StatusTooManyRequests, errcode.ErrRateLimit.Code,
 			fmt.Sprintf("Too many requests, please retry after %d seconds", secondsUntilReset))
 		c.Abort()
@@ -251,6 +258,59 @@ func slidingWindowCheck(ctx context.Context, redis *goredis.Client, key string, 
 	}
 
 	return true
+}
+
+// parseRateLimitKey 解析 Redis key 前缀反推 (subjectType, subjectID, rule)
+// 支持 rl:ip:, rl:user:, rl:apikey:, rl:member_rpm:, rl:strict:<path>:<ip|user:uid>
+func parseRateLimitKey(key string) (subjectType, subjectID, rule string) {
+	rule = "sliding_60s"
+	if strings.HasPrefix(key, "rl:ip:") {
+		return "ip", strings.TrimPrefix(key, "rl:ip:"), rule
+	}
+	if strings.HasPrefix(key, "rl:user:") {
+		return "user", strings.TrimPrefix(key, "rl:user:"), rule
+	}
+	if strings.HasPrefix(key, "rl:apikey:") {
+		return "apikey", strings.TrimPrefix(key, "rl:apikey:"), rule
+	}
+	if strings.HasPrefix(key, "rl:member_rpm:") {
+		return "member", strings.TrimPrefix(key, "rl:member_rpm:"), "member_rpm"
+	}
+	if strings.HasPrefix(key, "rl:strict:") {
+		// 格式：rl:strict:<path>:<ip>  或  rl:strict:<path>:user:<uid>
+		rest := strings.TrimPrefix(key, "rl:strict:")
+		if idx := strings.LastIndex(rest, ":user:"); idx >= 0 {
+			return "strict_user", rest[idx+len(":user:"):], "strict:" + rest[:idx]
+		}
+		if idx := strings.LastIndex(rest, ":"); idx >= 0 {
+			return "strict_ip", rest[idx+1:], "strict:" + rest[:idx]
+		}
+		return "strict", rest, "strict"
+	}
+	return "unknown", key, rule
+}
+
+// recordRateLimitEvent 异步记录 429 事件（fail-open，失败不阻塞请求）
+func recordRateLimitEvent(c *gin.Context, subjectType, subjectID, rule string, limit, windowSec int) {
+	if ratelimitsvc.Default == nil {
+		return
+	}
+	// 截断 user agent 避免超长
+	ua := c.GetHeader("User-Agent")
+	if len(ua) > 512 {
+		ua = ua[:512]
+	}
+	ratelimitsvc.Default.Enqueue(&model.RateLimitEvent{
+		SubjectType: subjectType,
+		SubjectID:   subjectID,
+		Rule:        rule,
+		LimitVal:    limit,
+		WindowSec:   windowSec,
+		Path:        c.FullPath(),
+		Method:      c.Request.Method,
+		UserAgent:   ua,
+		RequestID:   c.GetString("requestId"),
+	})
 }
 
 // setRateLimitHeaders 设置标准限流响应头

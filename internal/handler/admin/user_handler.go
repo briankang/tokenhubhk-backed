@@ -30,8 +30,9 @@ func (h *UserHandler) List(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 	tenantID, _ := strconv.ParseUint(c.Query("tenant_id"), 10, 64)
+	search := c.Query("search")
 
-	users, total, err := h.svc.List(c.Request.Context(), uint(tenantID), page, pageSize)
+	users, total, err := h.svc.List(c.Request.Context(), uint(tenantID), search, page, pageSize)
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return

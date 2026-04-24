@@ -1,6 +1,9 @@
 package admin
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -9,8 +12,50 @@ import (
 	"gorm.io/gorm"
 
 	"tokenhub-server/internal/pkg/errcode"
+	pkgredis "tokenhub-server/internal/pkg/redis"
 	"tokenhub-server/internal/pkg/response"
 )
+
+// ========================================================================
+// 共享缓存辅助（admin:stats:*）
+// 所有 /admin/stats/* 端点复用此逻辑：
+//   - cacheHit: true 表示命中并已写响应；调用方应 return
+//   - cacheWrite: 计算完成后在返回 response.Success 前写缓存
+// Redis 不可用时 fail-open（cacheHit 永远 false，cacheWrite 静默跳过）
+// ========================================================================
+
+const (
+	statsCacheTTLShort = 30 * time.Minute
+	statsCacheTTLLong  = 1 * time.Hour
+)
+
+func statsCacheGet(ctx context.Context, key string, dst any) bool {
+	if pkgredis.Client == nil {
+		return false
+	}
+	raw, err := pkgredis.Client.Get(ctx, key).Result()
+	if err != nil {
+		return false
+	}
+	return json.Unmarshal([]byte(raw), dst) == nil
+}
+
+func statsCacheSet(ctx context.Context, key string, value any, ttl time.Duration) {
+	if pkgredis.Client == nil {
+		return
+	}
+	if data, err := json.Marshal(value); err == nil {
+		_ = pkgredis.Client.Set(ctx, key, string(data), ttl).Err()
+	}
+}
+
+func statsCacheKey(kind, startDate, endDate string, extra ...string) string {
+	base := fmt.Sprintf("admin:stats:%s:%s:%s", kind, startDate, endDate)
+	for _, e := range extra {
+		base += ":" + e
+	}
+	return base
+}
 
 // StatsHandler 运营统计接口处理器
 type StatsHandler struct {
@@ -75,6 +120,14 @@ type RegistrationStatsResponse struct {
 func (h *StatsHandler) GetRegistrationStats(c *gin.Context) {
 	startDate, endDate := parseDateRange(c)
 
+	// 尝试缓存命中（1h TTL）
+	cacheKey := statsCacheKey("registrations", startDate, endDate)
+	var cached RegistrationStatsResponse
+	if statsCacheGet(c.Request.Context(), cacheKey, &cached) {
+		response.Success(c, cached)
+		return
+	}
+
 	// 1. 查询每日注册数（含邀请注册子集）
 	type dayRow struct {
 		Date         string `gorm:"column:date"`
@@ -126,12 +179,14 @@ func (h *StatsHandler) GetRegistrationStats(c *gin.Context) {
 		totalGiftRmb += giftRmb
 	}
 
-	response.Success(c, RegistrationStatsResponse{
+	resp := RegistrationStatsResponse{
 		Items:         items,
 		TotalNewUsers: totalNew,
 		TotalInvited:  totalInvited,
 		TotalGiftRmb:  totalGiftRmb,
-	})
+	}
+	statsCacheSet(c.Request.Context(), cacheKey, resp, statsCacheTTLLong)
+	response.Success(c, resp)
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -186,6 +241,21 @@ func (h *StatsHandler) GetReferralStats(c *gin.Context) {
 		pageSize = 20
 	}
 	offset := (page - 1) * pageSize
+
+	// 缓存键含分页 + 筛选条件（仅无 keyword 时命中，keyword 搜索基数大不缓存）
+	cacheable := keyword == ""
+	cacheKey := statsCacheKey("referrals", startDate, endDate,
+		fmt.Sprintf("p%d", page),
+		fmt.Sprintf("s%d", pageSize),
+		"f"+statusFilter,
+	)
+	if cacheable {
+		var cached ReferralStatsResponse
+		if statsCacheGet(c.Request.Context(), cacheKey, &cached) {
+			response.Success(c, cached)
+			return
+		}
+	}
 
 	// 构建 WHERE 子句
 	statusWhere := ""
@@ -318,7 +388,7 @@ func (h *StatsHandler) GetReferralStats(c *gin.Context) {
 		})
 	}
 
-	response.Success(c, ReferralStatsResponse{
+	resp := ReferralStatsResponse{
 		List:  items,
 		Total: total,
 		Summary: ReferralStatsSummary{
@@ -327,7 +397,11 @@ func (h *StatsHandler) GetReferralStats(c *gin.Context) {
 			TotalCommissionRmb: sum.TotalCommission,
 			PendingRmb:         sum.Pending,
 		},
-	})
+	}
+	if cacheable {
+		statsCacheSet(c.Request.Context(), cacheKey, resp, statsCacheTTLShort)
+	}
+	response.Success(c, resp)
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -351,6 +425,7 @@ type PnLDayItem struct {
 // PnLSummary 利润表汇总
 type PnLSummary struct {
 	TotalRechargeRmb       float64 `json:"total_recharge_rmb"`
+	TotalApiRevenueRmb     float64 `json:"total_api_revenue_rmb"`
 	TotalApiCostRmb        float64 `json:"total_api_cost_rmb"`
 	TotalCommissionPaidRmb float64 `json:"total_commission_paid_rmb"`
 	TotalRefundRmb         float64 `json:"total_refund_rmb"`
@@ -375,6 +450,14 @@ func (h *StatsHandler) GetPnLStatement(c *gin.Context) {
 	startDate, endDate := parseDateRange(c)
 
 	ctx := c.Request.Context()
+
+	// 尝试缓存（1h TTL，P&L 数据稳定）
+	cacheKey := statsCacheKey("pnl", startDate, endDate)
+	var cached PnLResponse
+	if statsCacheGet(ctx, cacheKey, &cached) {
+		response.Success(c, cached)
+		return
+	}
 
 	// ---------- 1. 每日充值进账（payments, status=completed）----------
 	type rechargeRow struct {
@@ -525,10 +608,10 @@ func (h *StatsHandler) GetPnLStatement(c *gin.Context) {
 		refund := refundByDate[d]
 		giftCost := float64(regByDate[d]*defaultFreeQuota) / 10000.0
 
-		net := recharge - s.TotalCost - commission - refund - giftCost
+		net := s.TotalRevenue - s.TotalCost - commission - refund - giftCost
 		margin := 0.0
-		if recharge > 0 {
-			margin = net / recharge
+		if s.TotalRevenue > 0 {
+			margin = net / s.TotalRevenue
 		}
 
 		items = append(items, PnLDayItem{
@@ -553,18 +636,21 @@ func (h *StatsHandler) GetPnLStatement(c *gin.Context) {
 		}
 
 		sum.TotalRechargeRmb += recharge
+		sum.TotalApiRevenueRmb += s.TotalRevenue
 		sum.TotalApiCostRmb += s.TotalCost
 		sum.TotalCommissionPaidRmb += commission
 		sum.TotalRefundRmb += refund
 		sum.TotalGiftCostRmb += giftCost
 	}
 
-	sum.NetProfitRmb = sum.TotalRechargeRmb - sum.TotalApiCostRmb - sum.TotalCommissionPaidRmb - sum.TotalRefundRmb - sum.TotalGiftCostRmb
-	if sum.TotalRechargeRmb > 0 {
-		sum.AvgProfitMargin = sum.NetProfitRmb / sum.TotalRechargeRmb
+	sum.NetProfitRmb = sum.TotalApiRevenueRmb - sum.TotalApiCostRmb - sum.TotalCommissionPaidRmb - sum.TotalRefundRmb - sum.TotalGiftCostRmb
+	if sum.TotalApiRevenueRmb > 0 {
+		sum.AvgProfitMargin = sum.NetProfitRmb / sum.TotalApiRevenueRmb
 	}
 
-	response.Success(c, PnLResponse{Items: items, Summary: sum})
+	resp := PnLResponse{Items: items, Summary: sum}
+	statsCacheSet(ctx, cacheKey, resp, statsCacheTTLLong)
+	response.Success(c, resp)
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -611,6 +697,14 @@ type PaymentAnalysisResponse struct {
 func (h *StatsHandler) GetPaymentAnalysis(c *gin.Context) {
 	startDate, endDate := parseDateRange(c)
 	ctx := c.Request.Context()
+
+	// 尝试缓存（1h TTL）
+	cacheKey := statsCacheKey("payment-analysis", startDate, endDate)
+	var cached PaymentAnalysisResponse
+	if statsCacheGet(ctx, cacheKey, &cached) {
+		response.Success(c, cached)
+		return
+	}
 
 	// 按日+网关聚合
 	type rawRow struct {
@@ -745,7 +839,7 @@ func (h *StatsHandler) GetPaymentAnalysis(c *gin.Context) {
 		})
 	}
 
-	response.Success(c, PaymentAnalysisResponse{
+	resp := PaymentAnalysisResponse{
 		Daily:          daily,
 		GatewaySummary: gwSummary,
 		Summary: PaymentSummary{
@@ -753,7 +847,9 @@ func (h *StatsHandler) GetPaymentAnalysis(c *gin.Context) {
 			TotalRefundRmb:   sumRefund,
 			TotalOrderCount:  sumOrders,
 		},
-	})
+	}
+	statsCacheSet(ctx, cacheKey, resp, statsCacheTTLLong)
+	response.Success(c, resp)
 }
 
 // ────────────────────────────────────────────────────────────────

@@ -429,7 +429,7 @@ func (s *OpenAPIService) GetAccountInfo(ctx context.Context, userID uint) (*Acco
 		UserID:   user.ID,
 		Name:     user.Name,
 		Email:    user.Email,
-		Role:     user.Role,
+		Role:     "", // v4.0: role 字段已废弃；如需展示用户角色，查询 user_roles 表
 		Language: user.Language,
 		IsActive: user.IsActive,
 	}, nil

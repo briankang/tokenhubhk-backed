@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,10 +55,51 @@ func (r *ChatRequest) Validate() error {
 }
 
 // Message 单条聊天消息结构体
+//
+// Content 字段类型为 interface{} 以兼容 OpenAI 多模态规范：
+//   - string：普通文本消息（绝大多数场景）
+//   - []interface{} / []map[string]interface{}：多模态数组，如
+//     [{"type":"text","text":"..."}, {"type":"image_url","image_url":{"url":"..."}}]
+//
+// 下游供应商适配器应通过 TextContent(m.Content) 取扁平文本（用于日志/缓存判断/Token 估算），
+// 通过 m.Content 原样序列化给上游（支持多模态的供应商如豆包/Qwen-VL/GPT-4V 会自动识别数组格式）。
 type Message struct {
-	Role             string `json:"role"`              // system/user/assistant
-	Content          string `json:"content"`
-	ReasoningContent string `json:"reasoning_content,omitempty"` // 深度思考内容（豆包/Qwen3/DeepSeek-R1等）
+	Role             string      `json:"role"`              // system/user/assistant
+	Content          interface{} `json:"content"`
+	ReasoningContent string      `json:"reasoning_content,omitempty"` // 深度思考内容（豆包/Qwen3/DeepSeek-R1等）
+}
+
+// TextContent 从 Message.Content 中提取扁平文本。
+//   - string → 原样返回
+//   - []interface{} → 遍历元素，拼接所有 {"type":"text","text":"..."} 的 text 字段
+//   - 其它类型 → 返回空串
+//
+// 用于日志、cache_control 判断、Token 估算等需要纯文本的场景。不影响上游请求的多模态透传。
+func TextContent(c interface{}) string {
+	if c == nil {
+		return ""
+	}
+	switch v := c.(type) {
+	case string:
+		return v
+	case []interface{}:
+		var sb strings.Builder
+		for _, item := range v {
+			if m, ok := item.(map[string]interface{}); ok {
+				if t, _ := m["type"].(string); t == "text" {
+					if txt, ok := m["text"].(string); ok {
+						if sb.Len() > 0 {
+							sb.WriteString("\n")
+						}
+						sb.WriteString(txt)
+					}
+				}
+			}
+		}
+		return sb.String()
+	default:
+		return ""
+	}
 }
 
 // ChatResponse 统一响应格式
@@ -83,6 +125,9 @@ type Usage struct {
 	// 缓存相关字段（不支持缓存的供应商保持零值）
 	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`  // 缓存命中Token数（OpenAI cached_tokens / Anthropic cache_read_input_tokens）
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"` // 缓存写入Token数（Anthropic cache_creation_input_tokens）
+	// 思考模式 Token（阿里云 qwen3.x-plus / deepseek-r1 / qwq 系列等；未使用思考时 0）
+	// 从上游返回的 usage.completion_tokens_details.reasoning_tokens / response.reasoning_content 解析
+	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
 }
 
 // StreamChunk 单个流式响应分片

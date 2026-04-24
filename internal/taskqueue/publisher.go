@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"tokenhub-server/internal/pkg/logger"
+	"tokenhub-server/internal/pkg/safego"
 )
 
 // Publisher 任务发布者，由 Backend 使用将重操作委派给 Worker
@@ -90,7 +91,7 @@ func (p *Publisher) SubscribeProgress(ctx context.Context, taskID string) (<-cha
 
 	ch := make(chan TaskProgress, 10)
 
-	go func() {
+	safego.Go("taskqueue-publisher-progress-sub", func() {
 		defer close(ch)
 		defer sub.Close()
 
@@ -118,7 +119,7 @@ func (p *Publisher) SubscribeProgress(ctx context.Context, taskID string) (<-cha
 				}
 			}
 		}
-	}()
+	})
 
 	return ch, nil
 }

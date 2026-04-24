@@ -34,31 +34,91 @@ func (h *RateLimitHandler) Register(rg *gin.RouterGroup) {
 }
 
 // GetRateLimits 获取全局限流配置 GET /api/v1/admin/rate-limits
+// 响应结构：{ rateLimits: {...}, apikeyAnomaly: {...} }
 func (h *RateLimitHandler) GetRateLimits(c *gin.Context) {
 	cfg := middleware.LoadRateLimiterConfig()
-	response.Success(c, cfg)
+	anomaly := middleware.LoadAPIKeyAnomalyConfig()
+	defaultQuota := balance.LoadDefaultUserQuotaConfig()
+	response.Success(c, gin.H{
+		"rateLimits":       cfg,
+		"apikeyAnomaly":    anomaly,
+		"defaultUserQuota": defaultQuota,
+	})
+}
+
+// rateLimitsUpdateRequest 支持嵌套更新 { rateLimits, apikeyAnomaly }
+// 兼容旧格式：若顶层字段 IPRPM/UserRPM/... 直接存在，按旧格式解析
+type rateLimitsUpdateRequest struct {
+	// 嵌套格式（推荐）
+	RateLimits       *middleware.RateLimiterConfig   `json:"rateLimits,omitempty"`
+	ApikeyAnomaly    *middleware.APIKeyAnomalyConfig `json:"apikeyAnomaly,omitempty"`
+	DefaultUserQuota *balance.DefaultUserQuotaConfig `json:"defaultUserQuota,omitempty"`
+	// 兼容旧格式（平铺）
+	middleware.RateLimiterConfig
 }
 
 // UpdateRateLimits 更新全局限流配置 PUT /api/v1/admin/rate-limits
+// 支持两种请求格式：
+//  1. { rateLimits: {...}, apikeyAnomaly: {...} }（推荐）
+//  2. { ipRpm, userRpm, apiKeyRpm, globalQps }（兼容旧格式）
 func (h *RateLimitHandler) UpdateRateLimits(c *gin.Context) {
-	var req middleware.RateLimiterConfig
+	var req rateLimitsUpdateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, http.StatusBadRequest, errcode.ErrBadRequest)
 		return
 	}
 
-	// 参数校验：各限流值必须为正数
-	if req.IPRPM <= 0 || req.UserRPM <= 0 || req.APIKeyRPM <= 0 || req.GlobalQPS <= 0 {
-		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrValidation.Code, "all rate limit values must be positive")
-		return
+	// 解析 rateLimits 部分（嵌套优先）
+	var rlCfg *middleware.RateLimiterConfig
+	if req.RateLimits != nil {
+		rlCfg = req.RateLimits
+	} else if req.RateLimiterConfig.IPRPM > 0 || req.RateLimiterConfig.UserRPM > 0 {
+		// 旧格式兼容
+		rlCfg = &req.RateLimiterConfig
 	}
 
-	if err := middleware.SaveRateLimiterConfig(&req); err != nil {
-		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
-		return
+	if rlCfg != nil {
+		if rlCfg.IPRPM <= 0 || rlCfg.UserRPM <= 0 || rlCfg.APIKeyRPM <= 0 || rlCfg.GlobalQPS <= 0 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrValidation.Code, "all rate limit values must be positive")
+			return
+		}
+		if err := middleware.SaveRateLimiterConfig(rlCfg); err != nil {
+			response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+			return
+		}
 	}
 
-	response.Success(c, req)
+	// 解析 apikeyAnomaly 部分
+	if req.ApikeyAnomaly != nil {
+		if req.ApikeyAnomaly.Threshold <= 0 || req.ApikeyAnomaly.WindowSeconds <= 0 || req.ApikeyAnomaly.BlockDurationSeconds <= 0 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrValidation.Code, "apikey anomaly values must be positive")
+			return
+		}
+		if err := middleware.SaveAPIKeyAnomalyConfig(req.ApikeyAnomaly); err != nil {
+			response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+			return
+		}
+	}
+
+	// 解析 defaultUserQuota 部分
+	if req.DefaultUserQuota != nil {
+		if req.DefaultUserQuota.MaxTokensPerReq <= 0 || req.DefaultUserQuota.MaxConcurrent <= 0 ||
+			req.DefaultUserQuota.DailyLimit < 0 || req.DefaultUserQuota.MonthlyLimit < 0 {
+			response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrValidation.Code, "invalid default user quota values")
+			return
+		}
+		if err := balance.SaveDefaultUserQuotaConfig(req.DefaultUserQuota); err != nil {
+			response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+			return
+		}
+	}
+
+	// 返回最新全量配置
+	response.Success(c, gin.H{
+		"rateLimits":       middleware.LoadRateLimiterConfig(),
+		"apikeyAnomaly":    middleware.LoadAPIKeyAnomalyConfig(),
+		"defaultUserQuota": balance.LoadDefaultUserQuotaConfig(),
+	})
 }
 
 // GetUserLimits 获取指定用户的限额配置 GET /api/v1/admin/users/:id/limits

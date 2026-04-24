@@ -63,6 +63,9 @@ type SupportConfig struct {
 	ProviderDocsTopK      int    `mapstructure:"provider_docs_top_k"`     // 默认 3
 	RateLimitPerHour      int    `mapstructure:"rate_limit_per_hour"`     // 用户级 chat 限流（默认 60）
 	TicketRateLimitPerDay int    `mapstructure:"ticket_rate_limit_per_day"` // 默认 20
+	// Phase A1: 向量存储后端。"memory" = 原 JSON + 内存余弦扫描（默认，MySQL/SQLite 通用）；
+	// "polardb" = 使用 PolarDB PolarSearch：VECTOR 列 + HNSW 索引 + DISTANCE() SQL 搜索
+	VectorStore string `mapstructure:"vector_store"`
 }
 
 // WithSupportDefaults 把零值字段填充为业务默认值
@@ -110,6 +113,12 @@ func (c *SupportConfig) WithDefaults() SupportConfig {
 	if out.TicketRateLimitPerDay <= 0 {
 		out.TicketRateLimitPerDay = 20
 	}
+	// 只接受 "memory" / "polardb"，其他值归一化为 "memory"
+	vs := strings.ToLower(strings.TrimSpace(out.VectorStore))
+	if vs != "polardb" {
+		vs = "memory"
+	}
+	out.VectorStore = vs
 	return out
 }
 
@@ -212,6 +221,9 @@ type DatabaseConfig struct {
 	MaxOpenConns    int    `mapstructure:"max_open_conns"`
 	MaxIdleConns    int    `mapstructure:"max_idle_conns"`
 	ConnMaxLifetime int    `mapstructure:"conn_max_lifetime"` // seconds
+	// ConnMaxIdleTime 空闲连接最大存活时间（秒），防止 RDS 侧 idle 超时关闭导致 bad connection。
+	// 应小于 MySQL/RDS wait_timeout（默认 28800s）。缺省值 300（5 分钟）。
+	ConnMaxIdleTime int `mapstructure:"conn_max_idle_time"`
 }
 
 // DSN 返回MySQL数据源名称连接字符串
@@ -314,6 +326,9 @@ func applyDefaults() {
 	}
 	if Global.Database.MaxIdleConns == 0 {
 		Global.Database.MaxIdleConns = 10
+	}
+	if Global.Database.ConnMaxIdleTime == 0 {
+		Global.Database.ConnMaxIdleTime = 300 // 5 分钟
 	}
 	if Global.Database.ConnMaxLifetime == 0 {
 		Global.Database.ConnMaxLifetime = 3600
@@ -439,6 +454,7 @@ func bindEnvVars() {
 	_ = viper.BindEnv("support.internal_api_key", "SUPPORT_INTERNAL_API_KEY")
 	_ = viper.BindEnv("support.embedding_model", "SUPPORT_EMBEDDING_MODEL")
 	_ = viper.BindEnv("support.budget_monthly_credits", "SUPPORT_BUDGET_MONTHLY_CREDITS")
+	_ = viper.BindEnv("support.vector_store", "SUPPORT_VECTOR_STORE")
 
 	// 汇率服务环境变量绑定
 	_ = viper.BindEnv("exchange_rate.primary_url", "EXCHANGE_RATE_PRIMARY_URL")

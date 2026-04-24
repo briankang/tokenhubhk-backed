@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm/clause"
 
 	"tokenhub-server/internal/model"
+	"tokenhub-server/internal/pkg/safego"
 )
 
 // StatsAggregator 统计聚合器，将 ChannelLog 记录聚合为 DailyStats
@@ -31,12 +32,14 @@ func NewStatsAggregator(db *gorm.DB, logger *zap.Logger) *StatsAggregator {
 
 // Start 启动后台 goroutine，每小时执行一次聚合任务
 func (a *StatsAggregator) Start(ctx context.Context) {
-	go func() {
-		// Run once at startup for today
+	safego.Go("stats-aggregator", func() {
+		// Run once at startup for today（用 Run 隔离初次执行的 panic）
 		today := time.Now().Format("2006-01-02")
-		if err := a.AggregateDaily(ctx, today); err != nil {
-			a.logger.Error("initial aggregation failed", zap.String("date", today), zap.Error(err))
-		}
+		safego.Run("stats-aggregator-initial", func() {
+			if err := a.AggregateDaily(ctx, today); err != nil {
+				a.logger.Error("initial aggregation failed", zap.String("date", today), zap.Error(err))
+			}
+		})
 
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
@@ -62,7 +65,7 @@ func (a *StatsAggregator) Start(ctx context.Context) {
 				}
 			}
 		}
-	}()
+	})
 
 	a.logger.Info("stats aggregator started (hourly)")
 }
@@ -94,23 +97,39 @@ func (a *StatsAggregator) AggregateDaily(ctx context.Context, date string) error
 
 	var rows []aggRow
 	err := a.db.WithContext(ctx).
-		Table("channel_logs").
+		Table("api_call_logs as acl").
 		Select(`
-			DATE(created_at) as date,
-			tenant_id,
-			0 as model_id,
-			channel_id,
-			agent_level,
-			COUNT(*) as total_requests,
-			COALESCE(SUM(request_tokens), 0) as total_input_tokens,
-			COALESCE(SUM(response_tokens), 0) as total_output_tokens,
-			0 as total_cost,
-			0 as total_revenue,
-			COALESCE(AVG(latency_ms), 0) as avg_latency_ms,
-			SUM(CASE WHEN error_message != '' AND error_message IS NOT NULL THEN 1 ELSE 0 END) as error_count
+			DATE(acl.created_at) as date,
+			acl.tenant_id,
+			COALESCE(am.id, 0) as model_id,
+			acl.channel_id,
+			COALESCE(t.level, 0) as agent_level,
+			COUNT(acl.id) as total_requests,
+			COALESCE(SUM(acl.prompt_tokens), 0) as total_input_tokens,
+			COALESCE(SUM(acl.completion_tokens), 0) as total_output_tokens,
+			COALESCE(SUM(CASE
+				WHEN acl.platform_cost_rmb > 0 THEN acl.platform_cost_rmb
+				WHEN COALESCE(am.pricing_unit, '') = 'per_image' THEN acl.image_count * am.input_cost_rmb
+				WHEN am.pricing_unit = 'per_second' THEN acl.duration_sec * am.input_cost_rmb
+				WHEN am.pricing_unit = 'per_minute' THEN (acl.duration_sec / 60.0) * am.input_cost_rmb
+				WHEN am.pricing_unit IN ('per_10k_characters', 'per_k_chars') THEN (acl.char_count / 10000.0) * am.input_cost_rmb
+				WHEN am.pricing_unit = 'per_million_characters' THEN (acl.char_count / 1000000.0) * am.input_cost_rmb
+				WHEN am.pricing_unit = 'per_call' THEN acl.call_count * am.input_cost_rmb
+				WHEN am.pricing_unit = 'per_hour' THEN (acl.duration_sec / 3600.0) * am.input_cost_rmb
+				ELSE
+					(((CASE WHEN acl.prompt_tokens - acl.cache_read_tokens - acl.cache_write_tokens > 0 THEN acl.prompt_tokens - acl.cache_read_tokens - acl.cache_write_tokens ELSE 0 END) / 1000000.0) * am.input_cost_rmb) +
+					((acl.cache_read_tokens / 1000000.0) * COALESCE(NULLIF(am.cache_input_price_rmb, 0), am.input_cost_rmb)) +
+					((acl.cache_write_tokens / 1000000.0) * COALESCE(NULLIF(am.cache_write_price_rmb, 0), am.input_cost_rmb)) +
+					((acl.completion_tokens / 1000000.0) * CASE WHEN acl.thinking_mode AND am.output_cost_thinking_rmb > 0 THEN am.output_cost_thinking_rmb ELSE am.output_cost_rmb END)
+			END), 0) as total_cost,
+			COALESCE(SUM(CASE WHEN COALESCE(acl.billing_status, 'settled') IN ('settled', 'no_charge') THEN acl.cost_rmb ELSE 0 END), 0) as total_revenue,
+			COALESCE(AVG(acl.total_latency_ms), 0) as avg_latency_ms,
+			SUM(CASE WHEN acl.status != 'success' THEN 1 ELSE 0 END) as error_count
 		`).
-		Where("DATE(created_at) = ?", date).
-		Group("DATE(created_at), tenant_id, channel_id, agent_level").
+		Joins("LEFT JOIN tenants t ON t.id = acl.tenant_id").
+		Joins("LEFT JOIN ai_models am ON am.model_name = COALESCE(NULLIF(acl.actual_model, ''), acl.request_model)").
+		Where("DATE(acl.created_at) = ?", date).
+		Group("DATE(acl.created_at), acl.tenant_id, COALESCE(am.id, 0), acl.channel_id, t.level").
 		Scan(&rows).Error
 
 	if err != nil {

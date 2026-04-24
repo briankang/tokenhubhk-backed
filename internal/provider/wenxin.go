@@ -255,10 +255,10 @@ func (p *WenxinProvider) convertRequest(req *ChatRequest, stream bool) *wenxinRe
 	msgs := make([]wenxinMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		if m.Role == "system" {
-			system = m.Content
+			system = TextContent(m.Content)
 			continue
 		}
-		msgs = append(msgs, wenxinMessage{Role: m.Role, Content: m.Content})
+		msgs = append(msgs, wenxinMessage{Role: m.Role, Content: TextContent(m.Content)})
 	}
 
 	return &wenxinRequest{

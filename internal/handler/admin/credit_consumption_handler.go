@@ -241,12 +241,19 @@ func (h *CreditConsumptionHandler) Daily(c *gin.Context) {
 func (h *CreditConsumptionHandler) ModelBreakdown(c *gin.Context) {
 	userID := c.Query("user_id")
 	date := c.Query("date")
-	if userID == "" || date == "" {
-		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrValidation.Code, "user_id 和 date 必填")
+	startDate := c.Query("start_date")
+	endDate := c.Query("end_date")
+	if userID == "" {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrValidation.Code, "user_id is required")
+		return
+	}
+	if date == "" && startDate == "" && endDate == "" {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrValidation.Code, "date or date range is required")
 		return
 	}
 
 	type modelRow struct {
+		Date         string  `json:"date,omitempty"`
 		RequestModel string  `json:"request_model"`
 		RequestCount int64   `json:"request_count"`
 		SuccessCount int64   `json:"success_count"`
@@ -260,20 +267,41 @@ func (h *CreditConsumptionHandler) ModelBreakdown(c *gin.Context) {
 	}
 
 	var rows []modelRow
-	err := h.db.WithContext(c.Request.Context()).
+	q := h.db.WithContext(c.Request.Context()).
 		Table("user_daily_stats").
-		Select(`request_model, request_count, success_count, error_count,
-			input_tokens, output_tokens, total_tokens,
-			cost_credits, cost_credits/10000.0 AS cost_rmb, avg_latency_ms`).
-		Where("user_id = ? AND date = ?", userID, date).
-		Order("cost_credits DESC").
-		Limit(100).
-		Scan(&rows).Error
+		Where("user_id = ?", userID)
+	if date != "" {
+		q = q.Where("date = ?", date).
+			Select(`date, request_model, request_count, success_count, error_count,
+				input_tokens, output_tokens, total_tokens,
+				cost_credits, cost_credits/10000.0 AS cost_rmb, avg_latency_ms`).
+			Order("cost_credits DESC")
+	} else {
+		if startDate != "" {
+			q = q.Where("date >= ?", startDate)
+		}
+		if endDate != "" {
+			q = q.Where("date <= ?", endDate)
+		}
+		q = q.Select(`date, request_model,
+				SUM(request_count) AS request_count,
+				SUM(success_count) AS success_count,
+				SUM(error_count) AS error_count,
+				SUM(input_tokens) AS input_tokens,
+				SUM(output_tokens) AS output_tokens,
+				SUM(total_tokens) AS total_tokens,
+				SUM(cost_credits) AS cost_credits,
+				SUM(cost_credits)/10000.0 AS cost_rmb,
+				AVG(avg_latency_ms) AS avg_latency_ms`).
+			Group("date, request_model").
+			Order("date DESC, cost_credits DESC")
+	}
+	err := q.Limit(500).Scan(&rows).Error
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return
 	}
-	response.Success(c, rows)
+	response.Success(c, gin.H{"list": rows})
 }
 
 // ExportCSV 导出积分消耗按日报表 CSV

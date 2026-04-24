@@ -221,20 +221,38 @@ func collectPermissionIDs(br BuiltinRole, permsByCode map[string]*model.Permissi
 	return out
 }
 
-// backfillUserRoles 根据 users.role 字符串为未分配角色的用户回填 user_roles
-// 仅对 user_roles 表无记录的用户执行，保证幂等。
+// backfillUserRoles 为缺少 user_roles 记录的用户兜底分配默认角色
+// v4.0: users.role 列已不可依赖（可能已 DROP），改为统一默认 USER
+// 首次启动时 Phase 1 迁移仍能读到 role 字段做精确映射；列被删后只能默认 USER。
 func backfillUserRoles(db *gorm.DB, rolesByCode map[string]*model.Role) (int, error) {
-	// 查询尚未有任何 user_roles 记录的用户列表
+	// 检查 users.role 是否仍存在
+	var roleColExists int64
+	db.Raw(`
+		SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'role'
+	`).Scan(&roleColExists)
+
 	type userRow struct {
 		ID   uint
 		Role string
 	}
 	var users []userRow
-	sql := `
-		SELECT u.id, u.role
-		FROM users u
-		WHERE NOT EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id)
-	`
+	var sql string
+	if roleColExists > 0 {
+		// legacy 路径：精确映射
+		sql = `
+			SELECT u.id, u.role
+			FROM users u
+			WHERE NOT EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id)
+		`
+	} else {
+		// v4.0 路径：列已 DROP，全部默认 USER
+		sql = `
+			SELECT u.id, '' AS role
+			FROM users u
+			WHERE NOT EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id)
+		`
+	}
 	if err := db.Raw(sql).Scan(&users).Error; err != nil {
 		return 0, fmt.Errorf("query users without roles: %w", err)
 	}
@@ -246,10 +264,11 @@ func backfillUserRoles(db *gorm.DB, rolesByCode map[string]*model.Role) (int, er
 	rows := make([]model.UserRole, 0, len(users))
 	now := time.Now()
 	for _, u := range users {
-		targetCode, ok := LegacyRoleMapping[u.Role]
-		if !ok {
-			targetCode = "USER"
-			if logger.L != nil {
+		targetCode := "USER"
+		if u.Role != "" {
+			if mapped, ok := LegacyRoleMapping[u.Role]; ok {
+				targetCode = mapped
+			} else if logger.L != nil {
 				logger.L.Warn("unknown legacy role, falling back to USER",
 					zap.Uint("user_id", u.ID),
 					zap.String("legacy_role", u.Role),
@@ -269,7 +288,7 @@ func backfillUserRoles(db *gorm.DB, rolesByCode map[string]*model.Role) (int, er
 		rows = append(rows, model.UserRole{
 			UserID:    u.ID,
 			RoleID:    targetRole.ID,
-			GrantedBy: 0, // 0 = 系统回填
+			GrantedBy: 0,
 			GrantedAt: now,
 		})
 	}

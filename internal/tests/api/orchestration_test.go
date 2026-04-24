@@ -112,7 +112,9 @@ func TestUpdateOrchestration_Success(t *testing.T) {
 	if err != nil || statusCode != http.StatusOK {
 		t.Skip("cannot create orchestration for update test")
 	}
-	var orch struct{ ID uint `json:"id"` }
+	var orch struct {
+		ID uint `json:"id"`
+	}
 	json.Unmarshal(createResp.Data, &orch)
 	if orch.ID == 0 {
 		t.Skip("no orchestration ID")
@@ -147,7 +149,9 @@ func TestDeleteOrchestration_Success(t *testing.T) {
 	if err != nil || statusCode != http.StatusOK {
 		t.Skip("cannot create orchestration for delete test")
 	}
-	var orch struct{ ID uint `json:"id"` }
+	var orch struct {
+		ID uint `json:"id"`
+	}
 	json.Unmarshal(createResp.Data, &orch)
 	if orch.ID == 0 {
 		t.Skip("no orchestration ID")

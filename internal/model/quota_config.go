@@ -16,6 +16,10 @@ type QuotaConfig struct {
 	InviterUnlockPaidRMB  int64 `gorm:"type:bigint;default:100000" json:"inviterUnlockPaidRmb"`      // 被邀者首次付费达此额度后解锁 InviterBonus(积分,默认 ¥10)
 	InviterMonthlyCap     int   `gorm:"default:10" json:"inviterMonthlyCap"`                         // 邀请人每月最多领奖人次(0=无限制,默认 10)
 
+	// --- v5.1 反滥用配置 ---
+	FreeQuotaExpiryDays   int   `gorm:"default:7" json:"freeQuotaExpiryDays"`                       // 免费额度过期天数(默认 7 天,0=永不过期)
+	PaidThresholdCredits  int64 `gorm:"type:bigint;default:100000" json:"paidThresholdCredits"`      // 付费用户判定门槛(积分,默认 100000 = ¥10)
+
 	IsActive    bool   `gorm:"default:true" json:"isActive"`
 	Description string `gorm:"size:200" json:"description"`
 }

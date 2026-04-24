@@ -25,12 +25,15 @@ import (
 	"tokenhub-server/internal/database"
 	adminHandler "tokenhub-server/internal/handler/admin"
 	"tokenhub-server/internal/model"
+	"tokenhub-server/internal/pkg/health"
 	"tokenhub-server/internal/pkg/logger"
 	"tokenhub-server/internal/pkg/metrics"
 	pkgredis "tokenhub-server/internal/pkg/redis"
 	"tokenhub-server/internal/router"
 	aimodelsvc "tokenhub-server/internal/service/aimodel"
 	auditsvc "tokenhub-server/internal/service/audit"
+	"tokenhub-server/internal/service/authlog"
+	ratelimitsvc "tokenhub-server/internal/service/ratelimit"
 	channelsvc "tokenhub-server/internal/service/channel"
 	memberSvc "tokenhub-server/internal/service/member"
 	"tokenhub-server/internal/service/modeldiscovery"
@@ -67,6 +70,7 @@ func main() {
 func runGateway() {
 	gin.SetMode(config.Global.Server.Mode)
 	engine := gin.New()
+	bootstrap.ConfigureTrustedProxies(engine)
 	engine.Use(metrics.RequestCounterMiddleware())
 	router.SetupGateway(engine)
 	engine.GET("/metrics", metrics.Handler(database.DB, pkgredis.Client, "gateway"))
@@ -79,6 +83,7 @@ func runGateway() {
 func runBackend() {
 	gin.SetMode(config.Global.Server.Mode)
 	engine := gin.New()
+	bootstrap.ConfigureTrustedProxies(engine)
 	engine.Use(metrics.RequestCounterMiddleware())
 	router.SetupBackend(engine)
 	router.RunCacheWarmer()
@@ -92,9 +97,10 @@ func runBackend() {
 func runWorker() {
 	gin.SetMode(config.Global.Server.Mode)
 	engine := gin.New()
-	engine.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "role": "worker"})
-	})
+	bootstrap.ConfigureTrustedProxies(engine)
+	engine.GET("/health", health.LivenessHandler("worker"))
+	engine.GET("/livez", health.LivenessHandler("worker"))
+	engine.GET("/readyz", health.ReadinessHandler("worker", database.DB, pkgredis.Client))
 	engine.GET("/metrics", metrics.Handler(database.DB, pkgredis.Client, "worker"))
 
 	// 创建共享服务实例
@@ -104,6 +110,8 @@ func runWorker() {
 	// 初始化全局审计服务（Worker 角色虽然不接收 HTTP 写请求，
 	// 但 Scheduler 的 audit_cleanup 任务依赖此服务清理 audit_logs 表）
 	auditsvc.InitDefault(database.DB, context.Background())
+	ratelimitsvc.InitDefault(database.DB, context.Background())
+	authlog.InitDefault(database.DB, context.Background())
 
 	// 启动 Scheduler（注入 capabilityTester 用于新模型自动触发）
 	scheduler := createScheduler(capTester)
@@ -308,6 +316,7 @@ func registerTaskHandlers(consumer *taskqueue.Consumer, capTester *aimodelsvc.Ca
 func runMonolith() {
 	gin.SetMode(config.Global.Server.Mode)
 	engine := gin.New()
+	bootstrap.ConfigureTrustedProxies(engine)
 	router.Setup(engine)
 	router.RunCacheWarmer()
 
@@ -333,6 +342,8 @@ func createScheduler(capTester ...*aimodelsvc.CapabilityTester) *cron.Scheduler 
 	opts := []cron.SchedulerOption{
 		cron.WithDiscoveryService(discoverySvc),
 		cron.WithAuditService(auditsvc.Default),
+		cron.WithRateLimitEventRecorder(ratelimitsvc.Default),
+		cron.WithAuthLogRecorder(authlog.Default),
 		cron.WithUserDailyAggService(userDailyAggSvc),
 	}
 	if len(capTester) > 0 && capTester[0] != nil {
@@ -342,6 +353,13 @@ func createScheduler(capTester ...*aimodelsvc.CapabilityTester) *cron.Scheduler 
 }
 
 // startServer 启动 HTTP 服务器并等待优雅关闭
+// shutdownTimeout 应配合 K8s terminationGracePeriodSeconds + preStop sleep 设置：
+//   grace - preStop - 30s(收尾缓冲) = shutdownTimeout 上限
+// 各角色推荐值：
+//   gateway  → 240s (grace=330, preStop=40, 其余收尾 ~50s)
+//   backend  → 180s (grace=240, preStop=40, 其余收尾 ~20s)
+//   worker   →  60s (grace=120, preStop=15)
+//   monolith →  60s (本地 dev，无 ALB)
 func startServer(engine *gin.Engine, writeTimeout time.Duration) {
 	addr := fmt.Sprintf(":%d", config.Global.Server.Port)
 	srv := &http.Server{
@@ -369,7 +387,21 @@ func startServer(engine *gin.Engine, writeTimeout time.Duration) {
 	sig := <-quit
 	logger.L.Info("shutdown signal received", zap.String("signal", sig.String()))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// 按角色选 shutdown 超时；保证正在处理的请求有机会返回，同时不超过 K8s grace 窗口
+	shutdownTimeout := 60 * time.Second
+	switch config.Global.Service.Role {
+	case config.RoleGateway:
+		shutdownTimeout = 240 * time.Second
+	case config.RoleBackend:
+		shutdownTimeout = 180 * time.Second
+	case config.RoleWorker:
+		shutdownTimeout = 60 * time.Second
+	}
+	logger.L.Info("graceful shutdown begin",
+		zap.Duration("timeout", shutdownTimeout),
+		zap.String("role", config.Global.Service.Role),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
@@ -378,6 +410,8 @@ func startServer(engine *gin.Engine, writeTimeout time.Duration) {
 
 	// 关闭审计日志异步队列（drain 剩余日志再退出）
 	auditsvc.ShutdownDefault()
+	ratelimitsvc.ShutdownDefault()
+	authlog.ShutdownDefault()
 
 	logger.L.Info("server exited gracefully")
 }

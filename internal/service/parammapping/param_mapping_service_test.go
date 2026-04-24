@@ -10,6 +10,7 @@ import (
 	"tokenhub-server/internal/model"
 
 	"gorm.io/driver/mysql"
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -23,17 +24,20 @@ var testSvc *ParamMappingService
 
 func TestMain(m *testing.M) {
 	dsn := os.Getenv("TEST_DATABASE_DSN")
+	var dialector gorm.Dialector
 	if dsn == "" {
-		dsn = "root:root123456@tcp(localhost:3306)/tokenhubhk?charset=utf8mb4&parseTime=True&loc=Local"
+		dialector = sqlite.Open(":memory:")
+	} else {
+		dialector = mysql.Open(dsn)
 	}
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
+	db, err := gorm.Open(dialector, &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
 		os.Exit(0) // 跳过测试：数据库不可用
 	}
 	testDB = db
-	_ = testDB.AutoMigrate(&model.PlatformParam{}, &model.SupplierParamMapping{})
+	_ = testDB.AutoMigrate(&model.PlatformParam{}, &model.SupplierParamMapping{}, &model.Supplier{}, &model.ModelCategory{}, &model.AIModel{})
 	testSvc = NewParamMappingService(testDB)
 	code := m.Run()
 	os.Exit(code)

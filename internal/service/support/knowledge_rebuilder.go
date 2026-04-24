@@ -21,10 +21,22 @@ import (
 type KnowledgeRebuilder struct {
 	db    *gorm.DB
 	embed *EmbeddingClient
+	// Phase A4: VectorStore=polardb 时，每条新建/更新的 chunk 同步写入 embedding_vec 列
+	vectorStore string
 }
 
 func NewKnowledgeRebuilder(db *gorm.DB, embed *EmbeddingClient) *KnowledgeRebuilder {
-	return &KnowledgeRebuilder{db: db, embed: embed}
+	return &KnowledgeRebuilder{db: db, embed: embed, vectorStore: "memory"}
+}
+
+// SetVectorStore 切换向量存储模式（由 Bootstrap 在启动期调用）
+func (b *KnowledgeRebuilder) SetVectorStore(mode string) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "polardb" {
+		b.vectorStore = "polardb"
+	} else {
+		b.vectorStore = "memory"
+	}
 }
 
 // RebuildStats 重建统计
@@ -217,6 +229,7 @@ func (b *KnowledgeRebuilder) rebuildSource(ctx context.Context, sourceType strin
 		// 写库
 		for j, p := range batch {
 			vecStr, _ := MarshalVector(vectors[j])
+			var rowID uint
 			if p.existingRow != nil {
 				// 更新
 				p.existingRow.Title = p.chunk.Title
@@ -232,6 +245,7 @@ func (b *KnowledgeRebuilder) rebuildSource(ctx context.Context, sourceType strin
 					continue
 				}
 				stats.Updated++
+				rowID = p.existingRow.ID
 			} else {
 				// 新建
 				row := model.KnowledgeChunk{
@@ -252,6 +266,12 @@ func (b *KnowledgeRebuilder) rebuildSource(ctx context.Context, sourceType strin
 					continue
 				}
 				stats.Created++
+				rowID = row.ID
+			}
+			// Phase A4: PolarDB 模式下同步写 embedding_vec 列
+			// 单行 UPDATE 失败不阻塞主流程（warn + 下次全量重建可补齐）
+			if b.vectorStore == "polardb" && rowID > 0 {
+				b.writeEmbeddingVec(ctx, rowID, vectors[j])
 			}
 		}
 	}
@@ -323,5 +343,29 @@ func hash(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// 确保引用 strings 包（未来可能加更多文本处理）
-var _ = strings.TrimSpace
+// writeEmbeddingVec 在 PolarDB 模式下，把 float32 向量写入 knowledge_chunks.embedding_vec 列。
+// SQL 使用 STRING_TO_VECTOR(?) 把 "[v1,v2,...]" 文本转换为 VECTOR 类型。
+// 失败时 warn + continue（不影响主重建流程，下次全量迁移/重建可补齐）。
+func (b *KnowledgeRebuilder) writeEmbeddingVec(ctx context.Context, rowID uint, vec []float32) {
+	if len(vec) == 0 {
+		return
+	}
+	var sb strings.Builder
+	sb.Grow(len(vec) * 10)
+	sb.WriteByte('[')
+	for i, x := range vec {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, "%.6f", x)
+	}
+	sb.WriteByte(']')
+
+	if err := b.db.WithContext(ctx).Exec(`
+		UPDATE knowledge_chunks
+		SET embedding_vec = STRING_TO_VECTOR(?)
+		WHERE id = ?`, sb.String(), rowID).Error; err != nil {
+		logger.L.Warn("polardb: write embedding_vec failed",
+			zap.Uint("id", rowID), zap.Error(err))
+	}
+}

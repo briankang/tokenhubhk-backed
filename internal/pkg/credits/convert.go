@@ -6,6 +6,14 @@ import "math"
 // 1 RMB = 10,000 credits（1元 = 1万积分）
 const CreditPerRMB = 10000
 
+// BillingUnitsPerRMB 是内部高精度计费单位。
+// 1 RMB = 100,000,000 billing units，用于微额供应商成本和审计快照。
+const BillingUnitsPerRMB = 100000000
+
+// BillingUnitsPerCredit 定义展示积分到内部计费单位的换算比例。
+// 1 credit = 0.0001 RMB = 10,000 billing units。
+const BillingUnitsPerCredit = BillingUnitsPerRMB / CreditPerRMB
+
 // RMBToCredits 将人民币金额转换为积分
 // 参数 rmb: 人民币金额（元）
 // 返回: 对应的积分数量（int64）
@@ -20,6 +28,26 @@ func RMBToCredits(rmb float64) int64 {
 // 换算规则: rmb = round(credits / 10000 * 10000) / 10000
 func CreditsToRMB(credits int64) float64 {
 	return math.Round(float64(credits)/CreditPerRMB*10000) / 10000
+}
+
+// RMBToBillingUnits 将人民币金额转换为内部高精度计费单位。
+func RMBToBillingUnits(rmb float64) int64 {
+	return int64(math.Round(rmb * BillingUnitsPerRMB))
+}
+
+// BillingUnitsToRMB 将内部高精度计费单位转换为人民币金额。
+func BillingUnitsToRMB(units int64) float64 {
+	return float64(units) / BillingUnitsPerRMB
+}
+
+// CreditsToBillingUnits 将展示/余额使用的积分转换为内部高精度计费单位。
+func CreditsToBillingUnits(credits int64) int64 {
+	return credits * BillingUnitsPerCredit
+}
+
+// BillingUnitsToCredits 将内部高精度计费单位转换为积分，采用四舍五入。
+func BillingUnitsToCredits(units int64) int64 {
+	return int64(math.Round(float64(units) / BillingUnitsPerCredit))
 }
 
 // CalculateWithFee 计算外币支付时的实际到账人民币金额

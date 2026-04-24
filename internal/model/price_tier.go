@@ -35,10 +35,14 @@ type PriceTier struct {
 	OutputPrice     float64 `json:"output_price"`                // 输出价格
 	CacheInputPrice float64 `json:"cache_input_price,omitempty"` // 缓存命中输入价
 	CacheWritePrice float64 `json:"cache_write_price,omitempty"` // 缓存写入价
+	// OutputPriceThinking: 思考模式输出成本价（0 = 不区分，与 OutputPrice 相同）
+	// 当阿里云等供应商在同一阶梯内将输出价拆分「非思考模式/思考模式」两档时使用
+	OutputPriceThinking float64 `json:"output_price_thinking,omitempty"`
 
 	// ---- 新增：阶梯独立售价覆盖（nil=走模型级 selling price，可叠加 DISCOUNT 折扣）----
-	SellingInputPrice  *float64 `json:"selling_input_price,omitempty"`
-	SellingOutputPrice *float64 `json:"selling_output_price,omitempty"`
+	SellingInputPrice         *float64 `json:"selling_input_price,omitempty"`
+	SellingOutputPrice        *float64 `json:"selling_output_price,omitempty"`
+	SellingOutputThinkingPrice *float64 `json:"selling_output_thinking_price,omitempty"` // 思考模式输出售价覆盖
 }
 
 // PriceTiersData 完整阶梯价格数据

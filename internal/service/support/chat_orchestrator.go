@@ -13,6 +13,7 @@ import (
 
 	goredis "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 
 	"tokenhub-server/internal/model"
@@ -90,13 +91,17 @@ type ChatRequest struct {
 
 // StreamEvent SSE 事件
 type StreamEvent struct {
-	Type      string `json:"type"`               // delta / done / error
-	Delta     string `json:"delta,omitempty"`    // 流式增量文本
+	Type      string `json:"type"`                  // delta / done / error / stage
+	Delta     string `json:"delta,omitempty"`       // 流式增量文本
 	SessionID uint   `json:"session_id,omitempty"`
 	MessageID uint   `json:"message_id,omitempty"`
 	DocRefs   []uint `json:"doc_refs,omitempty"`
 	NeedHuman bool   `json:"need_human,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// Phase B2: 阶段提示（type=stage）
+	// Stage 可选值：session_ready / detecting_lang / translating / retrieving_kb / kb_found / thinking / answering
+	Stage string `json:"stage,omitempty"`
+	Count int    `json:"count,omitempty"` // stage=kb_found 时携带命中条数
 }
 
 // Chat 主对话入口，通过 channel 流式推送事件
@@ -124,6 +129,7 @@ func (o *ChatOrchestrator) Chat(ctx context.Context, req ChatRequest, out chan<-
 		return
 	}
 	send(StreamEvent{Type: "delta", Delta: "", SessionID: session.ID}) // 发送 session_id 给前端
+	send(StreamEvent{Type: "stage", Stage: "session_ready", SessionID: session.ID})
 
 	// 2. 预算守护
 	level := o.budget.Check(ctx)
@@ -137,10 +143,11 @@ func (o *ChatOrchestrator) Chat(ctx context.Context, req ChatRequest, out chan<-
 		return
 	}
 
-	// 3. 语言检测
+	// 3. 语言检测（CJK 纯中文 fast-path 在 translator.ToZh 内部短路，不再额外调用 LLM）
 	origLang := o.translator.Detect(req.Message)
 	queryForRetrieval := req.Message
 	if origLang != "zh" {
+		send(StreamEvent{Type: "stage", Stage: "translating"})
 		// 翻译（用 qwen-turbo，传入回调）
 		translated := o.translator.ToZh(ctx, req.Message, func(ctx context.Context, sysPrompt, userText string) (string, error) {
 			return o.oneShotChat(ctx, "qwen-turbo", sysPrompt, userText, 0.1, 1024, false)
@@ -148,17 +155,40 @@ func (o *ChatOrchestrator) Chat(ctx context.Context, req ChatRequest, out chan<-
 		queryForRetrieval = translated
 	}
 
-	// 4. RAG 检索
-	chunks, _ := o.retriever.Retrieve(ctx, queryForRetrieval, RetrieveOptions{TopK: 5, Threshold: 0.5, MultiSource: true})
-
-	// 5. 供应商 URL 匹配
-	providerUrls := o.providerSvc.MatchByQuery(ctx, queryForRetrieval, 3)
-
-	// 6. 拉记忆
-	memories := o.memorySvc.Top(ctx, req.UserID, 10)
-
-	// 7. 历史对话
-	history := o.msgSvc.RecentForPrompt(ctx, session.ID, 8)
+	// ========== Phase B1：并行检索步骤 4-7 ==========
+	// 4. RAG 检索（最重，耗时 ~200-500ms）
+	// 5. 供应商 URL 匹配（全表 active 扫描 + 内存 filter，~10-50ms）
+	// 6. 拉记忆（DB 查询 + limit 10，~10ms）
+	// 7. 历史对话（DB 查询 + limit N，~5-20ms）
+	// 这四步彼此无依赖，错开独立 goroutine 并发执行；用 errgroup 聚合等待
+	send(StreamEvent{Type: "stage", Stage: "retrieving_kb"})
+	var (
+		chunks       []ScoredChunk
+		providerUrls []model.ProviderDocReference
+		memories     []model.UserSupportMemory
+		history      []map[string]string
+	)
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		c, _ := o.retriever.Retrieve(gctx, queryForRetrieval, RetrieveOptions{TopK: 5, Threshold: 0.5, MultiSource: true})
+		chunks = c
+		return nil
+	})
+	g.Go(func() error {
+		providerUrls = o.providerSvc.MatchByQuery(gctx, queryForRetrieval, 3)
+		return nil
+	})
+	g.Go(func() error {
+		memories = o.memorySvc.Top(gctx, req.UserID, 10)
+		return nil
+	})
+	g.Go(func() error {
+		history = o.msgSvc.RecentForPrompt(gctx, session.ID, 8)
+		return nil
+	})
+	// errgroup 中的任务全部是 best-effort，不会返回 error，可忽略
+	_ = g.Wait()
+	send(StreamEvent{Type: "stage", Stage: "kb_found", Count: len(chunks)})
 
 	// 8. 构造 system prompt
 	sysPrompt := o.prompt.Build(ctx, BuildInput{
@@ -170,9 +200,9 @@ func (o *ChatOrchestrator) Chat(ctx context.Context, req ChatRequest, out chan<-
 		HistoryTurns: len(history),
 	})
 
-	// 9. 挑模型
-	candidate := o.selector.Primary(ctx, level)
-	if candidate == nil {
+	// 9. 挑模型候选列表（支持 Fallback 链）
+	candidates := o.selector.Candidates(ctx, level)
+	if len(candidates) == 0 {
 		reply := o.prompt.BuildEmergencyReply(req.Locale)
 		_ = o.msgSvc.SaveUser(ctx, session.ID, req.Message, queryForRetrieval)
 		msgID, _ := o.msgSvc.SaveAssistant(ctx, session.ID, reply, "", nil, nil, true)
@@ -184,11 +214,31 @@ func (o *ChatOrchestrator) Chat(ctx context.Context, req ChatRequest, out chan<-
 	// 10. 保存用户消息（提前写入便于历史恢复）
 	_ = o.msgSvc.SaveUser(ctx, session.ID, req.Message, queryForRetrieval)
 
-	// 11. 调 LLM 流式
-	fullReply, tokensIn, tokensOut, err := o.streamLLM(ctx, candidate, sysPrompt, history, req.Message, out)
-	if err != nil {
-		send(StreamEvent{Type: "error", Error: "llm error: " + err.Error()})
-		// 可选：Fallback 到下一候选
+	// 11. 调 LLM 流式（Fallback 链：依次尝试候选模型，首个成功的为准）
+	send(StreamEvent{Type: "stage", Stage: "thinking"})
+	var (
+		fullReply          string
+		tokensIn, tokensOut int
+		usedCandidate      *model.SupportModelProfile
+		lastErr            error
+	)
+	for i := range candidates {
+		c := &candidates[i]
+		if i > 0 {
+			logger.L.Warn("support: fallback to next model",
+				zap.String("failed_model", candidates[i-1].ModelKey),
+				zap.String("next_model", c.ModelKey),
+				zap.Error(lastErr))
+		}
+		fullReply, tokensIn, tokensOut, lastErr = o.streamLLM(ctx, c, sysPrompt, history, req.Message, out)
+		if lastErr == nil {
+			usedCandidate = c
+			break
+		}
+	}
+	if lastErr != nil {
+		logger.L.Error("support: all model candidates failed", zap.Error(lastErr))
+		send(StreamEvent{Type: "error", Error: "service_unavailable"})
 		return
 	}
 
@@ -204,12 +254,12 @@ func (o *ChatOrchestrator) Chat(ctx context.Context, req ChatRequest, out chan<-
 	for _, u := range providerUrls {
 		urlStrings = append(urlStrings, u.URL)
 	}
-	msgID, _ := o.msgSvc.SaveAssistant(ctx, session.ID, cleanReply, candidate.ModelKey, chunkIDs, urlStrings, needHuman)
+	msgID, _ := o.msgSvc.SaveAssistant(ctx, session.ID, cleanReply, usedCandidate.ModelKey, chunkIDs, urlStrings, needHuman)
 	o.msgSvc.UpdateTokens(ctx, msgID, tokensIn, tokensOut)
 
 	// 13. 扣预算（用户消耗的 tokens × 模型成本近似）
 	// 简化：以 output tokens × 价格，仅估算（实际精确计费已在 /v1/chat/completions 内部处理）
-	go o.trackBudget(ctx, candidate.ModelKey, tokensIn, tokensOut)
+	go o.trackBudget(ctx, usedCandidate.ModelKey, tokensIn, tokensOut)
 
 	// 14. 异步提取记忆（每 5 条触发）
 	if session.MsgCount+2 > 0 && (session.MsgCount+2)%5 == 0 {
@@ -265,6 +315,7 @@ func (o *ChatOrchestrator) streamLLM(ctx context.Context, profile *model.Support
 	reader := bufio.NewReader(resp.Body)
 	var full strings.Builder
 	var tokensIn, tokensOut int
+	firstDeltaSent := false
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -299,6 +350,15 @@ func (o *ChatOrchestrator) streamLLM(ctx context.Context, profile *model.Support
 		if len(chunk.Choices) > 0 {
 			delta := chunk.Choices[0].Delta.Content
 			if delta != "" {
+				// 首个 delta 到达前发送 answering 阶段事件，让前端切换到"正在回答"UI
+				if !firstDeltaSent {
+					firstDeltaSent = true
+					select {
+					case <-ctx.Done():
+						return full.String(), tokensIn, tokensOut, ctx.Err()
+					case out <- StreamEvent{Type: "stage", Stage: "answering"}:
+					}
+				}
 				full.WriteString(delta)
 				select {
 				case <-ctx.Done():

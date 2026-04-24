@@ -96,45 +96,45 @@ func parseLocaleForLabels(acceptLang string) string {
 // PublicModelResponse 公开模型列表响应格式（供前端 /models 页面使用）
 // 字段命名遵循前端 AdminModel 类型定义
 type PublicModelResponse struct {
-	ID                 uint       `json:"id"`                    // 模型 ID
-	ModelID            string     `json:"model_id"`              // 模型标识符（如 gpt-4o）
-	Name               string     `json:"name"`                  // 展示名称
-	Provider           string     `json:"provider"`              // 供应商名称
-	ProviderIcon       string     `json:"provider_icon"`         // 供应商图标（emoji）
-	Description        string     `json:"description"`           // 模型描述
-	ContextWindow      int        `json:"context_window"`        // 上下文窗口大小
-	InputPrice         int64      `json:"input_price"`           // 输入价格（积分/百万token）
-	OutputPrice        int64      `json:"output_price"`          // 输出价格（积分/百万token）
-	InputPriceRMB      float64    `json:"input_price_rmb"`       // 输入价格（人民币/百万token）
-	OutputPriceRMB     float64    `json:"output_price_rmb"`      // 输出价格（人民币/百万token）
-	Capabilities       []string   `json:"capabilities"`          // 能力标签
-	Status             string     `json:"status"`                // 状态：online/offline
-	IsNew              bool       `json:"is_new"`                // 是否新品
-	IsFeatured         bool       `json:"is_featured"`           // 是否推荐
-	MaxTokens          int        `json:"max_tokens"`            // 最大输出 Token 数
-	ModelType          string     `json:"model_type"`            // 模型类型: LLM/VLM/ImageGeneration/VideoGeneration/Audio 等
-	Tags               string     `json:"tags"`                  // 搜索标签（逗号分隔）
-	Labels             []LabelDTO `json:"labels,omitempty"`      // k:v 标签列表（热卖/开源/优惠等）
-	Discount           int        `json:"discount,omitempty"`    // 折扣百分比（如85表示85折），0表示无折扣信息
-	AvgLatencyMs       int64      `json:"avg_latency_ms,omitempty"`  // 平均延迟（毫秒），最近24小时
-	SuccessRate        float64    `json:"success_rate,omitempty"`    // 成功率（0-100），最近24小时
-	RequestCount       int64      `json:"request_count,omitempty"`   // 请求量，最近24小时
+	ID             uint       `json:"id"`                       // 模型 ID
+	ModelID        string     `json:"model_id"`                 // 模型标识符（如 gpt-4o）
+	Name           string     `json:"name"`                     // 展示名称
+	Provider       string     `json:"provider"`                 // 供应商名称
+	ProviderIcon   string     `json:"provider_icon"`            // 供应商图标（emoji）
+	Description    string     `json:"description"`              // 模型描述
+	ContextWindow  int        `json:"context_window"`           // 上下文窗口大小
+	InputPrice     int64      `json:"input_price"`              // 输入价格（积分/百万token）
+	OutputPrice    int64      `json:"output_price"`             // 输出价格（积分/百万token）
+	InputPriceRMB  float64    `json:"input_price_rmb"`          // 输入价格（人民币/百万token）
+	OutputPriceRMB float64    `json:"output_price_rmb"`         // 输出价格（人民币/百万token）
+	Capabilities   []string   `json:"capabilities"`             // 能力标签
+	Status         string     `json:"status"`                   // 状态：online/offline
+	IsNew          bool       `json:"is_new"`                   // 是否新品
+	IsFeatured     bool       `json:"is_featured"`              // 是否推荐
+	MaxTokens      int        `json:"max_tokens"`               // 最大输出 Token 数
+	ModelType      string     `json:"model_type"`               // 模型类型: LLM/VLM/ImageGeneration/VideoGeneration/Audio 等
+	Tags           string     `json:"tags"`                     // 搜索标签（逗号分隔）
+	Labels         []LabelDTO `json:"labels,omitempty"`         // k:v 标签列表（热卖/开源/优惠等）
+	Discount       int        `json:"discount,omitempty"`       // 折扣百分比（如85表示85折），0表示无折扣信息
+	AvgLatencyMs   int64      `json:"avg_latency_ms,omitempty"` // 平均延迟（毫秒），最近24小时
+	SuccessRate    float64    `json:"success_rate,omitempty"`   // 成功率（0-100），最近24小时
+	RequestCount   int64      `json:"request_count,omitempty"`  // 请求量，最近24小时
 	// 多计费单位支持（v3.2）
-	PricingUnit        string     `json:"pricing_unit,omitempty"`    // 计费单位: per_million_tokens / per_image / per_second / per_minute / per_10k_characters / per_million_characters / per_call / per_hour
-	Variant            string     `json:"variant,omitempty"`         // 变体/质量档（如 1024x1024/hd/720p）
+	PricingUnit string `json:"pricing_unit,omitempty"` // 计费单位: per_million_tokens / per_image / per_second / per_minute / per_10k_characters / per_million_characters / per_call / per_hour
+	Variant     string `json:"variant,omitempty"`      // 变体/质量档（如 1024x1024/hd/720p）
 
 	// 缓存定价展示字段（v3.3）
-	SupportsCache                 bool    `json:"supports_cache"`                              // 是否支持缓存
-	CacheMechanism                string  `json:"cache_mechanism,omitempty"`                   // auto / explicit / both / none
-	CacheMinTokens                int     `json:"cache_min_tokens,omitempty"`                  // 触发缓存的最小 token 数
-	CacheInputPriceRMB            float64 `json:"cache_input_price_rmb,omitempty"`             // 缓存命中价（隐式/auto）
-	CacheExplicitInputPriceRMB    float64 `json:"cache_explicit_input_price_rmb,omitempty"`    // 显式缓存命中价（both 模式）
-	CacheWritePriceRMB            float64 `json:"cache_write_price_rmb,omitempty"`             // 显式缓存写入价
+	SupportsCache              bool    `json:"supports_cache"`                           // 是否支持缓存
+	CacheMechanism             string  `json:"cache_mechanism,omitempty"`                // auto / explicit / both / none
+	CacheMinTokens             int     `json:"cache_min_tokens,omitempty"`               // 触发缓存的最小 token 数
+	CacheInputPriceRMB         float64 `json:"cache_input_price_rmb,omitempty"`          // 缓存命中价（隐式/auto）
+	CacheExplicitInputPriceRMB float64 `json:"cache_explicit_input_price_rmb,omitempty"` // 显式缓存命中价（both 模式）
+	CacheWritePriceRMB         float64 `json:"cache_write_price_rmb,omitempty"`          // 显式缓存写入价
 
 	// 阶梯定价展示字段（v3.4）
-	PriceTiers          []PublicPriceTier          `json:"price_tiers,omitempty"`          // 阶梯价格列表
-	HasTieredPricing    bool                       `json:"has_tiered_pricing"`             // 是否多阶梯（>1 条或非默认兜底）
-	VideoPricingConfig  *model.VideoPricingConfig  `json:"video_pricing_config,omitempty"` // 视频模型特殊计价配置
+	PriceTiers         []PublicPriceTier         `json:"price_tiers,omitempty"`          // 阶梯价格列表
+	HasTieredPricing   bool                      `json:"has_tiered_pricing"`             // 是否多阶梯（>1 条或非默认兜底）
+	VideoPricingConfig *model.VideoPricingConfig `json:"video_pricing_config,omitempty"` // 视频模型特殊计价配置
 
 	// 能力特性字段（v3.5）— 由 features JSON 字段解析而来
 	SupportsThinking  bool `json:"supports_thinking"`   // 是否支持深度思考
@@ -146,21 +146,24 @@ type PublicModelResponse struct {
 
 // PublicPriceTier 公开展示用的阶梯价格简化视图
 type PublicPriceTier struct {
-	Name               string   `json:"name"`
-	InputRange         string   `json:"input_range,omitempty"`         // 人类可读的输入区间，如 "(0, 32k]"
-	OutputRange        string   `json:"output_range,omitempty"`        // 人类可读的输出区间
-	InputMin           int64    `json:"input_min"`
-	InputMinExclusive  bool     `json:"input_min_exclusive"`
-	InputMax           *int64   `json:"input_max,omitempty"`
-	InputMaxExclusive  bool     `json:"input_max_exclusive"`
-	OutputMin          int64    `json:"output_min"`
-	OutputMinExclusive bool     `json:"output_min_exclusive"`
-	OutputMax          *int64   `json:"output_max,omitempty"`
-	OutputMaxExclusive bool     `json:"output_max_exclusive"`
-	InputPrice         float64  `json:"input_price"`
-	OutputPrice        float64  `json:"output_price"`
-	SellingInputPrice  *float64 `json:"selling_input_price,omitempty"`
-	SellingOutputPrice *float64 `json:"selling_output_price,omitempty"`
+	Name               string  `json:"name"`
+	InputRange         string  `json:"input_range,omitempty"`  // 人类可读的输入区间，如 "(0, 32k]"
+	OutputRange        string  `json:"output_range,omitempty"` // 人类可读的输出区间
+	InputMin           int64   `json:"input_min"`
+	InputMinExclusive  bool    `json:"input_min_exclusive"`
+	InputMax           *int64  `json:"input_max,omitempty"`
+	InputMaxExclusive  bool    `json:"input_max_exclusive"`
+	OutputMin          int64   `json:"output_min"`
+	OutputMinExclusive bool    `json:"output_min_exclusive"`
+	OutputMax          *int64  `json:"output_max,omitempty"`
+	OutputMaxExclusive bool    `json:"output_max_exclusive"`
+	InputPrice         float64 `json:"input_price"`
+	OutputPrice        float64 `json:"output_price"`
+	// 思考模式价（阿里云 qwen3.x-plus 等）
+	OutputPriceThinking        float64  `json:"output_price_thinking,omitempty"`
+	SellingInputPrice          *float64 `json:"selling_input_price,omitempty"`
+	SellingOutputPrice         *float64 `json:"selling_output_price,omitempty"`
+	SellingOutputThinkingPrice *float64 `json:"selling_output_thinking_price,omitempty"`
 }
 
 // buildTierRangeString 构造人类可读的区间字符串 "(0, 32k]" / "[0, +∞)"
@@ -204,21 +207,23 @@ func convertTiersToPublic(tiers []model.PriceTier) []PublicPriceTier {
 	out := make([]PublicPriceTier, 0, len(tiers))
 	for _, t := range tiers {
 		out = append(out, PublicPriceTier{
-			Name:               t.Name,
-			InputRange:         buildTierRangeString(t.InputMin, t.InputMinExclusive, t.InputMax, t.InputMaxExclusive),
-			OutputRange:        buildTierRangeString(t.OutputMin, t.OutputMinExclusive, t.OutputMax, t.OutputMaxExclusive),
-			InputMin:           t.InputMin,
-			InputMinExclusive:  t.InputMinExclusive,
-			InputMax:           t.InputMax,
-			InputMaxExclusive:  t.InputMaxExclusive,
-			OutputMin:          t.OutputMin,
-			OutputMinExclusive: t.OutputMinExclusive,
-			OutputMax:          t.OutputMax,
-			OutputMaxExclusive: t.OutputMaxExclusive,
-			InputPrice:         t.InputPrice,
-			OutputPrice:        t.OutputPrice,
-			SellingInputPrice:  t.SellingInputPrice,
-			SellingOutputPrice: t.SellingOutputPrice,
+			Name:                       t.Name,
+			InputRange:                 buildTierRangeString(t.InputMin, t.InputMinExclusive, t.InputMax, t.InputMaxExclusive),
+			OutputRange:                buildTierRangeString(t.OutputMin, t.OutputMinExclusive, t.OutputMax, t.OutputMaxExclusive),
+			InputMin:                   t.InputMin,
+			InputMinExclusive:          t.InputMinExclusive,
+			InputMax:                   t.InputMax,
+			InputMaxExclusive:          t.InputMaxExclusive,
+			OutputMin:                  t.OutputMin,
+			OutputMinExclusive:         t.OutputMinExclusive,
+			OutputMax:                  t.OutputMax,
+			OutputMaxExclusive:         t.OutputMaxExclusive,
+			InputPrice:                 t.InputPrice,
+			OutputPrice:                t.OutputPrice,
+			OutputPriceThinking:        t.OutputPriceThinking,
+			SellingInputPrice:          t.SellingInputPrice,
+			SellingOutputPrice:         t.SellingOutputPrice,
+			SellingOutputThinkingPrice: t.SellingOutputThinkingPrice,
 		})
 	}
 	return out
@@ -384,11 +389,11 @@ func toPublicResponse(m model.AIModel) PublicModelResponse {
 		IsNew:          false, // TODO: 可根据创建时间计算
 		IsFeatured:     false, // TODO: 可根据配置决定
 		MaxTokens:      m.MaxTokens,
-		ModelType:       m.ModelType,
-		Tags:            tags,
-		Discount:        discount,
-		PricingUnit:     m.PricingUnit,
-		Variant:         m.Variant,
+		ModelType:      m.ModelType,
+		Tags:           tags,
+		Discount:       discount,
+		PricingUnit:    m.PricingUnit,
+		Variant:        m.Variant,
 
 		// 缓存定价字段（展示用）
 		SupportsCache:              m.SupportsCache,
@@ -842,9 +847,71 @@ func (h *AIModelHandler) PublicList(c *gin.Context) {
 }
 
 // Create 新建AI模型 POST /api/v1/admin/ai-models
+// 使用 map 中间绑定以支持 JSON 字段嵌套对象（price_tiers/features/extra_params 等）
+// 以及 selling_input_rmb/selling_output_rmb 单独写入 model_pricings 表
 func (h *AIModelHandler) Create(c *gin.Context) {
+	var payload map[string]interface{}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
+		return
+	}
+
+	// 前端发 input_price_rmb → 后端 input_cost_rmb
+	if v, ok := payload["input_price_rmb"]; ok {
+		payload["input_cost_rmb"] = v
+		delete(payload, "input_price_rmb")
+	}
+	if v, ok := payload["output_price_rmb"]; ok {
+		payload["output_cost_rmb"] = v
+		delete(payload, "output_price_rmb")
+	}
+
+	// 提取售价字段（单独写 model_pricings 表）
+	sellingInputRmb, hasSellingIn := payload["selling_input_rmb"]
+	sellingOutputRmb, hasSellingOut := payload["selling_output_rmb"]
+	sellingOutputThinkingRmb, hasSellingOutThinking := payload["selling_output_thinking_rmb"]
+	delete(payload, "selling_input_rmb")
+	delete(payload, "selling_output_rmb")
+	delete(payload, "selling_output_thinking_rmb")
+
+	// JSON 字段需要序列化为 model.JSON 字节
+	jsonFields := []string{"extra_params", "task_types", "input_modalities", "output_modalities", "features", "price_tiers", "video_pricing_config"}
+	for _, field := range jsonFields {
+		val, ok := payload[field]
+		if !ok || val == nil {
+			continue
+		}
+		if field == "price_tiers" {
+			if arr, ok := val.([]interface{}); ok {
+				arrBytes, _ := json.Marshal(arr)
+				var tiers []model.PriceTier
+				_ = json.Unmarshal(arrBytes, &tiers)
+				for i := range tiers {
+					tiers[i].Normalize()
+				}
+				model.SortTiers(tiers)
+				wrapped := model.PriceTiersData{
+					Tiers:     tiers,
+					Currency:  "CNY",
+					UpdatedAt: time.Now(),
+				}
+				b, _ := json.Marshal(wrapped)
+				payload[field] = b
+				continue
+			}
+		}
+		b, _ := json.Marshal(val)
+		payload[field] = b
+	}
+
+	// 将 map 序列化后反序列化到 AIModel（让 GORM 标签生效）
+	buf, err := json.Marshal(payload)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
+		return
+	}
 	var m model.AIModel
-	if err := c.ShouldBindJSON(&m); err != nil {
+	if err := json.Unmarshal(buf, &m); err != nil {
 		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
 		return
 	}
@@ -854,6 +921,31 @@ func (h *AIModelHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// 创建售价
+	if hasSellingIn || hasSellingOut || hasSellingOutThinking {
+		pricing := model.ModelPricing{ModelID: m.ID}
+		if hasSellingIn {
+			if v, ok := sellingInputRmb.(float64); ok {
+				pricing.InputPriceRMB = v
+				pricing.InputPricePerToken = int64(v * 10000)
+			}
+		}
+		if hasSellingOut {
+			if v, ok := sellingOutputRmb.(float64); ok {
+				pricing.OutputPriceRMB = v
+				pricing.OutputPricePerToken = int64(v * 10000)
+			}
+		}
+		if hasSellingOutThinking {
+			if v, ok := sellingOutputThinkingRmb.(float64); ok {
+				pricing.OutputPriceThinkingRMB = v
+				pricing.OutputPriceThinkingPerToken = int64(v * 10000)
+			}
+		}
+		database.DB.Create(&pricing)
+	}
+
+	invalidatePublicModelsCache()
 	response.Success(c, m)
 }
 
@@ -936,8 +1028,10 @@ func (h *AIModelHandler) Update(c *gin.Context) {
 	// 提取售价字段，保存到 ModelPricing 表
 	sellingInputRmb, hasSellingIn := updates["selling_input_rmb"]
 	sellingOutputRmb, hasSellingOut := updates["selling_output_rmb"]
+	sellingOutputThinkingRmb, hasSellingOutThinking := updates["selling_output_thinking_rmb"]
 	delete(updates, "selling_input_rmb")
 	delete(updates, "selling_output_rmb")
+	delete(updates, "selling_output_thinking_rmb")
 
 	if err := h.svc.Update(c.Request.Context(), uint(id), updates); err != nil {
 		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
@@ -945,7 +1039,7 @@ func (h *AIModelHandler) Update(c *gin.Context) {
 	}
 
 	// 更新或创建平台售价
-	if hasSellingIn || hasSellingOut {
+	if hasSellingIn || hasSellingOut || hasSellingOutThinking {
 		modelID := uint(id)
 		var pricing model.ModelPricing
 		db := database.DB
@@ -964,6 +1058,12 @@ func (h *AIModelHandler) Update(c *gin.Context) {
 			if v, ok := sellingOutputRmb.(float64); ok {
 				pricing.OutputPriceRMB = v
 				pricing.OutputPricePerToken = int64(v * 10000)
+			}
+		}
+		if hasSellingOutThinking {
+			if v, ok := sellingOutputThinkingRmb.(float64); ok {
+				pricing.OutputPriceThinkingRMB = v
+				pricing.OutputPriceThinkingPerToken = int64(v * 10000)
 			}
 		}
 		if pricing.ID == 0 {
@@ -1011,6 +1111,22 @@ func (h *AIModelHandler) Verify(c *gin.Context) {
 
 	invalidatePublicModelsCache()
 	response.Success(c, gin.H{"message": "model verified and online", "status": "online"})
+}
+
+// PreflightEnable checks whether a model can be safely enabled without changing state.
+func (h *AIModelHandler) PreflightEnable(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || id == 0 {
+		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
+		return
+	}
+
+	report, err := h.svc.PreflightModelEnable(c.Request.Context(), uint(id))
+	if err != nil {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
+		return
+	}
+	response.Success(c, report)
 }
 
 // SetOffline 将模型下线 POST /api/v1/admin/ai-models/:id/offline
@@ -1127,12 +1243,12 @@ type OfficialDeprecationItem struct {
 	ID          uint   `json:"id"`
 	ModelName   string `json:"model_name"`
 	DisplayName string `json:"display_name"`
-	Status      string `json:"status"`     // 当前状态: online/offline
-	IsActive    bool   `json:"is_active"`  // 当前 is_active
+	Status      string `json:"status"`    // 当前状态: online/offline
+	IsActive    bool   `json:"is_active"` // 当前 is_active
 	ModelType   string `json:"model_type,omitempty"`
-	RetireDate  string `json:"retire_date"`            // 官方下线日期
-	Reason      string `json:"reason"`                 // 下线原因/分类
-	Replacement string `json:"replacement,omitempty"`  // 官方推荐替代模型
+	RetireDate  string `json:"retire_date"`           // 官方下线日期
+	Reason      string `json:"reason"`                // 下线原因/分类
+	Replacement string `json:"replacement,omitempty"` // 官方推荐替代模型
 }
 
 // scanSupplierDeprecation 扫描单个供应商的模型下线情况（核心逻辑）
@@ -1360,13 +1476,13 @@ func (h *AIModelHandler) ScanOfflineAll(c *gin.Context) {
 
 	// 并发扫描所有供应商，使用信号量限制并发数为 5
 	var (
-		mu              sync.Mutex
-		wg              sync.WaitGroup
-		groups          []ScannedOfflineGroup
+		mu               sync.Mutex
+		wg               sync.WaitGroup
+		groups           []ScannedOfflineGroup
 		suppliersScanned int
 		suppliersFailed  int
-		totalModels     int
-		semaphore       = make(chan struct{}, 5)
+		totalModels      int
+		semaphore        = make(chan struct{}, 5)
 	)
 
 	for _, supplier := range suppliers {
@@ -1434,13 +1550,12 @@ func (h *AIModelHandler) ScanOfflineAll(c *gin.Context) {
 	})
 }
 
-
 // BulkDeprecateRequest 批量下线请求
 type BulkDeprecateRequest struct {
-	ModelIDs             []uint `json:"model_ids" binding:"required,min=1"`
-	OfflineDays          int    `json:"offline_days"`           // 多少天后正式下线，默认 7
-	AnnouncementTitle    string `json:"announcement_title"`
-	AnnouncementContent  string `json:"announcement_content"`
+	ModelIDs            []uint `json:"model_ids" binding:"required,min=1"`
+	OfflineDays         int    `json:"offline_days"` // 多少天后正式下线，默认 7
+	AnnouncementTitle   string `json:"announcement_title"`
+	AnnouncementContent string `json:"announcement_content"`
 }
 
 // BulkDeprecate POST /admin/models/bulk-deprecate
@@ -1691,4 +1806,60 @@ func (h *AIModelHandler) MarkOfficialDeprecated(c *gin.Context) {
 		"announcement_id":  announcementID,
 		"details":          details,
 	})
+}
+
+// BatchRetag POST /admin/models/batch-retag
+// 对所有 is_active=true 的模型重新执行 InferModelTagsWithFeatures() 并保存
+// 用于供应商默认能力变更后批量刷新标签
+func (h *AIModelHandler) BatchRetag(c *gin.Context) {
+	var models []model.AIModel
+	if err := database.DB.Where("is_active = ?", true).Find(&models).Error; err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrDatabase.Code, err.Error())
+		return
+	}
+
+	// 预加载供应商 code 映射
+	var suppliers []model.Supplier
+	database.DB.Find(&suppliers)
+	supplierMap := make(map[uint]string, len(suppliers))
+	for _, s := range suppliers {
+		supplierMap[s.ID] = s.Code
+	}
+
+	updatedCount := 0
+	for _, m := range models {
+		supplierCode := supplierMap[m.SupplierID]
+		newTags := modeldiscovery.InferModelTagsWithFeatures(m.ModelName, supplierCode, m.ModelType, m.Features)
+		if newTags != m.Tags {
+			if err := database.DB.Model(&model.AIModel{}).Where("id = ?", m.ID).
+				Update("tags", newTags).Error; err == nil {
+				updatedCount++
+			}
+		}
+	}
+
+	response.Success(c, gin.H{"updated_count": updatedCount, "total_scanned": len(models)})
+}
+
+// BatchSetFreeTierRequest 批量设置免费层模型请求
+type BatchSetFreeTierRequest struct {
+	ModelIDs   []uint `json:"model_ids" binding:"required"`
+	IsFreeTier bool   `json:"is_free_tier"`
+}
+
+// BatchSetFreeTier 批量设置免费层模型 POST /api/v1/admin/ai-models/batch-free-tier
+func (h *AIModelHandler) BatchSetFreeTier(c *gin.Context) {
+	var req BatchSetFreeTierRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
+		return
+	}
+
+	if err := h.svc.BatchUpdateFreeTier(c.Request.Context(), req.ModelIDs, req.IsFreeTier); err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+
+	invalidatePublicModelsCache()
+	response.Success(c, nil)
 }

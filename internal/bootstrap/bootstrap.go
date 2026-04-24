@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"go.uber.org/zap"
 
@@ -15,7 +16,6 @@ import (
 	pkgi18n "tokenhub-server/internal/pkg/i18n"
 	"tokenhub-server/internal/pkg/logger"
 	pkgredis "tokenhub-server/internal/pkg/redis"
-	permissionsvc "tokenhub-server/internal/service/permission"
 )
 
 // Result 保存初始化后的基础设施引用，供调用方获取清理函数
@@ -44,69 +44,104 @@ func InitLogger() error {
 	})
 }
 
-// InitDatabase 初始化 MySQL 连接。
-// 如果 runMigrations=true，执行 AutoMigrate + 种子数据（仅 backend/monolith 需要）。
+// InitDatabase 初始化 MySQL 连接 —— **只建连，不做任何 schema 变更 / 种子写入**。
+//
+// 参数 runMigrations 已废弃（保留签名仅为向后兼容）：
+//   - AutoMigrate / dropLegacy / 种子写入 均已从启动路径移除
+//   - 首次部署：走安装向导 POST /api/v1/setup/import-seed
+//   - 版本升级：走管理员接口 POST /api/v1/admin/system/migrate
+//   - 启动时仅做只读的 schema_version 校验（在 database.Init 内部），失败不阻塞
 func InitDatabase(runMigrations bool) error {
+	_ = runMigrations // 已废弃但保留签名
 	if err := database.Init(config.Global.Database, logger.L); err != nil {
 		return fmt.Errorf("database init: %w", err)
 	}
-
-	if runMigrations {
-		runSeeds()
-	}
-
 	return nil
 }
 
-// runSeeds 执行所有种子数据和数据迁移（从 cmd/server/main.go 中提取）
-func runSeeds() {
-	database.RunSeed(database.DB)
-	database.RunSeedDocs(database.DB)
-	database.RunSeedLevels(database.DB)
-	database.RunSeedParams()
+// RunDataMigrations 执行所有幂等的结构/数据迁移。
+//
+// **本函数不再在启动时调用**，仅由以下渠道触发：
+//   - 管理员升级接口 POST /api/v1/admin/system/migrate
+//   - 安装向导（可选）
+//   - CLI 工具（未来扩展）
+//
+// 内容说明：只包含"修复/迁移已有数据"的操作，不写入任何新的业务种子数据：
+//   - 字段回填：缓存定价、TPM 提升、extra_params 清洗、requires_stream、pricing_url、缓存类型
+//   - 数据迁移：tags → labels、渠道能力回填
+//   - 表结构：删除代理遗留表、FULLTEXT 索引、PolarDB 向量索引
+//   - 下线标记：volcengine batch8 deprecation
+//
+// 不包含的内容（在 RunAllSeeds 中）：
+//
+//	业务种子（suppliers/levels/params/roles/permissions 等任何写新行的操作）
+func RunDataMigrations() {
+	// 缓存定价回填
 	database.RunCachePriceMigration(database.DB)
+
+	// 一次性：提升 V0-V4 默认 TPM（仅未被管理员修改的行）
+	database.RunBumpMemberLevelTPM(database.DB)
+
+	// 补齐二维阶梯价格
 	database.RunPriceTiers2DMigration(database.DB)
+
+	// 清理 extra_params 字段中 JSON_TYPE='STRING'/'ARRAY' 的脏数据
 	database.RunExtraParamsCleanupMigration(database.DB)
-	database.RunExtraParamsFeatureFlagsCleanup(database.DB) // 清理 {key:bool} 能力标记脏数据
-	database.RunQwqRequiresStreamMigration(database.DB)     // 为 qwq/qvq 系列回填 features.requires_stream=true
+
+	// 清理 extra_params 中 {key: bool} 形式的能力标记脏数据
+	database.RunExtraParamsFeatureFlagsCleanup(database.DB)
+
+	// 为阿里云 qwq/qvq 系列回填 features.requires_stream=true
+	database.RunQwqRequiresStreamMigration(database.DB)
+
+	// 将 price_tiers[0] 同步到 ai_models 顶层字段（input_cost_rmb / output_cost_rmb /
+	// output_cost_thinking_rmb），修复爬虫路径漂移和批量售价被跳过的问题
+	database.RunTierOneSyncMigration(database.DB)
+
+	// 为存量供应商回填官网定价 URL
 	database.RunSupplierPricingURLMigration(database.DB)
+
+	// 修正非 LLM/VLM 模型错误启用缓存的问题
 	database.RunCacheTypeCleanup(database.DB)
 
-	// v3.5: 统一标签字典（多语言 + 颜色 + 图标 + 排序权重）+ tags→labels 迁移
-	database.RunSeedLabelDictionary(database.DB)
+	// tags 字符串 → model_labels 表迁移
 	database.RunMigrateTagsToLabels(database.DB)
 
+	// 回填渠道 supported_capabilities 字段
 	if err := database.MigrateChannelCapabilities(database.DB); err != nil {
 		logger.L.Warn("channel capabilities migration failed", zap.Error(err))
 	}
+
+	// v3.1 物理删除代理机制遗留表
 	if err := database.DropAgentTables(database.DB); err != nil {
 		logger.L.Warn("drop agent tables migration failed", zap.Error(err))
 	}
 
-	// RunSeedNonTokenModels 已禁用：硬编码模型与 auto-discovery 数据冲突
-	// database.RunSeedNonTokenModels(database.DB)
-	database.RunSeedQianfan(database.DB)
-	database.RunSeedHunyuan(database.DB)
-	database.RunSeedCapabilityCases(database.DB)
+	// knowledge_chunks FULLTEXT 索引（ngram 分词）
+	database.RunSupportFullTextMigration(database.DB)
 
-	// AI 客服系统种子（模型配置 + 供应商文档 URL + 热门问题）
-	database.RunSeedSupport(database.DB)
+	// PolarDB 向量检索迁移（仅在 SUPPORT_VECTOR_STORE=polardb 时执行）
+	if strings.EqualFold(config.Global.Support.WithDefaults().VectorStore, "polardb") {
+		database.RunPolarDBVectorMigration(database.DB)
+	}
 
-	// v3.2.3: 汇率 API 配置种子（SystemConfig 表）
-	database.RunSeedExchangeRateConfig(database.DB)
-
+	// 火山引擎第八批下线模型标记
 	if err := database.MigrateVolcengineBatch8Deprecation(database.DB); err != nil {
 		logger.L.Warn("volcengine batch8 deprecation migration failed", zap.Error(err))
 	}
 
-	if err := database.RunSeedTrendingModels(); err != nil {
-		logger.L.Warn("seed trending models failed", zap.Error(err))
+	// 网宿模型官网权威价强制更新（幂等 UPDATE，覆盖推测价 → OpenAI/Anthropic/Google 官网价）
+	database.RunWangsuOfficialPricingMigration(database.DB)
+
+	// 修复 Qwen/QwQ 等模型的能力标记（v5.1 补丁）
+	database.RunFixQwenFeaturesMigration(database.DB)
+	if err := database.RunModelCapabilityDefaultsMigration(database.DB); err != nil {
+		logger.L.Warn("model capability defaults migration failed", zap.Error(err))
 	}
 
-	// v4.0: RBAC 权限系统种子（permissions/roles/role_permissions/user_roles 回填）
-	// 幂等，每次启动安全执行。
-	if err := permissionsvc.Seed(database.DB); err != nil {
-		logger.L.Warn("permission seed failed", zap.Error(err))
+	// 清理历史模板/测试供应商，只保留当前真实接入的中文供应商。
+	if err := database.RunPruneUnusedSuppliersMigration(database.DB); err != nil {
+		logger.L.Warn("supplier prune migration failed", zap.Error(err))
 	}
 }
 
@@ -152,25 +187,17 @@ func InitAll() (*Result, error) {
 		zap.String("role", config.Global.Service.Role),
 	)
 
-	// 3. 数据库
-	shouldMigrate := config.Global.Service.ShouldRunMigrations()
-	if err := InitDatabase(shouldMigrate); err != nil {
+	// 3. 数据库（仅建连，不做 schema 变更 / 种子写入）
+	if err := InitDatabase(false); err != nil {
 		logger.L.Fatal("init database failed", zap.Error(err))
 	}
-	logger.L.Info("database initialized",
-		zap.Bool("migrations", shouldMigrate),
-	)
+	logger.L.Info("database initialized")
 
 	// 4. Redis
 	if err := InitRedis(); err != nil {
 		logger.L.Fatal("init redis failed", zap.Error(err))
 	}
 	logger.L.Info("redis initialized")
-
-	// 4.1 种子数据更新后清缓存（Redis 初始化后执行）
-	if shouldMigrate {
-		PostRedisInit()
-	}
 
 	// 5. i18n（gateway 不需要 locale 文件，但初始化不影响）
 	if err := InitI18n(); err != nil {

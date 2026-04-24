@@ -40,6 +40,16 @@ var BuiltinRoles = []BuiltinRole{
 			"支付配置",
 			"余额管理",
 			"积分消耗查询",
+			"发票管理",
+		},
+		ExtraCodes: []string{
+			// v4.0 用户特殊折扣（财务审核/分配）
+			"user_discount_list_read",
+			"user_discount_get_read",
+			"user_discount_batch_create",
+			"user_discount_preview",
+			"user_discount_update",
+			"user_discount_delete",
 		},
 	},
 	{
@@ -55,6 +65,14 @@ var BuiltinRoles = []BuiltinRole{
 			"会员等级",
 			"注册赠送明细",
 			"邀请返佣明细",
+			"账户安全",
+			"邮件管理",
+		},
+		ExtraCodes: []string{
+			"rate_limit_active_read",
+			"rate_limit_event_read",
+			"auth_log_list_read",
+			"auth_log_stats_read",
 		},
 	},
 	{
@@ -88,6 +106,31 @@ var BuiltinRoles = []BuiltinRole{
 			"apikey_update",
 			"password_change",
 			"user_logout",
+			// 发票：所有普通用户均可申请
+			"user_invoice_create",
+			"user_invoice_list_read",
+			"user_invoice_get_read",
+		},
+	},
+	{
+		Code:        "FINANCIAL_USER",
+		Name:        "财务用户",
+		Description: "在普通用户基础上额外拥有申请提现和申请退款的权限，适用于需要开通提现/退款功能的用户",
+		DataScope:   "own_only",
+		ExtraCodes: []string{
+			// 继承 USER 角色的全部基础权限
+			"apikey_create",
+			"apikey_delete",
+			"apikey_update",
+			"password_change",
+			"user_logout",
+			// 新增财务申请权限
+			"user_withdrawal_create",
+			"user_refund_request_create",
+			// 发票申请
+			"user_invoice_create",
+			"user_invoice_list_read",
+			"user_invoice_get_read",
 		},
 	},
 }

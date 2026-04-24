@@ -5,11 +5,7 @@ package model
 // 7 层防御:CAPTCHA + OTP + IP 限流 + 邮箱域名限流 + 设备指纹 + 停留时长 + IP 情报 + 一次性邮箱黑名单
 type RegistrationGuard struct {
 	BaseModel
-	// --- CAPTCHA ---
-	CaptchaEnabled   bool   `gorm:"default:true" json:"captcha_enabled"`        // 是否启用 CAPTCHA
-	CaptchaProvider  string `gorm:"size:20;default:'turnstile'" json:"captcha_provider"` // turnstile / hcaptcha / recaptcha
-	CaptchaSiteKey   string `gorm:"size:200" json:"captcha_site_key"`           // 前端 Site Key
-	CaptchaSecretEnc string `gorm:"size:500" json:"-"`                          // 后端 Secret(加密存储,不返回前端)
+	// --- CAPTCHA 已移除 ---
 
 	// --- 邮箱 OTP ---
 	EmailOTPEnabled    bool `gorm:"default:true" json:"email_otp_enabled"`    // 是否启用邮箱 OTP
@@ -35,6 +31,11 @@ type RegistrationGuard struct {
 
 	// --- 一次性邮箱 ---
 	DisposableEmailBlocked bool `gorm:"default:true" json:"disposable_email_blocked"` // 是否屏蔽一次性邮箱
+
+	// --- 全局反滥用限速 (v5.1) ---
+	FreeUserRPM         int `gorm:"default:5" json:"free_user_rpm"`         // 免费用户每分钟请求数 (RPM)
+	FreeUserTPM         int `gorm:"default:10000" json:"free_user_tpm"`     // 免费用户每分钟 Token 数 (TPM)
+	FreeUserConcurrency int `gorm:"default:1" json:"free_user_concurrency"` // 免费用户并发限制
 
 	// --- 总开关 ---
 	IsActive bool `gorm:"default:true" json:"is_active"`

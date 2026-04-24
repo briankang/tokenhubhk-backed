@@ -82,6 +82,10 @@ func (r *ChannelRouter) SelectChannel(ctx context.Context, modelName string, cus
 
 // SelectChannelWithExcludes 带排除列表的渠道选择，用于 Failover 重试时排除已失败的渠道
 func (r *ChannelRouter) SelectChannelWithExcludes(ctx context.Context, modelName string, customChannelID *uint, userID uint, excludeChannelIDs []uint) (*SelectChannelResult, error) {
+	return r.selectChannelWithCapability(ctx, modelName, customChannelID, userID, excludeChannelIDs, "")
+}
+
+func (r *ChannelRouter) selectChannelWithCapability(ctx context.Context, modelName string, customChannelID *uint, userID uint, excludeChannelIDs []uint, requiredCap string) (*SelectChannelResult, error) {
 	if modelName == "" {
 		return nil, fmt.Errorf("model name is required")
 	}
@@ -98,7 +102,7 @@ func (r *ChannelRouter) SelectChannelWithExcludes(ctx context.Context, modelName
 		// 没有自定义渠道配置，降级到旧版渠道组路由
 		r.logger.Debug("无自定义渠道，降级到渠道组路由",
 			zap.String("model", modelName), zap.Error(err))
-		return r.fallbackToChannelGroup(ctx, modelName)
+		return r.fallbackToChannelGroupForCapability(ctx, modelName, requiredCap)
 	}
 
 	// ========== 步骤2: 检查访问权限 ==========
@@ -111,6 +115,7 @@ func (r *ChannelRouter) SelectChannelWithExcludes(ctx context.Context, modelName
 	if err == nil && len(routes) > 0 {
 		// 将显式路由转换为统一候选列表
 		candidates := r.filterExcluded(r.routesToCandidates(ctx, routes), excludeSet)
+		candidates = r.filterByCapability(candidates, requiredCap)
 		if len(candidates) > 0 {
 			result, err := r.applyStrategy(cc.Strategy, candidates, cc.ID)
 			if err == nil {
@@ -130,6 +135,7 @@ func (r *ChannelRouter) SelectChannelWithExcludes(ctx context.Context, modelName
 		if err == nil && len(channelModels) > 0 {
 			// 将自动发现结果转换为统一候选列表
 			candidates := r.filterExcluded(r.channelModelsToCandidates(channelModels), excludeSet)
+			candidates = r.filterByCapability(candidates, requiredCap)
 			if len(candidates) > 0 {
 				result, err := r.applyStrategy(cc.Strategy, candidates, cc.ID)
 				if err == nil {
@@ -145,7 +151,7 @@ func (r *ChannelRouter) SelectChannelWithExcludes(ctx context.Context, modelName
 
 	// ========== 步骤5: 最终降级到渠道组路由 ==========
 	r.logger.Debug("自定义渠道未找到匹配，降级到渠道组路由", zap.String("model", modelName))
-	return r.fallbackToChannelGroup(ctx, modelName)
+	return r.fallbackToChannelGroupForCapability(ctx, modelName, requiredCap)
 }
 
 // filterExcluded 从候选列表中过滤掉被排除的渠道ID
@@ -180,6 +186,7 @@ func (r *ChannelRouter) filterByCapability(candidates []RouteCandidate, required
 // SelectChannelForCapability 带能力校验的渠道选择
 // requiredCap: 模型所需能力（chat/image/video/tts/asr/embedding），空字符串兼容旧调用
 func (r *ChannelRouter) SelectChannelForCapability(ctx context.Context, modelName string, customChannelID *uint, userID uint, requiredCap string, excludeChannelIDs []uint) (*SelectChannelResult, error) {
+	return r.selectChannelWithCapability(ctx, modelName, customChannelID, userID, excludeChannelIDs, requiredCap)
 	// 先走原路由流程取候选，然后按能力过滤
 	result, err := r.SelectChannelWithExcludes(ctx, modelName, customChannelID, userID, excludeChannelIDs)
 	if err != nil {
@@ -197,6 +204,18 @@ func (r *ChannelRouter) SelectChannelForCapability(ctx context.Context, modelNam
 
 // loadCustomChannel 加载自定义渠道配置（带 Redis 缓存，5min TTL）
 // 如果指定了 customChannelID 则按 ID 查找，否则查找 is_default=true 的默认渠道
+func (r *ChannelRouter) fallbackToChannelGroupForCapability(ctx context.Context, modelName, requiredCap string) (*SelectChannelResult, error) {
+	result, err := r.fallbackToChannelGroup(ctx, modelName)
+	if err != nil || requiredCap == "" || result == nil || result.Channel == nil {
+		return result, err
+	}
+	if !result.Channel.HasCapability(requiredCap) {
+		return nil, fmt.Errorf("channel %s does not support capability %s (current: %s)",
+			result.Channel.Name, requiredCap, result.Channel.SupportedCapabilities)
+	}
+	return result, nil
+}
+
 func (r *ChannelRouter) loadCustomChannel(ctx context.Context, customChannelID *uint) (*model.CustomChannel, error) {
 	// 尝试从 Redis 缓存读取
 	var cacheKey string

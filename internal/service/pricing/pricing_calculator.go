@@ -36,11 +36,11 @@ type PriceResult struct {
 
 // CostResult 单次请求的费用明细（积分为主，RMB 为辅助展示）
 type CostResult struct {
-	InputCost    int64   `json:"input_cost"`    // 输入成本（积分）
-	OutputCost   int64   `json:"output_cost"`   // 输出成本（积分）
-	TotalCost    int64   `json:"total_cost"`    // 总成本（积分）
-	TotalCostRMB float64 `json:"total_cost_rmb"` // 总成本（人民币）
-	PlatformCost int64   `json:"platform_cost"` // 平台基础成本（积分），用于利润计算
+	InputCost    int64       `json:"input_cost"`     // 输入成本（积分）
+	OutputCost   int64       `json:"output_cost"`    // 输出成本（积分）
+	TotalCost    int64       `json:"total_cost"`     // 总成本（积分）
+	TotalCostRMB float64     `json:"total_cost_rmb"` // 总成本（人民币）
+	PlatformCost int64       `json:"platform_cost"`  // 平台基础成本（积分），用于利润计算
 	PriceDetail  PriceResult `json:"price_detail"`
 
 	// 阶梯定价命中信息（未命中时 MatchedTierIdx=-1）
@@ -50,10 +50,15 @@ type CostResult struct {
 	// 缓存计费明细（仅 CalculateCostWithCache 路径填充）
 	CacheReadTokens    int64 `json:"cache_read_tokens,omitempty"`
 	CacheWriteTokens   int64 `json:"cache_write_tokens,omitempty"`
-	CacheReadCost      int64 `json:"cache_read_cost,omitempty"`       // 缓存命中部分扣费（积分）
-	CacheWriteCost     int64 `json:"cache_write_cost,omitempty"`      // 缓存写入部分扣费（积分）
-	RegularInputCost   int64 `json:"regular_input_cost,omitempty"`    // 非缓存输入部分扣费（积分）
-	CacheSavingCredits int64 `json:"cache_saving_credits,omitempty"`  // 对比无缓存路径节省的积分
+	CacheReadCost      int64 `json:"cache_read_cost,omitempty"`      // 缓存命中部分扣费（积分）
+	CacheWriteCost     int64 `json:"cache_write_cost,omitempty"`     // 缓存写入部分扣费（积分）
+	RegularInputCost   int64 `json:"regular_input_cost,omitempty"`   // 非缓存输入部分扣费（积分）
+	CacheSavingCredits int64 `json:"cache_saving_credits,omitempty"` // 对比无缓存路径节省的积分
+
+	// 用户级特殊折扣命中信息（UserModelDiscount 命中时回填，供 api_call_logs 审计）
+	UserDiscountID   *uint    `json:"user_discount_id,omitempty"`
+	UserDiscountRate *float64 `json:"user_discount_rate,omitempty"`
+	UserDiscountType string   `json:"user_discount_type,omitempty"`
 }
 
 // UsageInput 多计费单位的用量输入
@@ -77,23 +82,23 @@ type UsageInput struct {
 
 // PriceMatrixItem 价格矩阵中的单行数据
 type PriceMatrixItem struct {
-	ModelID               uint    `json:"model_id"`
-	ModelName             string  `json:"model_name"`
-	DisplayName           string  `json:"display_name"`
-	SupplierName          string  `json:"supplier_name"`
-	CategoryName          string  `json:"category_name"`
-	CostInput             int64   `json:"cost_input"`       // 成本价（积分/百万token）
-	CostOutput            int64   `json:"cost_output"`
-	PlatformInput         int64   `json:"platform_input"`   // 平台售价（积分/百万token）
-	PlatformOutput        int64   `json:"platform_output"`
-	FinalInput            int64   `json:"final_input"`      // 最终售价（积分/百万token）
-	FinalOutput           int64   `json:"final_output"`
-	PlatformInputRMB      float64 `json:"platform_input_rmb"`
-	PlatformOutputRMB     float64 `json:"platform_output_rmb"`
-	FinalInputRMB         float64 `json:"final_input_rmb"`
-	FinalOutputRMB        float64 `json:"final_output_rmb"`
-	Currency              string  `json:"currency"`
-	Source                string  `json:"source"`
+	ModelID           uint    `json:"model_id"`
+	ModelName         string  `json:"model_name"`
+	DisplayName       string  `json:"display_name"`
+	SupplierName      string  `json:"supplier_name"`
+	CategoryName      string  `json:"category_name"`
+	CostInput         int64   `json:"cost_input"` // 成本价（积分/百万token）
+	CostOutput        int64   `json:"cost_output"`
+	PlatformInput     int64   `json:"platform_input"` // 平台售价（积分/百万token）
+	PlatformOutput    int64   `json:"platform_output"`
+	FinalInput        int64   `json:"final_input"` // 最终售价（积分/百万token）
+	FinalOutput       int64   `json:"final_output"`
+	PlatformInputRMB  float64 `json:"platform_input_rmb"`
+	PlatformOutputRMB float64 `json:"platform_output_rmb"`
+	FinalInputRMB     float64 `json:"final_input_rmb"`
+	FinalOutputRMB    float64 `json:"final_output_rmb"`
+	Currency          string  `json:"currency"`
+	Source            string  `json:"source"`
 }
 
 // PricingCalculator 核心计价引擎
@@ -115,20 +120,20 @@ func NewPricingCalculator(db *gorm.DB) *PricingCalculator {
 	}
 }
 
-// cacheKey 构建定价查询的 Redis 缓存键
-func cacheKey(modelID uint, tenantID uint, level int) string {
-	return fmt.Sprintf("%s:%d:%d:%d", priceCachePrefix, modelID, tenantID, level)
+// cacheKey 构建定价查询的 Redis 缓存键（包含 userID 支持用户级覆盖）
+func cacheKey(userID uint, modelID uint, tenantID uint, level int) string {
+	return fmt.Sprintf("%s:%d:%d:%d:%d", priceCachePrefix, userID, modelID, tenantID, level)
 }
 
-// CalculatePrice 计算指定模型/租户/层级的最终用户价格（积分/百万token）
-// 优先级：AgentPricing > AgentLevelDiscount > ModelPricing（平台价）
-func (c *PricingCalculator) CalculatePrice(ctx context.Context, modelID uint, tenantID uint, agentLevel int) (*PriceResult, error) {
+// CalculatePrice 计算指定用户/模型/租户/层级的最终用户价格（积分/百万token）
+// 优先级：UserModelDiscount > AgentPricing > AgentLevelDiscount > ModelPricing（平台价）
+func (c *PricingCalculator) CalculatePrice(ctx context.Context, userID uint, modelID uint, tenantID uint, agentLevel int) (*PriceResult, error) {
 	if modelID == 0 {
 		return nil, fmt.Errorf("modelID must not be zero")
 	}
 
 	// Try cache first
-	key := cacheKey(modelID, tenantID, agentLevel)
+	key := cacheKey(userID, modelID, tenantID, agentLevel)
 	if c.redis != nil {
 		var cached PriceResult
 		if err := redis.GetJSON(ctx, key, &cached); err == nil {
@@ -142,8 +147,8 @@ func (c *PricingCalculator) CalculatePrice(ctx context.Context, modelID uint, te
 		return nil, fmt.Errorf("get platform price: %w", err)
 	}
 
-	// If no tenant, return platform price directly
-	if tenantID == 0 {
+	// If no tenant and no user, return platform price directly
+	if tenantID == 0 && userID == 0 {
 		result := &PriceResult{
 			InputPricePerMillion:  platformPrice.InputPricePerToken,
 			OutputPricePerMillion: platformPrice.OutputPricePerToken,
@@ -156,8 +161,8 @@ func (c *PricingCalculator) CalculatePrice(ctx context.Context, modelID uint, te
 		return result, nil
 	}
 
-	// Resolve discount
-	discount, err := c.resolver.ResolveDiscount(ctx, tenantID, modelID, agentLevel)
+	// Resolve discount (user-level override checked first inside resolver)
+	discount, err := c.resolver.ResolveDiscount(ctx, userID, tenantID, modelID, agentLevel)
 	if err != nil {
 		return nil, fmt.Errorf("resolve discount: %w", err)
 	}
@@ -175,7 +180,7 @@ func (c *PricingCalculator) CalculatePrice(ctx context.Context, modelID uint, te
 //     - SellingOverride=true: 跳过 FIXED/MARKUP，仅叠加 DISCOUNT 代理折扣
 //     - SellingOverride=false: 完整走 applyDiscount 链路（阶梯价代替平台基础价）
 //  2. 未命中阶梯 → 旧路径：CalculatePrice + 单价
-func (c *PricingCalculator) CalculateCost(ctx context.Context, modelID uint, tenantID uint, agentLevel int, inputTokens, outputTokens int) (*CostResult, error) {
+func (c *PricingCalculator) CalculateCost(ctx context.Context, userID uint, modelID uint, tenantID uint, agentLevel int, inputTokens, outputTokens int) (*CostResult, error) {
 	if inputTokens < 0 {
 		inputTokens = 0
 	}
@@ -200,6 +205,9 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, modelID uint, ten
 		source           = "platform"
 		matchedTier      string
 		matchedTierIdx   = -1
+		userDiscountID   *uint
+		userDiscountRate *float64
+		userDiscountType string
 	)
 
 	if tierSel != nil && tierSel.FromTier {
@@ -212,9 +220,14 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, modelID uint, ten
 		matchedTierIdx = tierSel.MatchedTierIdx
 
 		// 叠加代理折扣（SellingOverride=true 时仅 DISCOUNT；否则完整链路）
-		if tenantID > 0 {
-			discount, derr := c.resolver.ResolveDiscount(ctx, tenantID, modelID, agentLevel)
+		if tenantID > 0 || userID > 0 {
+			discount, derr := c.resolver.ResolveDiscount(ctx, userID, tenantID, modelID, agentLevel)
 			if derr == nil && discount != nil && discount.Type != "none" {
+				if discount.UserDiscountID != nil {
+					userDiscountID = discount.UserDiscountID
+					userDiscountRate = discount.UserDiscountRate
+					userDiscountType = discount.UserDiscountType
+				}
 				if tierSel.SellingOverride {
 					// 只叠加 DISCOUNT（阶梯已是终价）
 					if discount.PricingType == "DISCOUNT" && discount.InputDiscount > 0 {
@@ -246,7 +259,7 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, modelID uint, ten
 		}
 	} else {
 		// 2. 旧路径：无阶梯，走 CalculatePrice + 单价
-		priceResult, err := c.CalculatePrice(ctx, modelID, tenantID, agentLevel)
+		priceResult, err := c.CalculatePrice(ctx, userID, modelID, tenantID, agentLevel)
 		if err != nil {
 			return nil, err
 		}
@@ -255,6 +268,15 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, modelID uint, ten
 		inputPriceRMB = priceResult.InputPriceRMB
 		outputPriceRMB = priceResult.OutputPriceRMB
 		source = priceResult.Source
+
+		// 补充 UserDiscount 审计信息（非阶梯路径 CalculatePrice 未透出该字段）
+		if userID > 0 {
+			if d, derr := c.resolver.ResolveDiscount(ctx, userID, tenantID, modelID, agentLevel); derr == nil && d != nil && d.UserDiscountID != nil {
+				userDiscountID = d.UserDiscountID
+				userDiscountRate = d.UserDiscountRate
+				userDiscountType = d.UserDiscountType
+			}
+		}
 	}
 
 	// 计算费用：价格单位是"每百万token的积分"，需要乘以 token 数再除以 1,000,000
@@ -285,8 +307,11 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, modelID uint, ten
 			Currency:              platformPrice.Currency,
 			Source:                source,
 		},
-		MatchedTier:    matchedTier,
-		MatchedTierIdx: matchedTierIdx,
+		MatchedTier:      matchedTier,
+		MatchedTierIdx:   matchedTierIdx,
+		UserDiscountID:   userDiscountID,
+		UserDiscountRate: userDiscountRate,
+		UserDiscountType: userDiscountType,
 	}, nil
 }
 
@@ -305,7 +330,7 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, modelID uint, ten
 // 对于非 Token 单位，以模型的平台基础价 InputCostRMB 计算。
 // 三级折扣（DISCOUNT）仍生效（通过 DiscountResolver 解析后乘折扣率）。
 // MARKUP/FIXED 在非 Token 类单位下暂不支持，按平台基础价收取。
-func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, modelID uint, tenantID uint, agentLevel int, usage UsageInput) (*CostResult, error) {
+func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, userID uint, modelID uint, tenantID uint, agentLevel int, usage UsageInput) (*CostResult, error) {
 	var m model.AIModel
 	if err := c.db.WithContext(ctx).First(&m, modelID).Error; err != nil {
 		return nil, fmt.Errorf("model %d not found: %w", modelID, err)
@@ -313,26 +338,48 @@ func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, modelID uin
 
 	// per_million_tokens 走原有路径，保证 FIXED/MARKUP/DISCOUNT 三层定价完全兼容
 	if m.PricingUnit == "" || m.PricingUnit == model.UnitPerMillionTokens {
-		return c.CalculateCost(ctx, modelID, tenantID, agentLevel, usage.InputTokens, usage.OutputTokens)
+		return c.CalculateCost(ctx, userID, modelID, tenantID, agentLevel, usage.InputTokens, usage.OutputTokens)
 	}
 
 	// 非 token 单位：以模型 InputCostRMB 为基础价
-	basePriceRMB := m.InputCostRMB
+	platformPrice, platformErr := c.getPlatformPrice(ctx, modelID)
+	sellPriceRMB := m.InputCostRMB
+	if platformErr == nil && platformPrice != nil && platformPrice.InputPriceRMB > 0 {
+		sellPriceRMB = platformPrice.InputPriceRMB
+	}
+	baseCostRMB := m.InputCostRMB
+	if baseCostRMB <= 0 && sellPriceRMB > 0 {
+		baseCostRMB = sellPriceRMB
+	}
+	basePriceRMB := sellPriceRMB
 	if basePriceRMB <= 0 {
 		// 价格未配置，返回 0 费用（不阻塞请求）
 		return &CostResult{TotalCost: 0, TotalCostRMB: 0}, nil
 	}
 
 	// 尝试解析折扣（仅应用 DISCOUNT 类型，其他类型回退为平台价）
-	discount, derr := c.resolver.ResolveDiscount(ctx, tenantID, modelID, agentLevel)
+	discount, derr := c.resolver.ResolveDiscount(ctx, userID, tenantID, modelID, agentLevel)
 	discountRate := 1.0
 	source := "platform"
-	if derr == nil && discount != nil && discount.PricingType == "DISCOUNT" && discount.InputDiscount > 0 {
-		discountRate = discount.InputDiscount
-		if discount.Type == "agent_custom" {
-			source = "agent_custom"
-		} else {
-			source = "level_discount"
+	var udID *uint
+	var udRate *float64
+	var udType string
+	if derr == nil && discount != nil {
+		if discount.UserDiscountID != nil {
+			udID = discount.UserDiscountID
+			udRate = discount.UserDiscountRate
+			udType = discount.UserDiscountType
+		}
+		if discount.PricingType == "DISCOUNT" && discount.InputDiscount > 0 {
+			discountRate = discount.InputDiscount
+			switch discount.Type {
+			case "user_custom":
+				source = "user_custom"
+			case "agent_custom":
+				source = "agent_custom"
+			default:
+				source = "level_discount"
+			}
 		}
 	}
 
@@ -355,7 +402,7 @@ func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, modelID uin
 		quantity = usage.DurationSec / 3600.0
 	default:
 		// 未知单位，回退到 token 路径避免漏扣
-		return c.CalculateCost(ctx, modelID, tenantID, agentLevel, usage.InputTokens, usage.OutputTokens)
+		return c.CalculateCost(ctx, userID, modelID, tenantID, agentLevel, usage.InputTokens, usage.OutputTokens)
 	}
 
 	if quantity <= 0 {
@@ -372,7 +419,7 @@ func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, modelID uin
 	totalCostRMB := credits.CreditsToRMB(totalCost)
 
 	// 平台成本（用于利润分析）使用同一基础价
-	platformCost := credits.RMBToCredits(basePriceRMB * quantity)
+	platformCost := credits.RMBToCredits(baseCostRMB * quantity)
 
 	return &CostResult{
 		InputCost:    totalCost,
@@ -381,9 +428,16 @@ func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, modelID uin
 		TotalCostRMB: totalCostRMB,
 		PlatformCost: platformCost,
 		PriceDetail: PriceResult{
-			Currency: "CREDIT",
-			Source:   source,
+			InputPricePerMillion:  credits.RMBToCredits(sellPriceRMB * discountRate),
+			OutputPricePerMillion: 0,
+			InputPriceRMB:         sellPriceRMB * discountRate,
+			OutputPriceRMB:        0,
+			Currency:              "CREDIT",
+			Source:                source,
 		},
+		UserDiscountID:   udID,
+		UserDiscountRate: udRate,
+		UserDiscountType: udType,
 	}, nil
 }
 
@@ -411,6 +465,7 @@ type CacheUsageInput struct {
 // CacheSavingCredits 便于日志记录与对账展示。
 func (c *PricingCalculator) CalculateCostWithCache(
 	ctx context.Context,
+	userID uint,
 	aiModel *model.AIModel,
 	tenantID uint, agentLevel int,
 	usage CacheUsageInput,
@@ -421,12 +476,12 @@ func (c *PricingCalculator) CalculateCostWithCache(
 	// 不支持缓存或无缓存用量 → 走普通路径
 	if !aiModel.SupportsCache || aiModel.CacheMechanism == "none" ||
 		(usage.CacheReadTokens == 0 && usage.CacheWriteTokens == 0) {
-		return c.CalculateCost(ctx, aiModel.ID, tenantID, agentLevel,
+		return c.CalculateCost(ctx, userID, aiModel.ID, tenantID, agentLevel,
 			usage.InputTokens, usage.OutputTokens)
 	}
 
 	// 1) 先按售价计算基础 CostResult（用户侧售价，已含阶梯/代理折扣）
-	base, err := c.CalculateCost(ctx, aiModel.ID, tenantID, agentLevel,
+	base, err := c.CalculateCost(ctx, userID, aiModel.ID, tenantID, agentLevel,
 		usage.InputTokens, usage.OutputTokens)
 	if err != nil {
 		return nil, err
@@ -504,6 +559,9 @@ func (c *PricingCalculator) CalculateCostWithCache(
 		CacheWriteCost:     cacheWriteCost,
 		RegularInputCost:   regularCost,
 		CacheSavingCredits: savings,
+		UserDiscountID:     base.UserDiscountID,
+		UserDiscountRate:   base.UserDiscountRate,
+		UserDiscountType:   base.UserDiscountType,
 	}, nil
 }
 
@@ -518,6 +576,7 @@ func (c *PricingCalculator) CalculateCostWithCache(
 // savingsRMB 表示平台从供应商侧节省的成本（不影响用户计费）。
 func (c *PricingCalculator) CalculateWithCache(
 	ctx context.Context,
+	userID uint,
 	aiModel *model.AIModel,
 	tenantID uint,
 	agentLevel int,
@@ -526,13 +585,13 @@ func (c *PricingCalculator) CalculateWithCache(
 	// 不支持缓存、或无缓存命中/写入，直接走普通计费路径
 	if !aiModel.SupportsCache || aiModel.CacheMechanism == "none" ||
 		(cacheUsage.CacheReadTokens == 0 && cacheUsage.CacheWriteTokens == 0) {
-		costResult, err = c.CalculateCost(ctx, aiModel.ID, tenantID, agentLevel,
+		costResult, err = c.CalculateCost(ctx, userID, aiModel.ID, tenantID, agentLevel,
 			cacheUsage.InputTokens, cacheUsage.OutputTokens)
 		return costResult, 0, err
 	}
 
 	// 先按普通价格计算用户侧费用（保持计费一致性）
-	costResult, err = c.CalculateCost(ctx, aiModel.ID, tenantID, agentLevel,
+	costResult, err = c.CalculateCost(ctx, userID, aiModel.ID, tenantID, agentLevel,
 		cacheUsage.InputTokens, cacheUsage.OutputTokens)
 	if err != nil {
 		return nil, 0, err
@@ -595,7 +654,7 @@ func (c *PricingCalculator) CalculateWithCache(
 }
 
 // GetPriceMatrix 获取指定租户/层级下所有活跃模型的价格矩阵
-func (c *PricingCalculator) GetPriceMatrix(ctx context.Context, tenantID uint, agentLevel int) ([]PriceMatrixItem, error) {
+func (c *PricingCalculator) GetPriceMatrix(ctx context.Context, userID uint, tenantID uint, agentLevel int) ([]PriceMatrixItem, error) {
 	var models []model.AIModel
 	if err := c.db.WithContext(ctx).
 		Preload("Supplier").
@@ -607,7 +666,7 @@ func (c *PricingCalculator) GetPriceMatrix(ctx context.Context, tenantID uint, a
 
 	items := make([]PriceMatrixItem, 0, len(models))
 	for _, m := range models {
-		price, err := c.CalculatePrice(ctx, m.ID, tenantID, agentLevel)
+		price, err := c.CalculatePrice(ctx, userID, m.ID, tenantID, agentLevel)
 		if err != nil {
 			// Skip models without pricing configured
 			continue
@@ -640,22 +699,31 @@ func (c *PricingCalculator) GetPriceMatrix(ctx context.Context, tenantID uint, a
 }
 
 // InvalidateCache 清除定价缓存
-// tenantID 为 nil 时清除该模型的所有缓存，否则清除特定条目
+// tenantID 为 nil 时清除该模型的所有缓存（跨所有用户），否则清除该模型+租户的所有缓存
+// 缓存 key 格式：pricing:{userID}:{modelID}:{tenantID}:{level}
 func (c *PricingCalculator) InvalidateCache(ctx context.Context, modelID uint, tenantID *uint) {
 	if c.redis == nil {
 		return
 	}
 	if tenantID != nil {
-		// Clear all level variants for this model+tenant
-		for level := 0; level <= 3; level++ {
-			key := cacheKey(modelID, *tenantID, level)
-			_ = redis.Del(ctx, key)
-		}
+		// 模式扫描：pricing:*:{modelID}:{tenantID}:*（跨所有用户+所有 level）
+		pattern := fmt.Sprintf("%s:*:%d:%d:*", priceCachePrefix, modelID, *tenantID)
+		c.deleteByPattern(ctx, pattern)
 	} else {
-		// Wildcard delete: scan keys with prefix pricing:{modelID}:*
-		pattern := fmt.Sprintf("%s:%d:*", priceCachePrefix, modelID)
+		// 模式扫描：pricing:*:{modelID}:*（跨所有用户+租户+level）
+		pattern := fmt.Sprintf("%s:*:%d:*", priceCachePrefix, modelID)
 		c.deleteByPattern(ctx, pattern)
 	}
+}
+
+// InvalidateUserCache 清除指定用户的所有定价缓存
+// 适用于 UserModelDiscount 创建/更新/删除后
+func (c *PricingCalculator) InvalidateUserCache(ctx context.Context, userID uint) {
+	if c.redis == nil {
+		return
+	}
+	pattern := fmt.Sprintf("%s:%d:*", priceCachePrefix, userID)
+	c.deleteByPattern(ctx, pattern)
 }
 
 // getPlatformPrice 获取模型的平台定价（积分/百万token）

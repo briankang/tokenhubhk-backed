@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 
+	"tokenhub-server/internal/pkg/safego"
 	"tokenhub-server/internal/provider"
 	channelsvc "tokenhub-server/internal/service/channel"
 )
@@ -63,7 +64,7 @@ func (n *LLMNode) Execute(ctx context.Context, input *NodeInput) (*NodeOutput, e
 
 	content := ""
 	if len(resp.Choices) > 0 {
-		content = resp.Choices[0].Message.Content
+		content = provider.TextContent(resp.Choices[0].Message.Content)
 	}
 
 	return &NodeOutput{
@@ -103,7 +104,7 @@ func (n *LLMNode) Stream(ctx context.Context, input *NodeInput) (<-chan StreamEv
 	}
 
 	ch := make(chan StreamEvent, 32)
-	go func() {
+	safego.Go("orchestration-llm-stream", func() {
 		defer close(ch)
 		defer reader.Close()
 
@@ -159,7 +160,7 @@ func (n *LLMNode) Stream(ctx context.Context, input *NodeInput) (<-chan StreamEv
 				}
 			}
 		}
-	}()
+	})
 
 	return ch, nil
 }

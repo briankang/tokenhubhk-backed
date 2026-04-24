@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -15,6 +16,7 @@ import (
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 	balancesvc "tokenhub-server/internal/service/balance"
+	permissionsvc "tokenhub-server/internal/service/permission"
 	referralsvc "tokenhub-server/internal/service/referral"
 )
 
@@ -139,15 +141,16 @@ func (h *BatchUserHandler) BatchCreateUsers(c *gin.Context) {
 			continue
 		}
 
-		// 设置默认角色
-		role := userReq.Role
-		if role == "" {
-			role = "USER"
+		// v4.0: 角色通过 user_roles 表分配，legacy role 字段不再写入
+		// 支持传入 USER/ADMIN，映射到 USER/SUPER_ADMIN 角色 code
+		requestedRole := userReq.Role
+		if requestedRole == "" {
+			requestedRole = "USER"
 		}
-		// 验证角色是否合法（v3.1：代理角色已废除，仅保留 USER/ADMIN）
-		validRoles := map[string]bool{"USER": true, "ADMIN": true}
-		if !validRoles[role] {
-			role = "USER"
+		roleMapping := map[string]string{"USER": "USER", "ADMIN": "SUPER_ADMIN"}
+		targetRoleCode, ok := roleMapping[requestedRole]
+		if !ok {
+			targetRoleCode = "USER"
 		}
 
 		// 创建用户
@@ -156,7 +159,6 @@ func (h *BatchUserHandler) BatchCreateUsers(c *gin.Context) {
 			Email:        userReq.Email,
 			PasswordHash: string(hash),
 			Name:         userReq.Name,
-			Role:         role,
 			IsActive:     true,
 			Language:     "zh",
 		}
@@ -167,6 +169,16 @@ func (h *BatchUserHandler) BatchCreateUsers(c *gin.Context) {
 			result.Failed++
 			result.Results = append(result.Results, createResult)
 			continue
+		}
+
+		// v4.0: 分配角色到 user_roles 表
+		var targetRoleID uint
+		if err := h.db.Table("roles").
+			Where("code = ? AND deleted_at IS NULL", targetRoleCode).
+			Select("id").Scan(&targetRoleID).Error; err == nil && targetRoleID != 0 {
+			_ = h.db.Create(&model.UserRole{
+				UserID: user.ID, RoleID: targetRoleID, GrantedBy: 0, GrantedAt: time.Now(),
+			}).Error
 		}
 
 		// 初始化用户余额
@@ -205,7 +217,9 @@ type UpdateRoleRequest struct {
 }
 
 // UpdateUserRole 更新用户角色 PUT /api/v1/admin/users/:id/role
-// v3.1：代理角色已废除，仅支持 USER/ADMIN 切换
+// v4.0: 改为操作 user_roles 表。legacy 角色字符串 → role.code 映射：
+//   ADMIN → SUPER_ADMIN；USER → USER
+// 其他自定义角色分配请用 Phase 6 的 /admin/users/:id/roles 端点。
 func (h *BatchUserHandler) UpdateUserRole(c *gin.Context) {
 	userIDStr := c.Param("id")
 	uid, err := strconv.ParseUint(userIDStr, 10, 64)
@@ -220,18 +234,22 @@ func (h *BatchUserHandler) UpdateUserRole(c *gin.Context) {
 		return
 	}
 
-	// 验证角色是否合法
-	validRoles := map[string]bool{"USER": true, "ADMIN": true}
-	if !validRoles[req.Role] {
-		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "invalid role")
+	// v4.1: 接受任意 role code（向下兼容 legacy "user"/"admin" 小写）
+	roleCodeInput := req.Role
+	legacyMap := map[string]string{"user": "USER", "admin": "SUPER_ADMIN"}
+	if mapped, ok := legacyMap[roleCodeInput]; ok {
+		roleCodeInput = mapped
+	}
+	newRoleCode := roleCodeInput
+	if newRoleCode == "" {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "role code is required")
 		return
 	}
 
-	// 获取操作人ID
 	operatorID, _ := c.Get("userId")
 	opID, _ := operatorID.(uint)
 
-	// 获取用户信息
+	// 查询目标用户是否存在 + 查当前角色（用于审计）
 	var user model.User
 	if err := h.db.First(&user, uid).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -241,23 +259,52 @@ func (h *BatchUserHandler) UpdateUserRole(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return
 	}
+	var oldRoleCodes []string
+	h.db.Table("roles").
+		Joins("JOIN user_roles ON roles.id = user_roles.role_id").
+		Where("user_roles.user_id = ?", uid).
+		Pluck("roles.code", &oldRoleCodes)
 
-	oldRole := user.Role
+	// 查询目标角色 ID
+	var newRoleID uint
+	if err := h.db.Table("roles").
+		Where("code = ? AND deleted_at IS NULL", newRoleCode).
+		Select("id").Scan(&newRoleID).Error; err != nil || newRoleID == 0 {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, "target role not found in DB")
+		return
+	}
 
-	// 更新用户角色
-	if err := h.db.Model(&model.User{}).Where("id = ?", user.ID).Update("role", req.Role).Error; err != nil {
+	// 事务：删除旧 user_roles，插入新 user_roles
+	tx := h.db.Begin()
+	if err := tx.Where("user_id = ?", uid).Delete(&model.UserRole{}).Error; err != nil {
+		tx.Rollback()
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	ur := model.UserRole{UserID: uint(uid), RoleID: newRoleID, GrantedBy: opID, GrantedAt: time.Now()}
+	if err := tx.Create(&ur).Error; err != nil {
+		tx.Rollback()
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	if err := tx.Commit().Error; err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return
 	}
 
-	// 记录审计日志
-	h.logAudit(c.Request.Context(), opID, "UPDATE_USER_ROLE", fmt.Sprintf("user:%d", uid), fmt.Sprintf("role changed from %s to %s", oldRole, req.Role))
+	// 显式失效 Redis 缓存，让下次请求走 DB 重建
+	if permissionsvc.Default != nil {
+		_ = permissionsvc.Default.InvalidateUserPerms(c.Request.Context(), uint(uid))
+	}
+
+	h.logAudit(c.Request.Context(), opID, "UPDATE_USER_ROLE", fmt.Sprintf("user:%d", uid),
+		fmt.Sprintf("roles changed from %v to [%s]", oldRoleCodes, newRoleCode))
 
 	response.Success(c, gin.H{
-		"message":  "role updated",
-		"user_id":  uid,
-		"old_role": oldRole,
-		"new_role": req.Role,
+		"message":   "role updated",
+		"user_id":   uid,
+		"old_roles": oldRoleCodes,
+		"new_role":  newRoleCode,
 	})
 }
 

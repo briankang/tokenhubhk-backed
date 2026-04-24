@@ -59,6 +59,8 @@ func (h *QuotaHandler) UpdateQuotaConfig(c *gin.Context) {
 		InviterBonus         *int64  `json:"inviterBonus"`
 		InviterUnlockPaidRMB *int64  `json:"inviterUnlockPaidRmb"`
 		InviterMonthlyCap    *int    `json:"inviterMonthlyCap"`
+		FreeQuotaExpiryDays  *int    `json:"freeQuotaExpiryDays"`
+		PaidThresholdCredits *int64  `json:"paidThresholdCredits"`
 		Description          *string `json:"description"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -129,6 +131,12 @@ func (h *QuotaHandler) UpdateQuotaConfig(c *gin.Context) {
 			return
 		}
 		current.InviterMonthlyCap = v
+	}
+	if req.FreeQuotaExpiryDays != nil {
+		current.FreeQuotaExpiryDays = *req.FreeQuotaExpiryDays
+	}
+	if req.PaidThresholdCredits != nil {
+		current.PaidThresholdCredits = *req.PaidThresholdCredits
 	}
 	if req.Description != nil {
 		current.Description = *req.Description

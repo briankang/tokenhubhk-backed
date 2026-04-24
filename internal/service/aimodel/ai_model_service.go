@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"gorm.io/gorm"
 
@@ -198,6 +199,15 @@ func (s *AIModelService) SetStatus(ctx context.Context, id uint, status string) 
 	if status != "offline" && status != "online" && status != "error" {
 		return fmt.Errorf("invalid status: %s, must be offline/online/error", status)
 	}
+	if status == "online" {
+		report, err := s.PreflightModelEnable(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !report.CanEnable {
+			return fmt.Errorf("model preflight failed: %s", report.BlockerMessage())
+		}
+	}
 	updates := map[string]interface{}{"status": status}
 	if status == "online" {
 		updates["is_active"] = true
@@ -210,6 +220,13 @@ func (s *AIModelService) SetStatus(ctx context.Context, id uint, status string) 
 		return fmt.Errorf("ai model not found")
 	}
 	return nil
+}
+
+func IsTemporaryModelName(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	return strings.HasPrefix(lower, "tmp-model_") ||
+		strings.HasPrefix(lower, "qa-offline-") ||
+		strings.HasPrefix(lower, "updated-model_")
 }
 
 // ListOnline 查询所有在线模型（is_active=true 且 status=online）
@@ -225,7 +242,7 @@ func (s *AIModelService) ListOnline(ctx context.Context, page, pageSize int, mod
 		pageSize = 20
 	}
 
-	typeFilter := []string{"LLM", "VLM"}
+	typeFilter := []string{"LLM", "VLM", "Reasoning"}
 	priceFilter := true
 	if len(modelTypes) > 0 {
 		typeFilter = modelTypes
@@ -275,4 +292,14 @@ func (s *AIModelService) ListOnlineByPopularity(ctx context.Context, page, pageS
 		return nil, 0, fmt.Errorf("failed to list online models by popularity: %w", err)
 	}
 	return models, total, nil
+}
+
+// BatchUpdateFreeTier 批量更新模型的 IsFreeTier 状态
+func (s *AIModelService) BatchUpdateFreeTier(ctx context.Context, ids []uint, isFree bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	return s.db.WithContext(ctx).Model(&model.AIModel{}).
+		Where("id IN ?", ids).
+		Update("is_free_tier", isFree).Error
 }

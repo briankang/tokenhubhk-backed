@@ -1,6 +1,7 @@
 package user
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 
@@ -9,6 +10,13 @@ import (
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 	apikeysvc "tokenhub-server/internal/service/apikey"
+	"tokenhub-server/internal/service/usercache"
+)
+
+// apiKeyListCacheEnabled 仅对默认分页参数启用缓存（Dashboard 热路径）
+const (
+	apiKeyDefaultPage     = 1
+	apiKeyDefaultPageSize = 20
 )
 
 // ApiKeyHandler 用户API Key管理接口处理器
@@ -39,6 +47,24 @@ func (h *ApiKeyHandler) List(c *gin.Context) {
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+
+	// 仅对默认分页走 user:apikeys:{uid} 缓存（Dashboard 首屏命中率最高）
+	if page == apiKeyDefaultPage && pageSize == apiKeyDefaultPageSize {
+		type listPayload struct {
+			Keys  []apikeysvc.ApiKeyWithStats `json:"keys"`
+			Total int64                       `json:"total"`
+		}
+		result, err := usercache.GetOrLoadApiKeys[listPayload](c.Request.Context(), uid, func(ctx context.Context) (listPayload, error) {
+			keys, total, e := h.svc.List(ctx, uid, page, pageSize)
+			return listPayload{Keys: keys, Total: total}, e
+		})
+		if err != nil {
+			response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+			return
+		}
+		response.PageResult(c, result.Keys, result.Total, page, pageSize)
+		return
+	}
 
 	keys, total, err := h.svc.List(c.Request.Context(), uid, page, pageSize)
 	if err != nil {
@@ -101,6 +127,7 @@ func (h *ApiKeyHandler) Generate(c *gin.Context) {
 		return
 	}
 
+	usercache.InvalidateApiKeys(c.Request.Context(), uid)
 	response.Success(c, result)
 }
 
@@ -119,6 +146,7 @@ func (h *ApiKeyHandler) Revoke(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
 		return
 	}
+	usercache.InvalidateApiKeys(c.Request.Context(), uid)
 	response.Success(c, gin.H{"message": "api key deleted"})
 }
 
@@ -136,6 +164,7 @@ func (h *ApiKeyHandler) Disable(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
 		return
 	}
+	usercache.InvalidateApiKeys(c.Request.Context(), uid)
 	response.Success(c, gin.H{"message": "api key disabled"})
 }
 
@@ -153,6 +182,7 @@ func (h *ApiKeyHandler) Enable(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
 		return
 	}
+	usercache.InvalidateApiKeys(c.Request.Context(), uid)
 	response.Success(c, gin.H{"message": "api key enabled"})
 }
 
@@ -256,5 +286,6 @@ func (h *ApiKeyHandler) Update(c *gin.Context) {
 		return
 	}
 
+	usercache.InvalidateApiKeys(c.Request.Context(), uid)
 	response.Success(c, gin.H{"message": "api key updated"})
 }

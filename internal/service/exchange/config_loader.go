@@ -43,9 +43,10 @@ type DecryptFn func(encoded string) (string, error)
 //  4. 所有错误都降级处理，不 panic、不 return error
 //
 // 参数：
-//   db         — DB 连接
-//   fallback   — 默认配置（通常从 config.Global.ExchangeRate 填充）
-//   decryptFn  — 可选；为 nil 时跳过 AppSecret 解密
+//
+//	db         — DB 连接
+//	fallback   — 默认配置（通常从 config.Global.ExchangeRate 填充）
+//	decryptFn  — 可选；为 nil 时跳过 AppSecret 解密
 //
 // 返回：已合并 DB 值的 Config
 func LoadConfigFromDB(db *gorm.DB, fallback Config, decryptFn DecryptFn) Config {
@@ -68,7 +69,7 @@ func LoadConfigFromDB(db *gorm.DB, fallback Config, decryptFn DecryptFn) Config 
 		if decryptFn != nil {
 			plain, err := decryptFn(encrypted)
 			if err != nil {
-				logger.L.Warn("exchange_rate appsecret decrypt failed, use fallback",
+				log().Warn("exchange_rate appsecret decrypt failed, use fallback",
 					zap.Error(err))
 			} else {
 				fallback.AppSecret = plain
@@ -113,7 +114,7 @@ func getIntSystemConfig(db *gorm.DB, key string) int {
 	}
 	n, err := strconv.Atoi(val)
 	if err != nil {
-		logger.L.Debug("exchange_rate int config parse failed",
+		log().Debug("exchange_rate int config parse failed",
 			zap.String("key", key), zap.String("value", val))
 		return 0
 	}
@@ -128,9 +129,16 @@ func getFloatSystemConfig(db *gorm.DB, key string) float64 {
 	}
 	f, err := strconv.ParseFloat(val, 64)
 	if err != nil {
-		logger.L.Debug("exchange_rate float config parse failed",
+		log().Debug("exchange_rate float config parse failed",
 			zap.String("key", key), zap.String("value", val))
 		return 0
 	}
 	return f
+}
+
+func log() *zap.Logger {
+	if logger.L == nil {
+		return zap.NewNop()
+	}
+	return logger.L
 }

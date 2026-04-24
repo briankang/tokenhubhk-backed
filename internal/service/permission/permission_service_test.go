@@ -28,9 +28,12 @@ func TestMain(m *testing.M) {
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
-		os.Exit(0)
+		// DB 不可用时不退出 —— 允许无需 DB 的纯单元测试（resolver_test、builtin_roles_test）继续运行
+		testDB = nil
+	} else {
+		testDB = db
+		_ = testDB.AutoMigrate(&model.User{}, &model.Tenant{})
 	}
-	testDB = db
 
 	redisAddr := os.Getenv("TEST_REDIS_ADDR")
 	if redisAddr == "" {
@@ -41,7 +44,6 @@ func TestMain(m *testing.M) {
 		testRedis = nil
 	}
 
-	_ = testDB.AutoMigrate(&model.User{}, &model.Tenant{})
 	code := m.Run()
 	os.Exit(code)
 }

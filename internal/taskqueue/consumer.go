@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"tokenhub-server/internal/pkg/logger"
+	"tokenhub-server/internal/pkg/safego"
 )
 
 // TaskHandler 任务处理函数签名
@@ -86,7 +87,11 @@ func (c *Consumer) Start(ctx context.Context) {
 
 		for _, stream := range streams {
 			for _, msg := range stream.Messages {
-				c.processMessage(ctx, msg)
+				msgCopy := msg
+				// safego.Run 隔离单条消息处理的 panic，避免 consumer 主循环被 handler panic 拖死
+				safego.Run("taskqueue-process-message", func() {
+					c.processMessage(ctx, msgCopy)
+				})
 			}
 		}
 	}

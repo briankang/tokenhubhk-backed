@@ -8,17 +8,13 @@ import (
 	"gorm.io/gorm"
 )
 
-// RunSeedParams 初始化平台标准参数和供应商映射
-// 幂等操作：仅在 platform_params 表为空时执行
+// RunSeedParams 初始化/更新平台标准参数和供应商映射
+// v4.2 起：每次重启均执行 upsert，确保所有环境拥有最新的参数定义和供应商映射。
+// 更新策略：
+//   - PlatformParam：按 param_name 匹配，存在则更新 display_name/description/param_type/category/sort_order，不存在则创建
+//   - SupplierParamMapping：按 (platform_param_id, supplier_code) 匹配，存在则更新转换规则/支持状态/notes，不存在则创建
 func RunSeedParams() {
-	var count int64
-	DB.Model(&model.PlatformParam{}).Count(&count)
-	if count > 0 {
-		logger.L.Info("platform_params already seeded, skipping")
-		return
-	}
-
-	logger.L.Info("seeding platform params and supplier mappings...")
+	logger.L.Info("seeding platform params and supplier mappings (upsert mode)...")
 
 	// ── 平台标准参数定义 ──
 	// 命名规范参考 OpenAI API 参数风格
@@ -84,18 +80,49 @@ func RunSeedParams() {
 		},
 	}
 
-	// 批量创建参数定义
+	// ── Upsert 平台参数定义 ──
+	paramCreated, paramUpdated := 0, 0
 	for i := range params {
-		if err := DB.Create(&params[i]).Error; err != nil {
-			logger.L.Error("seed platform param failed", zap.String("param", params[i].ParamName), zap.Error(err))
+		var existing model.PlatformParam
+		if err := DB.Where("param_name = ?", params[i].ParamName).First(&existing).Error; err != nil {
+			// 不存在，创建
+			if err2 := DB.Create(&params[i]).Error; err2 != nil {
+				logger.L.Error("seed platform param failed",
+					zap.String("param", params[i].ParamName), zap.Error(err2))
+				continue
+			}
+			paramCreated++
+		} else {
+			// 已存在，更新非 ID 字段，保留 ID 以便后续映射
+			params[i].ID = existing.ID
+			updates := map[string]interface{}{
+				"display_name":  params[i].DisplayName,
+				"description":   params[i].Description,
+				"param_type":    params[i].ParamType,
+				"default_value": params[i].DefaultValue,
+				"category":      params[i].Category,
+				"sort_order":    params[i].SortOrder,
+				"is_active":     params[i].IsActive,
+			}
+			if err2 := DB.Model(&model.PlatformParam{}).Where("id = ?", existing.ID).
+				Updates(updates).Error; err2 != nil {
+				logger.L.Error("update platform param failed",
+					zap.String("param", params[i].ParamName), zap.Error(err2))
+			} else {
+				paramUpdated++
+			}
 		}
 	}
+	logger.L.Info("platform params upserted",
+		zap.Int("created", paramCreated), zap.Int("updated", paramUpdated))
 
 	// ── 供应商映射 ──
-	// 构建参数名 → ID 映射
+	// 从 DB 重新读取 ID（确保 FirstOrCreate 后 ID 正确）
 	paramIDMap := make(map[string]uint)
 	for _, p := range params {
-		paramIDMap[p.ParamName] = p.ID
+		if p.ID > 0 {
+			paramIDMap[p.ParamName] = p.ID
+		}
 	}
 
 	mappings := []model.SupplierParamMapping{
@@ -244,12 +271,52 @@ func RunSeedParams() {
 		{PlatformParamID: paramIDMap["top_k"], SupplierCode: "azure_openai", VendorParamName: "top_k", TransformType: "none", Supported: false},
 	}
 
-	if err := DB.CreateInBatches(mappings, 50).Error; err != nil {
-		logger.L.Error("seed supplier param mappings failed", zap.Error(err))
+	// ── Upsert 供应商映射 ──
+	mappingCreated, mappingUpdated, mappingSkipped := 0, 0, 0
+	for _, m := range mappings {
+		if m.PlatformParamID == 0 {
+			// 参数 ID 为 0 说明对应的参数创建失败，跳过
+			mappingSkipped++
+			continue
+		}
+		var existing model.SupplierParamMapping
+		if err := DB.Where("platform_param_id = ? AND supplier_code = ?",
+			m.PlatformParamID, m.SupplierCode).First(&existing).Error; err != nil {
+			// 不存在，创建
+			if err2 := DB.Create(&m).Error; err2 != nil {
+				logger.L.Error("seed supplier param mapping failed",
+					zap.String("supplier", m.SupplierCode),
+					zap.Uint("param_id", m.PlatformParamID), zap.Error(err2))
+				mappingSkipped++
+			} else {
+				mappingCreated++
+			}
+		} else {
+			// 已存在，更新转换规则/支持状态/notes
+			updates := map[string]interface{}{
+				"vendor_param_name": m.VendorParamName,
+				"transform_type":    m.TransformType,
+				"transform_rule":    m.TransformRule,
+				"supported":         m.Supported,
+				"notes":             m.Notes,
+			}
+			if err2 := DB.Model(&model.SupplierParamMapping{}).Where("id = ?", existing.ID).
+				Updates(updates).Error; err2 != nil {
+				logger.L.Error("update supplier param mapping failed",
+					zap.String("supplier", m.SupplierCode),
+					zap.Uint("param_id", m.PlatformParamID), zap.Error(err2))
+				mappingSkipped++
+			} else {
+				mappingUpdated++
+			}
+		}
 	}
-
 	logger.L.Info("platform params and supplier mappings seeded successfully",
-		zap.Int("params", len(params)), zap.Int("mappings", len(mappings)))
+		zap.Int("params_created", paramCreated),
+		zap.Int("params_updated", paramUpdated),
+		zap.Int("mappings_created", mappingCreated),
+		zap.Int("mappings_updated", mappingUpdated),
+		zap.Int("mappings_skipped", mappingSkipped))
 }
 
 // reseedParamMappings 重新同步映射（管理员手动触发时使用）

@@ -1,0 +1,11 @@
+package main
+import (
+  "fmt"
+  "golang.org/x/crypto/bcrypt"
+)
+func main() {
+  hash := "$2a$12$NIxBjZzMy6BshaXSYFctVuHlVNTNSVNfw1LapqJUDVoKg50OvkK76"
+  pwd := "05bf221f654b8f73a2e120cda3f057952b955f424dcb8ca8793e8040a4e29988"
+  err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(pwd))
+  if err == nil { fmt.Println("MATCH") } else { fmt.Println("MISMATCH:", err) }
+}

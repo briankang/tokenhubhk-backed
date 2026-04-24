@@ -1,0 +1,53 @@
+# Slim 版 Dockerfile（不含 Chromium，约 150MB）
+# 用途：gateway / backend 以及 worker（若暂不使用 Chromium 价格爬虫）
+# 国内到 GHCR 网络不稳时的首选镜像
+# ============================================
+# Stage 1: Build（与完整版共用）
+FROM golang:1.23-alpine AS builder
+
+RUN apk update && apk add --no-cache git ca-certificates tzdata
+
+ENV GOPROXY=https://goproxy.cn,https://goproxy.io,https://proxy.golang.org,direct
+ENV GONOSUMCHECK=*
+ENV GONOSUMDB=*
+ENV GOFLAGS=-insecure
+
+WORKDIR /build
+
+COPY go.mod go.sum* ./
+
+RUN for i in 1 2 3 4 5; do \
+      echo "=== Attempt $i ===" && \
+      go mod download && break || sleep 3; \
+    done
+
+COPY . .
+
+RUN for i in 1 2 3 4 5; do \
+      echo "=== go mod tidy attempt $i ===" && \
+      go mod tidy && break || sleep 5; \
+    done
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o server ./cmd/server/
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o tokenhub ./cmd/tokenhub/
+
+# Stage 2: 精简运行时（仅 CA + 时区 + 字体，无 Chromium）
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates tzdata fonts-wqy-zenhei wget && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /build/server .
+COPY --from=builder /build/tokenhub .
+COPY --from=builder /build/configs ./configs
+COPY --from=builder /build/internal/pkg/i18n/locales ./internal/pkg/i18n/locales
+
+RUN mkdir -p /app/logs
+
+EXPOSE 8080
+
+CMD ["./tokenhub"]

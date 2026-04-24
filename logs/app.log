@@ -1,0 +1,4 @@
+{"level":"info","ts":"2026-04-24T13:57:58.949Z","caller":"database/seed_wangsu_image.go:134","msg":"seed_wangsu_image: complete","created":4,"updated":0,"total":4}
+{"level":"info","ts":"2026-04-24T13:57:58.953Z","caller":"seed-wangsu-image/main.go:35","msg":"seed-wangsu-image complete","database":"tokenhubhk"}
+{"level":"info","ts":"2026-04-24T14:02:56.778Z","caller":"database/seed_wangsu_video.go:137","msg":"seed_wangsu_video: complete","created":5,"updated":0,"total":5}
+{"level":"info","ts":"2026-04-24T14:02:56.783Z","caller":"seed-wangsu-video/main.go:35","msg":"seed-wangsu-video complete","database":"tokenhubhk"}

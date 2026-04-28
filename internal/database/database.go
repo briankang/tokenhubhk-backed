@@ -161,8 +161,23 @@ func Init(cfg config.DatabaseConfig, logger *zap.Logger) error {
 	if err := ensureBillingCostUnitColumns(); err != nil {
 		return err
 	}
+	if err := ensureModelOpsTables(); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+func ensureModelOpsTables() error {
+	if DB == nil {
+		return nil
+	}
+	return DB.AutoMigrate(
+		&model.PriceCalculatorConfig{}, &model.ModelAlias{}, &model.OAuthProviderConfig{}, &model.OAuthIdentity{},
+		&model.ModelAPIDoc{}, &model.ModelAPIDocSource{}, &model.ModelAPIParamVerification{},
+		&model.SMSProviderConfig{}, &model.CaptchaProviderConfig{}, &model.SMSRiskConfig{},
+		&model.PhoneOTPToken{}, &model.SMSSendLog{}, &model.PhoneRiskRule{},
+	)
 }
 
 func ensureBillingCostUnitColumns() error {
@@ -415,6 +430,8 @@ func autoMigrate() error {
 		&model.SystemConfig{},
 		&model.Tenant{},
 		&model.User{},
+		&model.OAuthProviderConfig{},
+		&model.OAuthIdentity{},
 		&model.ApiKey{},
 		&model.Supplier{},
 		&model.ModelCategory{},
@@ -463,6 +480,7 @@ func autoMigrate() error {
 		&model.CapabilityTestResult{},          // 能力测试单条结果（model×case）
 		&model.CapabilityTestBaseline{},        // 能力测试回归基线
 		&model.BackgroundTask{},                // 后台异步任务
+		&model.CronTaskRun{},                   // 定时任务运行历史
 		&model.ApiCallLog{},                    // API 调用全链路日志
 		&model.BillingReconciliationSnapshot{}, // 每日扣费对账快照
 		&model.PlatformParam{},                 // 平台标准参数定义
@@ -485,10 +503,12 @@ func autoMigrate() error {
 		// --- 站内公告/通知系统 ---
 		&model.Announcement{},         // 管理员发布的站内公告
 		&model.UserAnnouncementRead{}, // 用户公告已读记录
+		&model.ModelAlias{},
 
 		// --- 模型 k:v 标签系统 ---
-		&model.ModelLabel{},      // 模型标签（热卖/开源/优惠等，支持自定义 k:v）
-		&model.LabelDictionary{}, // v3.5 标签字典（多语言 + 颜色 + 图标 + 排序权重）
+		&model.ModelLabel{},            // 模型标签（热卖/开源/优惠等，支持自定义 k:v）
+		&model.LabelDictionary{},       // v3.5 标签字典（多语言 + 颜色 + 图标 + 排序权重）
+		&model.PriceCalculatorConfig{}, // 价格计算器配置（模型运营工作台）
 
 		// --- v3.2 支付/订单/财务系统重构 ---
 		&model.ExchangeRateHistory{},    // 汇率历史快照（审计 + 降级 fallback）
@@ -529,10 +549,22 @@ func autoMigrate() error {
 		&model.InvoiceRequest{},
 		&model.InvoiceTitle{},
 
+		// --- Privacy and provider compliance baseline ---
+		&model.PrivacyRequest{},
+		&model.ProviderComplianceProfile{},
+
 		// --- 邮件管理（v4.3 新增）---
 		&model.EmailProviderConfig{},
 		&model.EmailTemplate{},
 		&model.EmailSendLog{},
+
+		// --- 中国大陆手机号登录注册（第一期）---
+		&model.SMSProviderConfig{},
+		&model.CaptchaProviderConfig{},
+		&model.SMSRiskConfig{},
+		&model.PhoneOTPToken{},
+		&model.SMSSendLog{},
+		&model.PhoneRiskRule{},
 	)
 }
 
@@ -548,7 +580,9 @@ func seedDefaults() error {
 	// 检查管理员用户是否已存在
 	var existing model.User
 	if err := DB.Where("email = ?", adminEmail).First(&existing).Error; err == nil {
-		return ensureDefaultAdminPasswordHash(DB, &existing, adminPass)
+		// 严格幂等: admin 已存在则不做任何修改 (含密码 hash)
+		// 修改 admin 密码请走 cmd/hashpwd + 直写 DB 的方式 (见 CLAUDE.md 紧急重置命令)
+		return nil
 	} else if err.Error() != "record not found" {
 		return fmt.Errorf("check admin user: %w", err)
 	}

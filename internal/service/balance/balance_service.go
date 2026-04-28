@@ -61,43 +61,37 @@ func (s *BalanceService) GetBalance(ctx context.Context, userID, tenantID uint) 
 	}
 	// v5.1: 懒清理过期免费额度
 	s.expireFreeQuotaIfNeeded(ctx, &ub)
+	hydrateBalanceUnits(&ub)
 	return &ub, nil
 }
 
 // expireFreeQuotaIfNeeded v5.1: 免费额度过期懒清理
 // 若 FreeQuotaExpiredAt 已过且仍有免费额度，则清零并记录 EXPIRED 流水
 func (s *BalanceService) expireFreeQuotaIfNeeded(ctx context.Context, ub *model.UserBalance) {
-	if ub.FreeQuotaExpiredAt == nil || ub.FreeQuota <= 0 {
+	hydrateBalanceUnits(ub)
+	if ub.FreeQuotaExpiredAt == nil || ub.FreeQuotaUnits <= 0 {
 		return
 	}
 	if time.Now().Before(*ub.FreeQuotaExpiredAt) {
 		return
 	}
 	// 免费额度已过期，清零
-	expiredAmount := ub.FreeQuota
-	ub.FreeQuota = 0
-	ub.FreeQuotaRMB = 0
+	expiredUnits := ub.FreeQuotaUnits
+	ub.FreeQuotaUnits = 0
+	syncBalanceCreditFields(ub)
 
 	// 异步更新数据库（best-effort，失败不影响读取）
 	go func(ubID uint, expired int64) {
 		s.db.Model(&model.UserBalance{}).Where("id = ?", ubID).
 			Updates(map[string]interface{}{
-				"free_quota":     0,
-				"free_quota_rmb": 0,
+				"free_quota":       0,
+				"free_quota_units": 0,
+				"free_quota_rmb":   0,
 			})
 		// 记录过期流水
-		record := &model.BalanceRecord{
-			UserID:        ub.UserID,
-			TenantID:      ub.TenantID,
-			Type:          "EXPIRED",
-			Amount:        -expired,
-			AmountRMB:     -credits.CreditsToRMB(expired),
-			BeforeBalance: ub.Balance,
-			AfterBalance:  ub.Balance,
-			Remark:        "免费额度已过期自动清零",
-		}
+		record := balanceRecordFromUnits(ub.UserID, ub.TenantID, "EXPIRED", -expired, ub.BalanceUnits, ub.BalanceUnits, "免费额度已过期自动清零", "")
 		s.db.Create(record)
-	}(ub.ID, expiredAmount)
+	}(ub.ID, expiredUnits)
 }
 
 // GetBalanceCached 带 Redis 缓存的余额查询（user:balance:{uid}，3min TTL）
@@ -111,10 +105,64 @@ func (s *BalanceService) GetBalanceCached(ctx context.Context, userID, tenantID 
 // InvalidateCache 清除指定用户的余额缓存（扣减/充值/退款等操作后调用）
 func (s *BalanceService) InvalidateCache(ctx context.Context, userID uint) {
 	usercache.InvalidateBalance(ctx, userID)
+	usercache.InvalidatePaidStatus(ctx, userID)
 	// 兼容：旧 key 仍可能有残留，一并删除（过渡期）
 	if s.redis != nil {
 		key := balanceCachePrefix + strconv.FormatUint(uint64(userID), 10)
 		_ = s.redis.Del(ctx, key).Err()
+	}
+}
+
+func hydrateBalanceUnits(ub *model.UserBalance) {
+	if ub == nil {
+		return
+	}
+	if ub.BalanceUnits == 0 && ub.Balance > 0 {
+		ub.BalanceUnits = credits.CreditsToBillingUnits(ub.Balance)
+	}
+	if ub.FreeQuotaUnits == 0 && ub.FreeQuota > 0 {
+		ub.FreeQuotaUnits = credits.CreditsToBillingUnits(ub.FreeQuota)
+	}
+	if ub.FrozenUnits == 0 && ub.FrozenAmount > 0 {
+		ub.FrozenUnits = credits.CreditsToBillingUnits(ub.FrozenAmount)
+	}
+	if ub.TotalConsumedUnits == 0 && ub.TotalConsumed > 0 {
+		ub.TotalConsumedUnits = credits.CreditsToBillingUnits(ub.TotalConsumed)
+	}
+	if ub.TotalRechargedUnits == 0 && ub.TotalRecharged > 0 {
+		ub.TotalRechargedUnits = credits.CreditsToBillingUnits(ub.TotalRecharged)
+	}
+	syncBalanceCreditFields(ub)
+}
+
+func syncBalanceCreditFields(ub *model.UserBalance) {
+	if ub == nil {
+		return
+	}
+	ub.Balance = credits.BillingUnitsToCredits(ub.BalanceUnits)
+	ub.BalanceRMB = credits.BillingUnitsToRMB(ub.BalanceUnits)
+	ub.FreeQuota = credits.BillingUnitsToCredits(ub.FreeQuotaUnits)
+	ub.FreeQuotaRMB = credits.BillingUnitsToRMB(ub.FreeQuotaUnits)
+	ub.TotalConsumed = credits.BillingUnitsToCredits(ub.TotalConsumedUnits)
+	ub.TotalConsumedRMB = credits.BillingUnitsToRMB(ub.TotalConsumedUnits)
+	ub.FrozenAmount = credits.BillingUnitsToCredits(ub.FrozenUnits)
+	ub.TotalRecharged = credits.BillingUnitsToCredits(ub.TotalRechargedUnits)
+}
+
+func balanceRecordFromUnits(userID, tenantID uint, recordType string, amountUnits int64, beforeUnits int64, afterUnits int64, remark string, relatedID string) *model.BalanceRecord {
+	return &model.BalanceRecord{
+		UserID:             userID,
+		TenantID:           tenantID,
+		Type:               recordType,
+		Amount:             credits.BillingUnitsToCredits(amountUnits),
+		AmountUnits:        amountUnits,
+		AmountRMB:          credits.BillingUnitsToRMB(amountUnits),
+		BeforeBalance:      credits.BillingUnitsToCredits(beforeUnits),
+		BeforeBalanceUnits: beforeUnits,
+		AfterBalance:       credits.BillingUnitsToCredits(afterUnits),
+		AfterBalanceUnits:  afterUnits,
+		Remark:             remark,
+		RelatedID:          relatedID,
 	}
 }
 
@@ -124,6 +172,7 @@ func (s *BalanceService) InitBalance(ctx context.Context, userID, tenantID uint)
 	// 获取当前生效的额度配置
 	quota := s.getActiveQuotaConfig(ctx)
 	freeCredits := quota.DefaultFreeQuota + quota.RegistrationBonus
+	freeUnits := credits.CreditsToBillingUnits(freeCredits)
 
 	// v5.1: 计算免费额度过期时间
 	var expiredAt *time.Time
@@ -142,7 +191,8 @@ func (s *BalanceService) InitBalance(ctx context.Context, userID, tenantID uint)
 		Balance:            0,
 		BalanceRMB:         0,
 		FreeQuota:          freeCredits,
-		FreeQuotaRMB:       credits.CreditsToRMB(freeCredits),
+		FreeQuotaRMB:       credits.BillingUnitsToRMB(freeUnits),
+		FreeQuotaUnits:     freeUnits,
 		Currency:           "CREDIT",
 		FreeQuotaExpiredAt: expiredAt,
 	}
@@ -154,17 +204,7 @@ func (s *BalanceService) InitBalance(ctx context.Context, userID, tenantID uint)
 
 	// 记录赠送流水
 	if freeCredits > 0 {
-		freeRMB := credits.CreditsToRMB(freeCredits)
-		record := &model.BalanceRecord{
-			UserID:        userID,
-			TenantID:      tenantID,
-			Type:          "GIFT",
-			Amount:        freeCredits,
-			AmountRMB:     freeRMB,
-			BeforeBalance: 0,
-			AfterBalance:  freeCredits,
-			Remark:        "Registration free quota",
-		}
+		record := balanceRecordFromUnits(userID, tenantID, "GIFT", freeUnits, 0, 0, "Registration free quota", "")
 		_ = s.db.WithContext(ctx).Create(record).Error
 	}
 
@@ -174,12 +214,13 @@ func (s *BalanceService) InitBalance(ctx context.Context, userID, tenantID uint)
 // Recharge 用户充值（管理员操作或支付回调），向用户余额添加积分
 // 参数 creditsAmount: 充值的积分数量（int64）
 func (s *BalanceService) Recharge(ctx context.Context, userID, tenantID uint, creditsAmount int64, remark, relatedID string) (*model.UserBalance, error) {
-	if creditsAmount <= 0 {
+	return s.RechargeUnits(ctx, userID, tenantID, credits.CreditsToBillingUnits(creditsAmount), remark, relatedID)
+}
+
+func (s *BalanceService) RechargeUnits(ctx context.Context, userID, tenantID uint, amountUnits int64, remark, relatedID string) (*model.UserBalance, error) {
+	if amountUnits <= 0 {
 		return nil, fmt.Errorf("recharge amount must be positive")
 	}
-
-	amountRMB := credits.CreditsToRMB(creditsAmount)
-
 	var ub model.UserBalance
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 行级锁保证并发安全
@@ -201,29 +242,18 @@ func (s *BalanceService) Recharge(ctx context.Context, userID, tenantID uint, cr
 			}
 		}
 
-		before := ub.Balance
-		ub.Balance += creditsAmount
-		ub.BalanceRMB = credits.CreditsToRMB(ub.Balance)
-		ub.FreeQuotaRMB = credits.CreditsToRMB(ub.FreeQuota)
-		// v5.1: 累加累计充值额，用于判定 Free/Paid 用户
-		ub.TotalRecharged += creditsAmount
+		hydrateBalanceUnits(&ub)
+		beforeUnits := ub.BalanceUnits
+		ub.BalanceUnits += amountUnits
+		ub.TotalRechargedUnits += amountUnits
+		syncBalanceCreditFields(&ub)
 
 		if err := tx.Save(&ub).Error; err != nil {
 			return fmt.Errorf("update balance: %w", err)
 		}
 
 		// 记录充值流水
-		record := &model.BalanceRecord{
-			UserID:        userID,
-			TenantID:      tenantID,
-			Type:          "RECHARGE",
-			Amount:        creditsAmount,
-			AmountRMB:     amountRMB,
-			BeforeBalance: before,
-			AfterBalance:  ub.Balance,
-			Remark:        remark,
-			RelatedID:     relatedID,
-		}
+		record := balanceRecordFromUnits(userID, tenantID, "RECHARGE", amountUnits, beforeUnits, ub.BalanceUnits, remark, relatedID)
 		return tx.Create(record).Error
 	})
 
@@ -245,12 +275,13 @@ func (s *BalanceService) RechargeRMB(ctx context.Context, userID, tenantID uint,
 // Deduct 消费扣款，余额不足时返回错误。优先扣减免费额度，再扣减充值余额
 // 参数 creditsAmount: 扣减的积分数量（int64）
 func (s *BalanceService) Deduct(ctx context.Context, userID, tenantID uint, creditsAmount int64, remark, relatedID string) (*model.UserBalance, error) {
-	if creditsAmount <= 0 {
+	return s.DeductUnits(ctx, userID, tenantID, credits.CreditsToBillingUnits(creditsAmount), remark, relatedID)
+}
+
+func (s *BalanceService) DeductUnits(ctx context.Context, userID, tenantID uint, amountUnits int64, remark, relatedID string) (*model.UserBalance, error) {
+	if amountUnits <= 0 {
 		return nil, fmt.Errorf("deduct amount must be positive")
 	}
-
-	amountRMB := credits.CreditsToRMB(creditsAmount)
-
 	var ub model.UserBalance
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 行级锁保证并发安全
@@ -259,46 +290,36 @@ func (s *BalanceService) Deduct(ctx context.Context, userID, tenantID uint, cred
 			return fmt.Errorf("lock balance: %w", err)
 		}
 
-		available := ub.Balance + ub.FreeQuota - ub.FrozenAmount
-		if available < creditsAmount {
-			return fmt.Errorf("insufficient balance: available=%d credits, required=%d credits", available, creditsAmount)
+		hydrateBalanceUnits(&ub)
+		availableUnits := ub.BalanceUnits + ub.FreeQuotaUnits - ub.FrozenUnits
+		if availableUnits < amountUnits {
+			return fmt.Errorf("insufficient balance: available=%d units, required=%d units", availableUnits, amountUnits)
 		}
 
-		before := ub.Balance
+		beforeUnits := ub.BalanceUnits
 
 		// 优先扣减免费额度，再扣减余额
-		remaining := creditsAmount
-		if ub.FreeQuota > 0 {
-			if ub.FreeQuota >= remaining {
-				ub.FreeQuota -= remaining
+		remaining := amountUnits
+		if ub.FreeQuotaUnits > 0 {
+			if ub.FreeQuotaUnits >= remaining {
+				ub.FreeQuotaUnits -= remaining
 				remaining = 0
 			} else {
-				remaining -= ub.FreeQuota
-				ub.FreeQuota = 0
+				remaining -= ub.FreeQuotaUnits
+				ub.FreeQuotaUnits = 0
 			}
 		}
 		if remaining > 0 {
-			ub.Balance -= remaining
-			ub.BalanceRMB = credits.CreditsToRMB(ub.Balance)
+			ub.BalanceUnits -= remaining
 		}
-		ub.TotalConsumed += creditsAmount
-		ub.TotalConsumedRMB = credits.CreditsToRMB(ub.TotalConsumed)
+		ub.TotalConsumedUnits += amountUnits
+		syncBalanceCreditFields(&ub)
 
 		if err := tx.Save(&ub).Error; err != nil {
 			return fmt.Errorf("update balance: %w", err)
 		}
 
-		record := &model.BalanceRecord{
-			UserID:        userID,
-			TenantID:      tenantID,
-			Type:          "CONSUME",
-			Amount:        -creditsAmount,
-			AmountRMB:     -amountRMB,
-			BeforeBalance: before,
-			AfterBalance:  ub.Balance,
-			Remark:        remark,
-			RelatedID:     relatedID,
-		}
+		record := balanceRecordFromUnits(userID, tenantID, "CONSUME", -amountUnits, beforeUnits, ub.BalanceUnits, remark, relatedID)
 		return tx.Create(record).Error
 	})
 
@@ -323,14 +344,17 @@ func (s *BalanceService) DeductForRequest(ctx context.Context, userID, tenantID 
 	return err
 }
 
+func (s *BalanceService) DeductUnitsForRequest(ctx context.Context, userID, tenantID uint, amountUnits int64, modelName, requestID string) error {
+	_, err := s.DeductUnits(ctx, userID, tenantID, amountUnits, fmt.Sprintf("消费 %s", modelName), requestID)
+	return err
+}
+
 // AdminAdjust 管理员手动调整用户余额（可正可负）
 // 参数 creditsAmount: 调整的积分数量（正数增加，负数减少）
 func (s *BalanceService) AdminAdjust(ctx context.Context, userID, tenantID uint, creditsAmount int64, remark string) (*model.UserBalance, error) {
 	if creditsAmount == 0 {
 		return nil, fmt.Errorf("adjust amount cannot be zero")
 	}
-
-	amountRMB := credits.CreditsToRMB(creditsAmount)
 
 	var ub model.UserBalance
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -339,28 +363,19 @@ func (s *BalanceService) AdminAdjust(ctx context.Context, userID, tenantID uint,
 			return fmt.Errorf("lock balance: %w", err)
 		}
 
-		before := ub.Balance
-		ub.Balance += creditsAmount
-		if ub.Balance < 0 {
-			ub.Balance = 0
+		hydrateBalanceUnits(&ub)
+		beforeUnits := ub.BalanceUnits
+		ub.BalanceUnits += credits.CreditsToBillingUnits(creditsAmount)
+		if ub.BalanceUnits < 0 {
+			ub.BalanceUnits = 0
 		}
-		ub.BalanceRMB = credits.CreditsToRMB(ub.Balance)
-		ub.FreeQuotaRMB = credits.CreditsToRMB(ub.FreeQuota)
+		syncBalanceCreditFields(&ub)
 
 		if err := tx.Save(&ub).Error; err != nil {
 			return fmt.Errorf("update balance: %w", err)
 		}
 
-		record := &model.BalanceRecord{
-			UserID:        userID,
-			TenantID:      tenantID,
-			Type:          "ADMIN_ADJUST",
-			Amount:        creditsAmount,
-			AmountRMB:     amountRMB,
-			BeforeBalance: before,
-			AfterBalance:  ub.Balance,
-			Remark:        remark,
-		}
+		record := balanceRecordFromUnits(userID, tenantID, "ADMIN_ADJUST", credits.CreditsToBillingUnits(creditsAmount), beforeUnits, ub.BalanceUnits, remark, "")
 		return tx.Create(record).Error
 	})
 
@@ -382,8 +397,9 @@ func (s *BalanceService) HasSufficientBalance(ctx context.Context, userID uint) 
 		}
 		return false, 0, err
 	}
-	available := ub.Balance + ub.FreeQuota - ub.FrozenAmount
-	return available > 0, available, nil
+	hydrateBalanceUnits(&ub)
+	availableUnits := ub.BalanceUnits + ub.FreeQuotaUnits - ub.FrozenUnits
+	return availableUnits > 0, credits.BillingUnitsToCredits(availableUnits), nil
 }
 
 // ListRecords 分页查询用户的余额变动记录
@@ -422,12 +438,18 @@ func (s *BalanceService) UpdateQuotaConfig(ctx context.Context, cfg *model.Quota
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			cfg.IsActive = true
-			return s.db.WithContext(ctx).Create(cfg).Error
+			if err := s.db.WithContext(ctx).Create(cfg).Error; err != nil {
+				return err
+			}
+			_, _ = usercache.InvalidatePaidStatusPatternAll(ctx)
+			return nil
 		}
 		return err
 	}
 	existing.DefaultFreeQuota = cfg.DefaultFreeQuota
 	existing.RegistrationBonus = cfg.RegistrationBonus
+	existing.FreeQuotaExpiryDays = cfg.FreeQuotaExpiryDays
+	existing.PaidThresholdCredits = cfg.PaidThresholdCredits
 	// v3.1 邀请双向奖励字段
 	existing.InviteeBonus = cfg.InviteeBonus
 	existing.InviteeUnlockCredits = cfg.InviteeUnlockCredits
@@ -435,7 +457,11 @@ func (s *BalanceService) UpdateQuotaConfig(ctx context.Context, cfg *model.Quota
 	existing.InviterUnlockPaidRMB = cfg.InviterUnlockPaidRMB
 	existing.InviterMonthlyCap = cfg.InviterMonthlyCap
 	existing.Description = cfg.Description
-	return s.db.WithContext(ctx).Save(&existing).Error
+	if err := s.db.WithContext(ctx).Save(&existing).Error; err != nil {
+		return err
+	}
+	_, _ = usercache.InvalidatePaidStatusPatternAll(ctx)
+	return nil
 }
 
 // getActiveQuotaConfig 获取当前活跃的额度配置，查询失败时返回默认值
@@ -467,11 +493,13 @@ const (
 // 参数 estimatedCredits: 预估消费积分数量（int64）
 // 返回 freezeID: 冻结记录唯一标识
 func (s *BalanceService) FreezeBalance(ctx context.Context, userID, tenantID uint, estimatedCredits int64, modelName, requestID string) (string, error) {
-	if estimatedCredits <= 0 {
+	return s.FreezeBalanceUnits(ctx, userID, tenantID, credits.CreditsToBillingUnits(estimatedCredits), modelName, requestID)
+}
+
+func (s *BalanceService) FreezeBalanceUnits(ctx context.Context, userID, tenantID uint, estimatedUnits int64, modelName, requestID string) (string, error) {
+	if estimatedUnits <= 0 {
 		return "", nil // 免费请求无需冻结
 	}
-
-	estimatedRMB := credits.CreditsToRMB(estimatedCredits)
 
 	// 获取 Redis 分布式锁，防止同一用户并发超扣
 	lockKey := fmt.Sprintf("user:%d:balance_lock", userID)
@@ -496,13 +524,15 @@ func (s *BalanceService) FreezeBalance(ctx context.Context, userID, tenantID uin
 		}
 
 		// 计算可用余额 = 余额 + 赠送额度 - 已冻结金额
-		available := ub.Balance + ub.FreeQuota - ub.FrozenAmount
-		if available < estimatedCredits {
-			return fmt.Errorf("insufficient balance: available=%d credits, required=%d credits", available, estimatedCredits)
+		hydrateBalanceUnits(&ub)
+		availableUnits := ub.BalanceUnits + ub.FreeQuotaUnits - ub.FrozenUnits
+		if availableUnits < estimatedUnits {
+			return fmt.Errorf("insufficient balance: available=%d units, required=%d units", availableUnits, estimatedUnits)
 		}
 
 		// 增加冻结金额
-		ub.FrozenAmount += estimatedCredits
+		ub.FrozenUnits += estimatedUnits
+		syncBalanceCreditFields(&ub)
 		if err := tx.Save(&ub).Error; err != nil {
 			return fmt.Errorf("update frozen amount: %w", err)
 		}
@@ -512,8 +542,9 @@ func (s *BalanceService) FreezeBalance(ctx context.Context, userID, tenantID uin
 			FreezeID:        freezeID,
 			UserID:          userID,
 			TenantID:        tenantID,
-			FrozenAmount:    estimatedCredits,
-			FrozenAmountRMB: estimatedRMB,
+			FrozenAmount:    credits.BillingUnitsToCredits(estimatedUnits),
+			FrozenUnits:     estimatedUnits,
+			FrozenAmountRMB: credits.BillingUnitsToRMB(estimatedUnits),
 			Status:          "FROZEN",
 			ModelName:       modelName,
 			RequestID:       requestID,
@@ -523,17 +554,7 @@ func (s *BalanceService) FreezeBalance(ctx context.Context, userID, tenantID uin
 		}
 
 		// 记录冻结流水
-		balRecord := &model.BalanceRecord{
-			UserID:        userID,
-			TenantID:      tenantID,
-			Type:          "FREEZE",
-			Amount:        -estimatedCredits,
-			AmountRMB:     -estimatedRMB,
-			BeforeBalance: ub.Balance,
-			AfterBalance:  ub.Balance,
-			Remark:        fmt.Sprintf("预扣费冻结 %s", modelName),
-			RelatedID:     freezeID,
-		}
+		balRecord := balanceRecordFromUnits(userID, tenantID, "FREEZE", -estimatedUnits, ub.BalanceUnits, ub.BalanceUnits, fmt.Sprintf("预扣费冻结 %s", modelName), freezeID)
 		return tx.Create(balRecord).Error
 	})
 

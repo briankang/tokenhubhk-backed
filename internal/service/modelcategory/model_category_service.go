@@ -56,15 +56,21 @@ func (s *ModelCategoryService) GetByID(ctx context.Context, id uint) (*model.Mod
 }
 
 // List 分页查询模型分类列表
-func (s *ModelCategoryService) List(ctx context.Context, page, pageSize int) ([]model.ModelCategory, int64, error) {
+func (s *ModelCategoryService) List(ctx context.Context, page, pageSize int, supplierID ...uint) ([]model.ModelCategory, int64, error) {
 	if page < 1 {
 		page = 1
 	}
-	if pageSize < 1 || pageSize > 100 {
+	if pageSize < 1 {
 		pageSize = 20
+	}
+	if pageSize > 500 {
+		pageSize = 500
 	}
 	var total int64
 	query := s.db.WithContext(ctx).Model(&model.ModelCategory{})
+	if len(supplierID) > 0 && supplierID[0] > 0 {
+		query = query.Where("supplier_id = ?", supplierID[0])
+	}
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to count categories: %w", err)
 	}

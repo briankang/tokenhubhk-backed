@@ -56,6 +56,11 @@ func isPrivateHost(host string) bool {
 // 5. 未找到 → 继续请求（路由层自行判断是否必须）
 func TenantResolveMiddleware(resolver *whitelabel.DomainResolver, platformDomain string) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if IsHealthPath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+
 		host := extractDomain(c.Request.Host)
 		if host == "" {
 			c.Next()

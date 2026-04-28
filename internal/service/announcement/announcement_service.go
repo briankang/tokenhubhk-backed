@@ -34,7 +34,9 @@ func NewService(db *gorm.DB) *Service {
 // CreateRequest 创建公告请求
 type CreateRequest struct {
 	Title      string     `json:"title" binding:"required,max=255"`
+	TitleEn    string     `json:"title_en" binding:"max=255"`
 	Content    string     `json:"content"`
+	ContentEn  string     `json:"content_en"`
 	Type       string     `json:"type" binding:"required"`
 	Priority   string     `json:"priority" binding:"required"`
 	Status     string     `json:"status" binding:"required"`
@@ -47,7 +49,9 @@ type CreateRequest struct {
 // UpdateRequest 更新公告请求
 type UpdateRequest struct {
 	Title      *string    `json:"title,omitempty"`
+	TitleEn    *string    `json:"title_en,omitempty"`
 	Content    *string    `json:"content,omitempty"`
+	ContentEn  *string    `json:"content_en,omitempty"`
 	Type       *string    `json:"type,omitempty"`
 	Priority   *string    `json:"priority,omitempty"`
 	Status     *string    `json:"status,omitempty"`
@@ -102,7 +106,9 @@ func (s *Service) List(ctx context.Context, page, pageSize int, typ, status, pri
 func (s *Service) Create(ctx context.Context, req CreateRequest, creatorID uint) (*model.Announcement, error) {
 	ann := &model.Announcement{
 		Title:      req.Title,
+		TitleEn:    req.TitleEn,
 		Content:    req.Content,
+		ContentEn:  req.ContentEn,
 		Type:       req.Type,
 		Priority:   req.Priority,
 		Status:     req.Status,
@@ -131,8 +137,14 @@ func (s *Service) Update(ctx context.Context, id uint, req UpdateRequest) (*mode
 	if req.Title != nil {
 		updates["title"] = *req.Title
 	}
+	if req.TitleEn != nil {
+		updates["title_en"] = *req.TitleEn
+	}
 	if req.Content != nil {
 		updates["content"] = *req.Content
+	}
+	if req.ContentEn != nil {
+		updates["content_en"] = *req.ContentEn
 	}
 	if req.Type != nil {
 		updates["type"] = *req.Type

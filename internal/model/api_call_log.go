@@ -41,18 +41,31 @@ type ApiCallLog struct {
 	ErrorMessage     string `gorm:"type:text" json:"error_message,omitempty"`
 	ErrorType        string `gorm:"type:varchar(50)" json:"error_type,omitempty"`
 
-	CostCredits           int64   `gorm:"default:0" json:"cost_credits"`
-	CostUnits             int64   `gorm:"default:0" json:"cost_units"`
-	CostRMB               float64 `gorm:"type:decimal(16,6);default:0" json:"cost_rmb"`
-	EstimatedCostCredits  int64   `gorm:"default:0" json:"estimated_cost_credits"`
-	EstimatedCostUnits    int64   `gorm:"default:0" json:"estimated_cost_units"`
-	FrozenCredits         int64   `gorm:"default:0" json:"frozen_credits"`
-	FrozenUnits           int64   `gorm:"default:0" json:"frozen_units"`
-	ActualCostCredits     int64   `gorm:"default:0" json:"actual_cost_credits"`
-	ActualCostUnits       int64   `gorm:"default:0" json:"actual_cost_units"`
-	PlatformCostRMB       float64 `gorm:"type:decimal(16,6);default:0" json:"platform_cost_rmb"`
-	PlatformCostUnits     int64   `gorm:"default:0" json:"platform_cost_units"`
-	BillingStatus         string  `gorm:"type:varchar(32);default:settled;index" json:"billing_status"`
+	// CostCredits / CostRMB —— **应扣金额**(用户理论扣费)
+	// 由 PricingCalculator 用 model_pricings.input_price × tokens 等算出,
+	// 是用户应当被扣的金额。前端 UI 标签统一为 "应扣金额"。
+	// 与 ActualCostCredits 的区别: 余额不足时实扣 = 0, 应扣 ≠ 实扣, 差额记入 UnderCollectedCredits。
+	CostCredits int64   `gorm:"default:0" json:"cost_credits"`
+	CostUnits   int64   `gorm:"default:0" json:"cost_units"`
+	CostRMB     float64 `gorm:"type:decimal(16,6);default:0" json:"cost_rmb"`
+	// EstimatedCostCredits —— 流式扣费的预估值,流结束后会用真实值覆盖到 CostCredits
+	EstimatedCostCredits int64 `gorm:"default:0" json:"estimated_cost_credits"`
+	EstimatedCostUnits   int64 `gorm:"default:0" json:"estimated_cost_units"`
+	// FrozenCredits —— 流式请求开始时冻结的预估金额, 结算后解冻
+	FrozenCredits int64 `gorm:"default:0" json:"frozen_credits"`
+	FrozenUnits   int64 `gorm:"default:0" json:"frozen_units"`
+	// ActualCostCredits / ActualCostUnits —— **实扣金额**(用户余额中真实被扣的金额)
+	// 扣费成功时 = CostCredits;余额不足导致 BillingStatus=deduct_failed 时 = 0。
+	// 前端 UI 标签统一为 "实扣金额"。
+	ActualCostCredits int64 `gorm:"default:0" json:"actual_cost_credits"`
+	ActualCostUnits   int64 `gorm:"default:0" json:"actual_cost_units"`
+	// PlatformCostRMB / PlatformCostUnits —— **平台成本估算**(向供应商支付的"理论成本")
+	// 注意:此值并非真实供应商账单,而是按 ai_models.input_cost_rmb × tokens 估算得出。
+	// 用于毛利估算 (毛利 = CostCredits - PlatformCostCredits)。
+	// 前端 UI 标签统一为 "平台成本",并标注"估算"以示其非真实账单。
+	PlatformCostRMB   float64 `gorm:"type:decimal(16,6);default:0" json:"platform_cost_rmb"`
+	PlatformCostUnits int64   `gorm:"default:0" json:"platform_cost_units"`
+	BillingStatus     string  `gorm:"type:varchar(32);default:settled;index" json:"billing_status"`
 	UsageSource           string  `gorm:"type:varchar(32);default:provider" json:"usage_source"`
 	UsageEstimated        bool    `gorm:"default:false" json:"usage_estimated"`
 	UnderCollectedCredits int64   `gorm:"default:0" json:"under_collected_credits"`

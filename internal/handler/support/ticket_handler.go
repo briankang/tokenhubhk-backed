@@ -61,7 +61,14 @@ func (h *TicketHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 40002, "message": "description too long"})
 		return
 	}
-	allowedCats := map[string]struct{}{"api": {}, "billing": {}, "channel": {}, "account": {}, "other": {}}
+	allowedCats := map[string]struct{}{
+		model.SupportTicketCategoryAPI:                  {},
+		model.SupportTicketCategoryAPIInterfaceFeedback: {},
+		model.SupportTicketCategoryBilling:              {},
+		model.SupportTicketCategoryChannel:              {},
+		model.SupportTicketCategoryAccount:              {},
+		model.SupportTicketCategoryOther:                {},
+	}
 	if _, ok := allowedCats[body.Category]; !ok {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 40003, "message": "invalid category"})
 		return

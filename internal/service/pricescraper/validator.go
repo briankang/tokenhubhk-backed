@@ -8,73 +8,73 @@ import (
 )
 
 // =====================================================
-// 价格验证器
-// 对爬取的价格数据执行多维度校验，包括空值、范围、阶梯顺序等
+// 浠锋牸楠岃瘉鍣?
+// 瀵圭埇鍙栫殑浠锋牸鏁版嵁鎵ц澶氱淮搴︽牎楠岋紝鍖呮嫭绌哄€笺€佽寖鍥淬€侀樁姊『搴忕瓑
 // =====================================================
 
-// ValidationError 验证错误
+// ValidationError 楠岃瘉閿欒
 type ValidationError struct {
-	ModelName string `json:"model_name"` // 出错的模型名称
-	Field     string `json:"field"`      // 出错字段
-	Message   string `json:"message"`    // 错误描述
-	Severity  string `json:"severity"`   // 严重程度: error / warning
+	ModelName string `json:"model_name"` // 鍑洪敊鐨勬ā鍨嬪悕绉?
+	Field     string `json:"field"`      // 鍑洪敊瀛楁
+	Message   string `json:"message"`    // 閿欒鎻忚堪
+	Severity  string `json:"severity"`   // 涓ラ噸绋嬪害: error / warning
 }
 
-// 价格合理范围常量（RMB/百万token）
+// 浠锋牸鍚堢悊鑼冨洿甯搁噺锛圧MB/鐧句竾token锛?
 const (
-	minPriceRMB = 0.0001 // 最低价格下限
-	maxPriceRMB = 500.0  // 最高价格上限（部分多模态模型较贵）
+	minPriceRMB = 0.0001 // 鏈€浣庝环鏍间笅闄?
+	maxPriceRMB = 500.0  // 鏈€楂樹环鏍间笂闄愶紙閮ㄥ垎澶氭ā鎬佹ā鍨嬭緝璐碉級
 )
 
-// 不同计费单位的价格合理范围
+// 涓嶅悓璁¤垂鍗曚綅鐨勪环鏍煎悎鐞嗚寖鍥?
 var pricingUnitRanges = map[string][2]float64{
-	PricingUnitPerMillionTokens:     {0.0001, 500.0}, // 元/百万tokens：0.0001 ~ 500
-	PricingUnitPerImage:             {0.01, 50.0},    // 元/张：0.01 ~ 50
-	PricingUnitPerSecond:            {0.001, 10.0},   // 元/秒：0.001 ~ 10（视频）
-	PricingUnitPerMinute:            {0.01, 50.0},    // 元/分钟：0.01 ~ 50（whisper 约 0.036）
-	PricingUnitPer10kCharacters:     {0.1, 100.0},    // 元/万字符：0.1 ~ 100
-	PricingUnitPerKChars:            {0.1, 100.0},    // 历史别名，等价于 per_10k_characters
-	PricingUnitPerMillionCharacters: {1.0, 2000.0},   // 元/百万字符：1 ~ 2000
-	PricingUnitPerCall:              {0.0001, 10.0},  // 元/次：0.0001 ~ 10
-	PricingUnitPerHour:              {0.1, 100.0},    // 元/小时：0.1 ~ 100
+	PricingUnitPerMillionTokens:     {0.0001, 500.0}, // 鍏?鐧句竾tokens锛?.0001 ~ 500
+	PricingUnitPerImage:             {0.01, 50.0},    // 鍏?寮狅細0.01 ~ 50
+	PricingUnitPerSecond:            {0.001, 10.0},   // 鍏?绉掞細0.001 ~ 10锛堣棰戯級
+	PricingUnitPerMinute:            {0.01, 50.0},    // 鍏?鍒嗛挓锛?.01 ~ 50锛坵hisper 绾?0.036锛?
+	PricingUnitPer10kCharacters:     {0.1, 100.0},    // 鍏?涓囧瓧绗︼細0.1 ~ 100
+	PricingUnitPerKChars:            {0.1, 100.0},    // 鍘嗗彶鍒悕锛岀瓑浠蜂簬 per_10k_characters
+	PricingUnitPerMillionCharacters: {1.0, 2000.0},   // 鍏?鐧句竾瀛楃锛? ~ 2000
+	PricingUnitPerCall:              {0.0001, 10.0},  // 鍏?娆★細0.0001 ~ 10
+	PricingUnitPerHour:              {0.1, 100.0},    // 鍏?灏忔椂锛?.1 ~ 100
 }
 
-// getPriceRange 根据计费单位获取价格合理范围
+// getPriceRange 鏍规嵁璁¤垂鍗曚綅鑾峰彇浠锋牸鍚堢悊鑼冨洿
 func getPriceRange(pricingUnit string) (float64, float64) {
 	if r, ok := pricingUnitRanges[pricingUnit]; ok {
 		return r[0], r[1]
 	}
-	return minPriceRMB, maxPriceRMB // 默认使用 token 范围
+	return minPriceRMB, maxPriceRMB // 榛樿浣跨敤 token 鑼冨洿
 }
 
-// pricingUnitLabel 获取计费单位的中文标签（用于日志）
+// pricingUnitLabel 鑾峰彇璁¤垂鍗曚綅鐨勪腑鏂囨爣绛撅紙鐢ㄤ簬鏃ュ織锛?
 func pricingUnitLabel(unit string) string {
 	switch unit {
 	case PricingUnitPerImage:
-		return "元/张"
+		return "RMB/image"
 	case PricingUnitPerSecond:
-		return "元/秒"
+		return "RMB/second"
 	case PricingUnitPerMinute:
-		return "元/分钟"
+		return "RMB/minute"
 	case PricingUnitPer10kCharacters, PricingUnitPerKChars:
-		return "元/万字符"
+		return "RMB/10k characters"
 	case PricingUnitPerMillionCharacters:
-		return "元/百万字符"
+		return "RMB/million characters"
 	case PricingUnitPerCall:
-		return "元/次"
+		return "RMB/call"
 	case PricingUnitPerHour:
-		return "元/小时"
+		return "RMB/hour"
 	default:
-		return "元/百万token"
+		return "RMB/million tokens"
 	}
 }
 
-// ValidateScrapedData 验证爬取的价格数据
-// 对整个爬取结果执行以下验证：
-// 1. 空值检查：模型名称非空，至少有输入或输出价格
-// 2. 数值范围：价格在合理区间内
-// 3. 阶梯顺序：token 区间递增，价格递减或相等
-// 4. 零值过滤：输入输出价格不能都为 0
+// ValidateScrapedData 楠岃瘉鐖彇鐨勪环鏍兼暟鎹?
+// 瀵规暣涓埇鍙栫粨鏋滄墽琛屼互涓嬮獙璇侊細
+// 1. 绌哄€兼鏌ワ細妯″瀷鍚嶇О闈炵┖锛岃嚦灏戞湁杈撳叆鎴栬緭鍑轰环鏍?
+// 2. 鏁板€艰寖鍥达細浠锋牸鍦ㄥ悎鐞嗗尯闂村唴
+// 3. 闃舵椤哄簭锛歵oken 鍖洪棿閫掑锛屼环鏍奸€掑噺鎴栫浉绛?
+// 4. 闆跺€艰繃婊わ細杈撳叆杈撳嚭浠锋牸涓嶈兘閮戒负 0
 func ValidateScrapedData(data *ScrapedPriceData) []ValidationError {
 	var errors []ValidationError
 
@@ -82,7 +82,7 @@ func ValidateScrapedData(data *ScrapedPriceData) []ValidationError {
 		errors = append(errors, ValidationError{
 			ModelName: "",
 			Field:     "data",
-			Message:   "爬取数据为空",
+			Message:   "鐖彇鏁版嵁涓虹┖",
 			Severity:  "error",
 		})
 		return errors
@@ -92,7 +92,7 @@ func ValidateScrapedData(data *ScrapedPriceData) []ValidationError {
 		errors = append(errors, ValidationError{
 			ModelName: "",
 			Field:     "models",
-			Message:   "未爬取到任何模型数据",
+			Message:   "鏈埇鍙栧埌浠讳綍妯″瀷鏁版嵁",
 			Severity:  "error",
 		})
 		return errors
@@ -102,7 +102,7 @@ func ValidateScrapedData(data *ScrapedPriceData) []ValidationError {
 		modelErrors := validateSingleModel(m, i)
 		errors = append(errors, modelErrors...)
 
-		// 将验证警告也写入模型的 Warnings 字段
+		// 灏嗛獙璇佽鍛婁篃鍐欏叆妯″瀷鐨?Warnings 瀛楁
 		for _, e := range modelErrors {
 			data.Models[i].Warnings = append(data.Models[i].Warnings, fmt.Sprintf("[%s] %s: %s", e.Severity, e.Field, e.Message))
 		}
@@ -111,35 +111,35 @@ func ValidateScrapedData(data *ScrapedPriceData) []ValidationError {
 	return errors
 }
 
-// validateSingleModel 验证单个模型的价格数据
+// validateSingleModel 楠岃瘉鍗曚釜妯″瀷鐨勪环鏍兼暟鎹?
 func validateSingleModel(m ScrapedModel, index int) []ValidationError {
 	var errors []ValidationError
 	nameForLog := m.ModelName
 	if nameForLog == "" {
-		nameForLog = fmt.Sprintf("模型#%d", index)
+		nameForLog = fmt.Sprintf("妯″瀷#%d", index)
 	}
 
-	// 1. 模型名称非空检查
+	// 1. 妯″瀷鍚嶇О闈炵┖妫€鏌?
 	if m.ModelName == "" {
 		errors = append(errors, ValidationError{
 			ModelName: nameForLog,
 			Field:     "model_name",
-			Message:   "模型名称为空",
+			Message:   "妯″瀷鍚嶇О涓虹┖",
 			Severity:  "error",
 		})
 	}
 
-	// 2. 输入输出价格不能都为 0
+	// 2. 杈撳叆杈撳嚭浠锋牸涓嶈兘閮戒负 0
 	if m.InputPrice == 0 && m.OutputPrice == 0 && len(m.PriceTiers) == 0 {
 		errors = append(errors, ValidationError{
 			ModelName: nameForLog,
 			Field:     "price",
-			Message:   "输入和输出价格均为 0，且无阶梯价格",
+			Message:   "input and output prices are both zero and no tiered pricing is configured",
 			Severity:  "warning",
 		})
 	}
 
-	// 3. 价格范围检查（根据计费单位选择合理范围）
+	// 3. 浠锋牸鑼冨洿妫€鏌ワ紙鏍规嵁璁¤垂鍗曚綅閫夋嫨鍚堢悊鑼冨洿锛?
 	minP, maxP := getPriceRange(m.PricingUnit)
 	unitLabel := pricingUnitLabel(m.PricingUnit)
 
@@ -148,7 +148,7 @@ func validateSingleModel(m ScrapedModel, index int) []ValidationError {
 			errors = append(errors, ValidationError{
 				ModelName: nameForLog,
 				Field:     "input_price",
-				Message:   fmt.Sprintf("输入价格 %.4f 超出合理范围 [%.4f, %.1f] %s", m.InputPrice, minP, maxP, unitLabel),
+				Message:   fmt.Sprintf("杈撳叆浠锋牸 %.4f 瓒呭嚭鍚堢悊鑼冨洿 [%.4f, %.1f] %s", m.InputPrice, minP, maxP, unitLabel),
 				Severity:  "warning",
 			})
 		}
@@ -158,13 +158,13 @@ func validateSingleModel(m ScrapedModel, index int) []ValidationError {
 			errors = append(errors, ValidationError{
 				ModelName: nameForLog,
 				Field:     "output_price",
-				Message:   fmt.Sprintf("输出价格 %.4f 超出合理范围 [%.4f, %.1f] %s", m.OutputPrice, minP, maxP, unitLabel),
+				Message:   fmt.Sprintf("杈撳嚭浠锋牸 %.4f 瓒呭嚭鍚堢悊鑼冨洿 [%.4f, %.1f] %s", m.OutputPrice, minP, maxP, unitLabel),
 				Severity:  "warning",
 			})
 		}
 	}
 
-	// 4. 阶梯价格验证
+	// 4. 闃舵浠锋牸楠岃瘉
 	if len(m.PriceTiers) > 0 {
 		tierErrors := validatePriceTiers(nameForLog, m.PriceTiers)
 		errors = append(errors, tierErrors...)
@@ -173,18 +173,18 @@ func validateSingleModel(m ScrapedModel, index int) []ValidationError {
 	return errors
 }
 
-// validatePriceTiers 验证阶梯价格的合理性
-// 规则：token 区间必须递增，同阶梯内价格应递减或相等（量大优惠）
+// validatePriceTiers 楠岃瘉闃舵浠锋牸鐨勫悎鐞嗘€?
+// 瑙勫垯锛歵oken 鍖洪棿蹇呴』閫掑锛屽悓闃舵鍐呬环鏍煎簲閫掑噺鎴栫浉绛夛紙閲忓ぇ浼樻儬锛?
 func validatePriceTiers(modelName string, tiers []model.PriceTier) []ValidationError {
 	var errors []ValidationError
 
 	for i, tier := range tiers {
-		// 检查阶梯内价格范围
+		// 妫€鏌ラ樁姊唴浠锋牸鑼冨洿
 		if tier.InputPrice != 0 && (tier.InputPrice < minPriceRMB || tier.InputPrice > maxPriceRMB) {
 			errors = append(errors, ValidationError{
 				ModelName: modelName,
 				Field:     fmt.Sprintf("tier[%d].input_price", i),
-				Message:   fmt.Sprintf("阶梯 %s 输入价格 %.4f 超出合理范围", tier.Name, tier.InputPrice),
+				Message:   fmt.Sprintf("闃舵 %s 杈撳叆浠锋牸 %.4f 瓒呭嚭鍚堢悊鑼冨洿", tier.Name, tier.InputPrice),
 				Severity:  "warning",
 			})
 		}
@@ -192,67 +192,61 @@ func validatePriceTiers(modelName string, tiers []model.PriceTier) []ValidationE
 			errors = append(errors, ValidationError{
 				ModelName: modelName,
 				Field:     fmt.Sprintf("tier[%d].output_price", i),
-				Message:   fmt.Sprintf("阶梯 %s 输出价格 %.4f 超出合理范围", tier.Name, tier.OutputPrice),
+				Message:   fmt.Sprintf("闃舵 %s 杈撳嚭浠锋牸 %.4f 瓒呭嚭鍚堢悊鑼冨洿", tier.Name, tier.OutputPrice),
 				Severity:  "warning",
 			})
 		}
 
-		// 检查 token 区间递增（优先使用新字段 InputMin，兼容旧字段 MinTokens）
+		// Check token ranges using the current input_min field only.
 		if i > 0 {
 			prevTier := tiers[i-1]
 			curMin := tier.InputMin
-			if curMin == 0 {
-				curMin = tier.MinTokens
-			}
 			prevMin := prevTier.InputMin
-			if prevMin == 0 {
-				prevMin = prevTier.MinTokens
-			}
 			if curMin > 0 && prevMin > 0 && curMin <= prevMin {
 				errors = append(errors, ValidationError{
 					ModelName: modelName,
 					Field:     fmt.Sprintf("tier[%d].input_min", i),
-					Message:   fmt.Sprintf("阶梯 %s 的下界(%d) 应大于上一阶梯 %s 的下界(%d)", tier.Name, curMin, prevTier.Name, prevMin),
+					Message:   fmt.Sprintf("闃舵 %s 鐨勪笅鐣?%d) 搴斿ぇ浜庝笂涓€闃舵 %s 鐨勪笅鐣?%d)", tier.Name, curMin, prevTier.Name, prevMin),
 					Severity:  "error",
 				})
 			}
 
-			// 长上下文模型的阶梯价格可能随 token 数量上升（长文档计费更贵），不发出警告
+			// 闀夸笂涓嬫枃妯″瀷鐨勯樁姊环鏍煎彲鑳介殢 token 鏁伴噺涓婂崌锛堥暱鏂囨。璁¤垂鏇磋吹锛夛紝涓嶅彂鍑鸿鍛?
 		}
 	}
 
 	return errors
 }
 
-// DetectAnomalies 检测价格异常变动
-// current: 当前数据库中的价格
-// newPrice: 新爬取的价格
-// threshold: 变动阈值（0.5 = 50%），超过此比例视为异常
-// 返回：是否异常、变动比率、警告信息
+// DetectAnomalies 妫€娴嬩环鏍煎紓甯稿彉鍔?
+// current: 褰撳墠鏁版嵁搴撲腑鐨勪环鏍?
+// newPrice: 鏂扮埇鍙栫殑浠锋牸
+// threshold: 鍙樺姩闃堝€硷紙0.5 = 50%锛夛紝瓒呰繃姝ゆ瘮渚嬭涓哄紓甯?
+// 杩斿洖锛氭槸鍚﹀紓甯搞€佸彉鍔ㄦ瘮鐜囥€佽鍛婁俊鎭?
 func DetectAnomalies(current, newPrice float64, threshold float64) (isAnomaly bool, ratio float64, warning string) {
-	// 如果当前价格为 0，无法计算变动比率
+	// 濡傛灉褰撳墠浠锋牸涓?0锛屾棤娉曡绠楀彉鍔ㄦ瘮鐜?
 	if current == 0 {
 		if newPrice > 0 {
-			return false, 0, "当前价格为 0，新价格为首次设置"
+			return false, 0, "current price is zero; new price is the initial value"
 		}
 		return false, 0, ""
 	}
 
-	// 如果新价格为 0，标记为异常（可能爬取失败）
+	// 濡傛灉鏂颁环鏍间负 0锛屾爣璁颁负寮傚父锛堝彲鑳界埇鍙栧け璐ワ級
 	if newPrice == 0 {
-		return true, -1.0, fmt.Sprintf("新价格为 0，当前价格为 %.4f，可能爬取失败", current)
+		return true, -1.0, fmt.Sprintf("new price is zero while current price is %.4f; scraping may have failed", current)
 	}
 
-	// 计算变动比率: (new - current) / current
+	// 璁＄畻鍙樺姩姣旂巼: (new - current) / current
 	ratio = (newPrice - current) / current
 
-	// 判断是否超过阈值
+	// 鍒ゆ柇鏄惁瓒呰繃闃堝€?
 	if math.Abs(ratio) > threshold {
-		direction := "上涨"
+		direction := "涓婃定"
 		if ratio < 0 {
-			direction = "下降"
+			direction = "涓嬮檷"
 		}
-		warning = fmt.Sprintf("价格%s %.1f%%（%.4f → %.4f），超过 %.0f%% 阈值",
+		warning = fmt.Sprintf("price changed %s %.1f%% (%.4f -> %.4f), exceeding %.0f%% threshold",
 			direction, math.Abs(ratio)*100, current, newPrice, threshold*100)
 		return true, ratio, warning
 	}

@@ -3,6 +3,7 @@ package payment
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -18,11 +19,11 @@ import (
 
 // PaymentService 支付业务服务，管理订单创建、回调处理、查询和退款
 type PaymentService struct {
-	db             *gorm.DB
-	redis          *redis.Client
-	gateways       map[string]PaymentGateway
-	logger         *zap.Logger
-	exchangeSvc    *ExchangeService
+	db          *gorm.DB
+	redis       *redis.Client
+	gateways    map[string]PaymentGateway
+	logger      *zap.Logger
+	exchangeSvc *ExchangeService
 
 	// v3.2 新增：可选注入
 	accountRouter   *AccountRouter
@@ -96,10 +97,11 @@ func (s *PaymentService) CreatePayment(ctx context.Context, userID, tenantID uin
 		CreditAmount:     exchangeResult.CreditAmount,
 		Currency:         "CREDIT",
 		Gateway:          gateway,
+		OrderNo:          &orderNo,
 		Status:           "pending",
 	}
 
-	// 将 order_no 存入 metadata，因为模型没有 OrderNo 字段
+	// order_no 写入实体列供索引查询，同时保留 metadata 兼容历史逻辑。
 	meta := map[string]interface{}{"order_no": orderNo}
 	if subject != "" {
 		meta["subject"] = subject
@@ -154,13 +156,13 @@ func (s *PaymentService) CreatePayment(ctx context.Context, userID, tenantID uin
 
 	// 记录审计日志
 	s.recordAuditLog(ctx, tenantID, userID, "payment_create", payment.ID, clientIP, map[string]interface{}{
-		"order_no":       orderNo,
-		"gateway":        gateway,
-		"amount":         amount,
-		"currency":       currency,
-		"rmb_amount":     exchangeResult.RMBAmount,
-		"credit_amount":  exchangeResult.CreditAmount,
-		"exchange_rate":  exchangeResult.ExchangeRate,
+		"order_no":      orderNo,
+		"gateway":       gateway,
+		"amount":        amount,
+		"currency":      currency,
+		"rmb_amount":    exchangeResult.RMBAmount,
+		"credit_amount": exchangeResult.CreditAmount,
+		"exchange_rate": exchangeResult.ExchangeRate,
 	})
 
 	return result, nil
@@ -430,11 +432,16 @@ func (s *PaymentService) findPaymentIDByOrderNo(ctx context.Context, orderNo str
 		return uint(val), nil
 	}
 
-	// 回退：通过 metadata JSON 中的 order_no 查找
 	var payment model.Payment
 	err = s.db.WithContext(ctx).
-		Where("JSON_EXTRACT(metadata, '$.order_no') = ?", orderNo).
+		Where("order_no = ?", orderNo).
 		First(&payment).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		// 兼容历史订单：旧数据只在 metadata 中保存 order_no。
+		err = s.db.WithContext(ctx).
+			Where("JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.order_no')) = ?", orderNo).
+			First(&payment).Error
+	}
 	if err != nil {
 		return 0, fmt.Errorf("payment not found for order_no=%s: %w", orderNo, err)
 	}
@@ -495,6 +502,7 @@ func (s *PaymentService) creditUserBalance(ctx context.Context, userID, tenantID
 		ub.Balance += creditAmount
 		ub.BalanceRMB = credits.CreditsToRMB(ub.Balance)
 		ub.FreeQuotaRMB = credits.CreditsToRMB(ub.FreeQuota)
+		ub.TotalRecharged += creditAmount
 
 		if err := tx.Save(&ub).Error; err != nil {
 			return fmt.Errorf("update balance: %w", err)
@@ -521,6 +529,7 @@ func (s *PaymentService) creditUserBalance(ctx context.Context, userID, tenantID
 
 	// 清理用户维度余额缓存（user:balance:{uid}），下次查询会回源到最新值
 	usercache.InvalidateBalance(ctx, userID)
+	usercache.InvalidatePaidStatus(ctx, userID)
 	return nil
 }
 

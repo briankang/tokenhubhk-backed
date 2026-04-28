@@ -235,6 +235,66 @@ func TestMCP_Initialize(t *testing.T) {
 	t.Logf("Initialize: protocolVersion=%v, serverInfo=%v", result["protocolVersion"], result["serverInfo"])
 }
 
+func TestMCP_StreamableHTTP_ToolsList(t *testing.T) {
+	apiKey := ensureMCPKey(t)
+
+	rpcReq := jsonRPCRequest{
+		JSONRPC: "2.0",
+		ID:      21,
+		Method:  "tools/list",
+	}
+
+	resp, status, err := doMCPMessage(baseURL+"/api/v1/mcp", rpcReq, apiKey)
+	if err != nil {
+		t.Fatalf("streamable HTTP tools/list request failed: %v", err)
+	}
+	skipIfNotFound(t, status)
+
+	if status != http.StatusOK {
+		t.Fatalf("expected 200, got %d", status)
+	}
+	if resp.Error != nil {
+		t.Fatalf("streamable HTTP tools/list error: %s", resp.Error.Message)
+	}
+
+	var result struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatalf("parse tools/list: %v", err)
+	}
+	if len(result.Tools) == 0 {
+		t.Fatal("streamable HTTP tools/list returned empty list")
+	}
+}
+
+func TestMCP_StreamableHTTP_NotificationAccepted(t *testing.T) {
+	apiKey := ensureMCPKey(t)
+	data := []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/v1/mcp", bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("notification request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	skipIfNotFound(t, resp.StatusCode)
+
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 202, got %d: %s", resp.StatusCode, string(body))
+	}
+}
+
 // ─── Test: tools/list ────────────────────────────────────────
 
 func TestMCP_ToolsList(t *testing.T) {

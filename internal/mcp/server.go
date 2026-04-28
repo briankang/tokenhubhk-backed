@@ -24,10 +24,10 @@ type JSONRPCRequest struct {
 
 // JSONRPCResponse JSON-RPC 2.0 响应消息
 type JSONRPCResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      interface{}     `json:"id,omitempty"`
-	Result  interface{}     `json:"result,omitempty"`
-	Error   *JSONRPCError   `json:"error,omitempty"`
+	JSONRPC string        `json:"jsonrpc"`
+	ID      interface{}   `json:"id,omitempty"`
+	Result  interface{}   `json:"result,omitempty"`
+	Error   *JSONRPCError `json:"error,omitempty"`
 }
 
 // JSONRPCError JSON-RPC 2.0 错误对象
@@ -151,7 +151,7 @@ func (s *MCPServer) handleInitialize(req JSONRPCRequest) *JSONRPCResponse {
 		JSONRPC: "2.0",
 		ID:      req.ID,
 		Result: map[string]interface{}{
-			"protocolVersion": "2024-11-05",
+			"protocolVersion": "2025-03-26",
 			"capabilities": map[string]interface{}{
 				"tools": map[string]interface{}{
 					"listChanged": false,

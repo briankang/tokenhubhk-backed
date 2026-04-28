@@ -92,6 +92,18 @@ func (s *ChannelService) Create(ctx context.Context, channel *model.Channel) err
 	if channel.SupplierID == 0 {
 		return fmt.Errorf("supplier_id is required")
 	}
+	supplierCode, err := s.supplierCode(ctx, channel.SupplierID)
+	if err != nil {
+		return err
+	}
+	if normalized, err := NormalizeCustomParams(channel.CustomParams); err != nil {
+		return err
+	} else {
+		channel.CustomParams = normalized
+	}
+	if err := ValidateCustomParams(supplierCode, channel.CustomParams); err != nil {
+		return err
+	}
 
 	// 默认值设置
 	if channel.Status == "" {
@@ -113,7 +125,9 @@ func (s *ChannelService) Create(ctx context.Context, channel *model.Channel) err
 	}
 
 	s.invalidateCache(ctx)
-	logger.L.Info("channel created", zap.Uint("id", channel.ID), zap.String("name", channel.Name))
+	if logger.L != nil {
+		logger.L.Info("channel created", zap.Uint("id", channel.ID), zap.String("name", channel.Name))
+	}
 	return nil
 }
 
@@ -136,6 +150,28 @@ func (s *ChannelService) Update(ctx context.Context, id uint, updates map[string
 			delete(updates, "api_key")
 		}
 	}
+	supplierID, err := s.updateSupplierID(ctx, id, updates)
+	if err != nil {
+		return err
+	}
+	supplierCode, err := s.supplierCode(ctx, supplierID)
+	if err != nil {
+		return err
+	}
+	if raw, ok := updates["custom_params"]; ok {
+		normalized, err := NormalizeCustomParams(raw)
+		if err != nil {
+			return err
+		}
+		if err := ValidateCustomParams(supplierCode, normalized); err != nil {
+			return err
+		}
+		if normalized == nil {
+			updates["custom_params"] = nil
+		} else {
+			updates["custom_params"] = normalized
+		}
+	}
 
 	lock, err := pkgredis.Lock(ctx, fmt.Sprintf("channel:update:%d", id), 10*time.Second)
 	if err != nil {
@@ -152,7 +188,9 @@ func (s *ChannelService) Update(ctx context.Context, id uint, updates map[string
 	}
 
 	s.invalidateCache(ctx)
-	logger.L.Info("channel updated", zap.Uint("id", id))
+	if logger.L != nil {
+		logger.L.Info("channel updated", zap.Uint("id", id))
+	}
 	return nil
 }
 
@@ -171,8 +209,43 @@ func (s *ChannelService) Delete(ctx context.Context, id uint) error {
 	}
 
 	s.invalidateCache(ctx)
-	logger.L.Info("channel deleted", zap.Uint("id", id))
+	if logger.L != nil {
+		logger.L.Info("channel deleted", zap.Uint("id", id))
+	}
 	return nil
+}
+
+func (s *ChannelService) supplierCode(ctx context.Context, supplierID uint) (string, error) {
+	if supplierID == 0 {
+		return "", fmt.Errorf("supplier_id is required")
+	}
+	var supplier model.Supplier
+	if err := s.db.WithContext(ctx).Select("id", "code").First(&supplier, supplierID).Error; err != nil {
+		return "", fmt.Errorf("supplier not found: %w", err)
+	}
+	return supplier.Code, nil
+}
+
+func (s *ChannelService) updateSupplierID(ctx context.Context, channelID uint, updates map[string]interface{}) (uint, error) {
+	if raw, ok := updates["supplier_id"]; ok {
+		switch v := raw.(type) {
+		case uint:
+			return v, nil
+		case int:
+			if v > 0 {
+				return uint(v), nil
+			}
+		case float64:
+			if v > 0 {
+				return uint(v), nil
+			}
+		}
+	}
+	var ch model.Channel
+	if err := s.db.WithContext(ctx).Select("id", "supplier_id").First(&ch, channelID).Error; err != nil {
+		return 0, fmt.Errorf("channel not found: %w", err)
+	}
+	return ch.SupplierID, nil
 }
 
 // GetByID 根据 ID 查询渠道，预加载标签和供应商信息
@@ -349,12 +422,12 @@ func (s *ChannelService) TestChannel(ctx context.Context, id uint) (*ChannelTest
 // VerifyChannelResult 渠道验证结果
 // 包含验证状态、更新的模型数量等信息
 type VerifyChannelResult struct {
-	ChannelID        uint     `json:"channel_id"`         // 渠道ID
-	Success           bool     `json:"success"`            // 验证是否成功
-	LatencyMs         int64    `json:"latency_ms"`         // 延迟毫秒
-	ModelsUpdated     []string `json:"models_updated"`     // 更新的模型列表
-	ModelsUpdatedCount int     `json:"models_updated_count"` // 更新的模型数量
-	Error             string   `json:"error,omitempty"`    // 错误信息
+	ChannelID          uint     `json:"channel_id"`           // 渠道ID
+	Success            bool     `json:"success"`              // 验证是否成功
+	LatencyMs          int64    `json:"latency_ms"`           // 延迟毫秒
+	ModelsUpdated      []string `json:"models_updated"`       // 更新的模型列表
+	ModelsUpdatedCount int      `json:"models_updated_count"` // 更新的模型数量
+	Error              string   `json:"error,omitempty"`      // 错误信息
 }
 
 // VerifyChannel 验证渠道API Key是否有效

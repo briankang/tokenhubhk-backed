@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,15 +18,16 @@ import (
 	"tokenhub-server/internal/cron"
 	"tokenhub-server/internal/database"
 	adminHandler "tokenhub-server/internal/handler/admin"
+	"tokenhub-server/internal/middleware"
 	pkgi18n "tokenhub-server/internal/pkg/i18n"
 	"tokenhub-server/internal/pkg/logger"
 	pkgredis "tokenhub-server/internal/pkg/redis"
 	"tokenhub-server/internal/router"
 	auditsvc "tokenhub-server/internal/service/audit"
 	"tokenhub-server/internal/service/authlog"
-	ratelimitsvc "tokenhub-server/internal/service/ratelimit"
 	memberSvc "tokenhub-server/internal/service/member"
 	"tokenhub-server/internal/service/modeldiscovery"
+	ratelimitsvc "tokenhub-server/internal/service/ratelimit"
 	reportSvc "tokenhub-server/internal/service/report"
 )
 
@@ -64,6 +66,13 @@ func main() {
 		}
 	}()
 	logger.L.Info("database initialized")
+	if err := database.RunPublicModelDescriptionCleanupMigration(database.DB); err != nil {
+		logger.L.Warn("public model description cleanup migration failed", zap.Error(err))
+	}
+
+	// 启动时执行的轻量幂等补丁：needs_review 字典项与 NeedsReview 标签 UI 渲染强耦合
+	// 已存在则 no-op，幂等安全；本机制与"种子数据生效"不同——种子仅安装向导触发
+	database.RunMigrateLabelDictNeedsReview(database.DB)
 
 	// 注意：启动时不再执行任何 schema 变更 / 种子写入。
 	//   - 首次部署：调用 POST /api/v1/setup/import-seed 走安装向导
@@ -85,6 +94,7 @@ func main() {
 		}
 	}()
 	logger.L.Info("redis initialized")
+	middleware.CacheInvalidate("cache:/api/v1/public/models*")
 
 	// 4.1 种子数据更新后清除等级缓存（种子在Redis初始化前运行，此处补清缓存）
 	_ = pkgredis.Client.Del(context.Background(), "member:levels:all", "agent:levels:all").Err()
@@ -136,6 +146,9 @@ func main() {
 	// 380 个模型并发 3、限流 500ms 时最坏情况约 30 分钟）
 	// 对于普通 API 仍受 ReadTimeout 30s 保护
 	addr := fmt.Sprintf(":%d", config.Global.Server.Port)
+	if config.Global.Server.Host != "" {
+		addr = net.JoinHostPort(config.Global.Server.Host, fmt.Sprintf("%d", config.Global.Server.Port))
+	}
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      engine,

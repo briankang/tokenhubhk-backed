@@ -43,12 +43,12 @@ type UserDiscountInput struct {
 
 // ListFilter 列表查询筛选器
 type ListFilter struct {
-	UserID     uint
-	ModelID    uint
-	IsActive   *bool
-	Keyword    string // 模糊匹配 note/用户邮箱/模型名
-	Page       int
-	PageSize   int
+	UserID   uint
+	ModelID  uint
+	IsActive *bool
+	Keyword  string // 模糊匹配 note/用户邮箱/模型名
+	Page     int
+	PageSize int
 }
 
 // ListResult 列表查询返回
@@ -302,6 +302,7 @@ func (s *UserDiscountService) List(ctx context.Context, f ListFilter) (*ListResu
 
 // invalidate 触发用户级缓存失效
 func (s *UserDiscountService) invalidate(ctx context.Context, userID uint) {
+	clearDiscountMissCache()
 	if s.calc == nil {
 		return
 	}

@@ -42,6 +42,9 @@ func RunAllSeeds(db *gorm.DB) {
 
 	// 3. 文档中心（分类 + 文章）
 	RunSeedDocs(db)
+	RunDocArticleLocaleMigration(db)
+	RunCleanPlaceholderDocCategories(db)
+	RunSeedCustomParamDocs(db)
 
 	// 4. 会员等级 + 汇率
 	RunSeedLevels(db)
@@ -86,6 +89,10 @@ func RunAllSeeds(db *gorm.DB) {
 	if err := RunExpandTrendingModels(db); err != nil {
 		logger.L.Warn("expand trending models migration failed", zap.Error(err))
 	}
+	if err := RunHotModelVisibilityMigration(db); err != nil {
+		logger.L.Warn("hot model visibility migration failed", zap.Error(err))
+	}
+	RunSeedModelAliases(db)
 
 	// 13. 模型 k:v 标签（热卖/开源/优惠，原 database.Init 里的 seedModelLabels）
 	if err := SeedModelLabels(db); err != nil {
@@ -100,6 +107,9 @@ func RunAllSeeds(db *gorm.DB) {
 	if err := RunSeedEmailTemplatesI18n(db); err != nil {
 		logger.L.Warn("seed email i18n templates failed", zap.Error(err))
 	}
+
+	// 13.7. Google/GitHub OAuth login defaults; disabled until an admin adds Client ID/Secret.
+	RunSeedOAuthProviders(db)
 
 	// 14. RBAC 权限系统（permissions / roles / role_permissions / user_roles）
 	// 放在最后：依赖前面的用户种子（admin 账号）已存在
@@ -121,6 +131,7 @@ func RunAllSeeds(db *gorm.DB) {
 	if err := RunAliyunDeprecationMigration(db); err != nil {
 		logger.L.Warn("aliyun deprecation migration failed", zap.Error(err))
 	}
+	RunSeedModelAPIDocs(db)
 
 	// 17. 标记 schema_version 为当前代码版本（供启动时只读校验）
 	if err := MarkSchemaVersion(db); err != nil {

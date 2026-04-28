@@ -76,8 +76,24 @@ func InitDatabase(runMigrations bool) error {
 //
 //	业务种子（suppliers/levels/params/roles/permissions 等任何写新行的操作）
 func RunDataMigrations() {
+	// Preserve source USD prices before RMB conversion.
+	database.RunPriceSourceColumnsMigration(database.DB)
 	// 缓存定价回填
 	database.RunCachePriceMigration(database.DB)
+	database.RunCachePriceCompletenessMigration(database.DB)
+	// 2026-04-28: 全量重算 api_call_logs.platform_cost_rmb,应用供应商折扣
+	// 修复历史 BUG: 旧代码用售价当成本算 platform_cost,导致毛利永远 0
+	if err := database.RunRecomputePlatformCostMigration(database.DB); err != nil {
+		// 不阻塞启动,UI 仍能用 recomputed_platform_cost_rmb 兜底显示
+		_ = err
+	}
+
+	// PriceMatrix v3:把 PriceTiers + 顶层售价数据迁移为 PriceMatrix JSON,
+	// 幂等(已有 price_matrix 数据的记录跳过),失败行单独日志
+	if err := database.RunPriceMatrixMigration(database.DB); err != nil {
+		// 不阻塞启动,旧字段路径仍可工作
+		_ = err
+	}
 
 	// 一次性：提升 V0-V4 默认 TPM（仅未被管理员修改的行）
 	database.RunBumpMemberLevelTPM(database.DB)
@@ -97,6 +113,30 @@ func RunDataMigrations() {
 	// 将 price_tiers[0] 同步到 ai_models 顶层字段（input_cost_rmb / output_cost_rmb /
 	// output_cost_thinking_rmb），修复爬虫路径漂移和批量售价被跳过的问题
 	database.RunTierOneSyncMigration(database.DB)
+
+	// 补齐 Doubao Seed 2.0 系列的阶梯价、阶梯缓存价和平台售价阶梯
+	database.RunTalkingDataSeed20PricingMigration(database.DB)
+
+	// 将所有成本阶梯同步到平台售价阶梯，并补齐阶梯缓存价。
+	database.RunPriceTierSellingSyncMigration(database.DB)
+
+	// F4 (2026-04-28): 思考模式价格锁定迁移
+	// 对 features.supports_thinking=true 的活跃模型显式锁定 thinking 价（默认与 output 同价，
+	// 已知差价模型走 thinkingPriceOverrides 表）。修复 22+ 思考模型当前 output_cost_thinking_rmb=0
+	// 导致即使 thinkingMode=true 也按非思考价计费的静默漏扣风险。
+	database.RunThinkingPriceLockMigration(database.DB)
+
+	// S4 + F1 + F2(A) (2026-04-28): Seedance 数据迁移到 DimValues 形态
+	// 把 magic-InputMin 编码维度的旧 PriceTiers 重写为显式 DimValues 阶梯
+	// （resolution / input_has_video / inference_mode / audio_mode），
+	// 修复 Seedance 1.5-pro/2.0/1.0 系列因 SelectTierOrLargest fallback 到最便宜档
+	// 导致的 33-75% 漏扣 bug。配合 S2 selectPriceForTokens 的三步匹配生效。
+	database.RunSeedanceDimValuesMigration(database.DB)
+
+	// M2 (2026-04-28): 为 AIModel 填充 DimensionConfig（业务维度声明）
+	// 必须在 S4 之后，从已迁移的 PriceTiers.DimValues 反推维度结构。
+	// 让前端可按 schema 自动渲染矩阵编辑器，计费链路按 config 校验请求 dims。
+	database.RunDimensionConfigMigration(database.DB)
 
 	// 为存量供应商回填官网定价 URL
 	database.RunSupplierPricingURLMigration(database.DB)
@@ -132,6 +172,16 @@ func RunDataMigrations() {
 
 	// 网宿模型官网权威价强制更新（幂等 UPDATE，覆盖推测价 → OpenAI/Anthropic/Google 官网价）
 	database.RunWangsuOfficialPricingMigration(database.DB)
+	database.RunUSDPriceSourceBackfillMigration(database.DB)
+	database.RunPriceTierInheritanceMigration(database.DB)
+	database.RunPriceTierSellingSyncMigration(database.DB)
+	database.RunModelPriceAccuracyMigration(database.DB)
+	if err := database.RunPublicModelDescriptionCleanupMigration(database.DB); err != nil {
+		logger.L.Warn("public model description cleanup migration failed", zap.Error(err))
+	}
+	database.RunFixQwenFeaturesMigration(database.DB)
+	// Wangsu 官方价迁移会刷新海外模型阶梯，再跑一次通用同步以兼容旧字段格式。
+	database.RunPriceTierSellingSyncMigration(database.DB)
 
 	// 修复 Qwen/QwQ 等模型的能力标记（v5.1 补丁）
 	database.RunFixQwenFeaturesMigration(database.DB)
@@ -143,6 +193,21 @@ func RunDataMigrations() {
 	if err := database.RunPruneUnusedSuppliersMigration(database.DB); err != nil {
 		logger.L.Warn("supplier prune migration failed", zap.Error(err))
 	}
+}
+
+// runStartupPatches 启动时执行的轻量幂等补丁（与 RunDataMigrations 区分）
+//
+// 设计原则：
+//   - **必须幂等**且对已存在数据 no-op（如 FirstOrCreate / WHERE NOT EXISTS）
+//   - **必须轻量**（毫秒级，不阻塞启动），不做大量 ALTER TABLE / 全表扫描
+//   - **不写入业务种子数据**，仅补字典/小补丁，与功能渲染强耦合
+//   - 与 RunDataMigrations 不同：本函数每次启动都会运行，无需管理员手动触发
+//
+// 加入条件：补丁缺失时会导致前端 UI 退化（如标签徽标颜色丢失）或基础字段不可用。
+// 不该加入：业务种子（suppliers/levels/permissions 等）—— 必须走安装向导。
+func runStartupPatches() {
+	// needs_review 字典项：自动入库模型 NeedsReview 标签的字典 JOIN 依赖
+	database.RunMigrateLabelDictNeedsReview(database.DB)
 }
 
 // InitRedis 初始化 Redis 连接
@@ -192,6 +257,11 @@ func InitAll() (*Result, error) {
 		logger.L.Fatal("init database failed", zap.Error(err))
 	}
 	logger.L.Info("database initialized")
+
+	// 3.1 启动时自动执行的轻量幂等补丁
+	// 这些补丁与服务功能强耦合（不补会导致 UI 退化或字段缺失），无需走管理员手动迁移端点
+	// 已存在数据时为 no-op，幂等安全
+	runStartupPatches()
 
 	// 4. Redis
 	if err := InitRedis(); err != nil {

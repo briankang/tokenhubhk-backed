@@ -52,7 +52,7 @@ func (h *DocPublicHandler) Register(rg *gin.RouterGroup) {
 // GetCategoryTree 获取文档分类树 GET /docs/categories
 // 返回嵌套结构：一级分类 → 子分类 → 文档列表
 func (h *DocPublicHandler) GetCategoryTree(c *gin.Context) {
-	tree, err := h.catSvc.GetCategoryTree(c.Request.Context())
+	tree, err := h.catSvc.GetCategoryTreeByLocale(c.Request.Context(), c.Query("locale"))
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return
@@ -68,7 +68,7 @@ func (h *DocPublicHandler) GetArticlesByCategory(c *gin.Context) {
 		return
 	}
 
-	articles, err := h.catSvc.GetArticlesByCategorySlug(c.Request.Context(), slug)
+	articles, err := h.catSvc.GetArticlesByCategorySlugAndLocale(c.Request.Context(), slug, c.Query("locale"))
 	if err != nil {
 		response.Error(c, http.StatusNotFound, errcode.ErrNotFound)
 		return
@@ -85,7 +85,7 @@ func (h *DocPublicHandler) GetArticleBySlug(c *gin.Context) {
 	}
 
 	if h.articleSvc != nil {
-		article, err := h.articleSvc.GetBySlug(c.Request.Context(), slug)
+		article, err := h.articleSvc.GetBySlugLocale(c.Request.Context(), slug, c.Query("locale"))
 		if err != nil {
 			response.Error(c, http.StatusNotFound, errcode.ErrNotFound)
 			return
@@ -117,7 +117,7 @@ func (h *DocPublicHandler) SearchArticles(c *gin.Context) {
 
 	// 优先使用新的文章搜索
 	if h.articleSvc != nil {
-		articles, total, err := h.articleSvc.Search(c.Request.Context(), keyword, page, pageSize)
+		articles, total, err := h.articleSvc.SearchLocale(c.Request.Context(), keyword, c.Query("locale"), page, pageSize)
 		if err != nil {
 			response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 			return
@@ -169,7 +169,7 @@ func (h *DocPublicHandler) GetBySlug(c *gin.Context) {
 
 	// 先在新的 DocArticle 表中查找
 	if h.articleSvc != nil {
-		article, err := h.articleSvc.GetBySlug(c.Request.Context(), slug)
+		article, err := h.articleSvc.GetBySlugLocale(c.Request.Context(), slug, c.Query("locale"))
 		if err == nil {
 			response.Success(c, article)
 			return

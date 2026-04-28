@@ -2,17 +2,22 @@ package credits
 
 import "testing"
 
-func TestBillingUnitsConversions(t *testing.T) {
-	if RMBToBillingUnits(1) != BillingUnitsPerRMB {
-		t.Fatalf("1 RMB should equal %d billing units", BillingUnitsPerRMB)
+func TestBillingUnitsPreserveFractionalCredits(t *testing.T) {
+	units := CostUnitsFromCreditsPerMillion(3754, 10_000)
+	if units != 375400 {
+		t.Fatalf("expected 37.54 credits as 375400 units, got %d", units)
 	}
-	if CreditsToBillingUnits(1) != BillingUnitsPerCredit {
-		t.Fatalf("1 credit should equal %d billing units", BillingUnitsPerCredit)
+	if got := BillingUnitsToCreditAmount(units); got != 37.54 {
+		t.Fatalf("expected decimal credits 37.54, got %f", got)
 	}
-	if BillingUnitsToCredits(BillingUnitsPerCredit) != 1 {
-		t.Fatal("billing units should round back to 1 credit")
+}
+
+func TestTinyRequestRoundsToUnitNotWholeCredit(t *testing.T) {
+	units := CostUnitsFromCreditsPerMillion(3754, 1)
+	if units != 38 {
+		t.Fatalf("expected 0.0038 credits as 38 units, got %d", units)
 	}
-	if got := BillingUnitsToRMB(50000000); got != 0.5 {
-		t.Fatalf("BillingUnitsToRMB = %v, want 0.5", got)
+	if roundedCredits := BillingUnitsToCredits(units); roundedCredits != 0 {
+		t.Fatalf("legacy rounded credits must not be used as truth, got %d", roundedCredits)
 	}
 }

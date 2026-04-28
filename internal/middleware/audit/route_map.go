@@ -4,6 +4,8 @@
 // 命中则记录审计日志，未命中则跳过（白名单策略，防止日志爆炸）。
 package audit
 
+import "strings"
+
 // RouteMeta 路由元数据，用于审计日志的菜单/功能维度展示
 type RouteMeta struct {
 	Menu     string // 菜单名（如 "用户管理"）
@@ -25,14 +27,21 @@ var routeMap = map[string]RouteMeta{
 	"PUT /api/v1/admin/users/:id":                 {"用户管理", "更新用户", "user_update", "user"},
 	"DELETE /api/v1/admin/users/:id":              {"用户管理", "删除用户", "user_delete", "user"},
 	"PATCH /api/v1/admin/users/:id/status":        {"用户管理", "禁用启用", "user_status_change", "user"},
+	"PUT /api/v1/admin/users/:id/status":          {"用户管理", "禁用启用", "user_status_change", "user"},
 	"POST /api/v1/admin/users":                    {"用户管理", "创建用户", "user_create", "user"},
 	"POST /api/v1/admin/users/batch":              {"用户管理", "批量创建用户", "user_batch_create", "user"},
 	"PATCH /api/v1/admin/users/:id/role":          {"用户管理", "调整角色", "user_role_change", "user"},
+	"PUT /api/v1/admin/users/:id/role":            {"用户管理", "调整角色", "user_role_change", "user"},
 	"POST /api/v1/admin/users/:id/reset-password": {"用户管理", "重置密码", "user_reset_password", "user"},
+	"PUT /api/v1/admin/users/:id/limits":          {"用户管理", "更新用户限速", "user_rate_limit_update", "user"},
 
 	// ==================== 余额管理 ====================
-	"POST /api/v1/admin/balance/adjust":          {"余额管理", "调整余额", "balance_adjust", "balance"},
-	"POST /api/v1/admin/users/:id/grant-credits": {"余额管理", "赠送积分", "balance_grant", "balance"},
+	"POST /api/v1/admin/balance/adjust":             {"余额管理", "调整余额", "balance_adjust", "balance"},
+	"POST /api/v1/admin/users/:id/grant-credits":    {"余额管理", "赠送积分", "balance_grant", "balance"},
+	"POST /api/v1/admin/users/:id/recharge-rmb":     {"余额管理", "人民币充值", "balance_recharge_rmb", "balance"},
+	"POST /api/v1/admin/users/:id/recharge":         {"余额管理", "手动充值", "balance_recharge", "balance"},
+	"POST /api/v1/admin/users/:id/recharge-credits": {"余额管理", "充值积分", "balance_recharge_credits", "balance"},
+	"PUT /api/v1/admin/users/:id/set-credits":       {"余额管理", "设置用户积分", "balance_set_credits", "balance"},
 
 	// ==================== 用户自助申请（权限控制）====================
 	// 这两条路由在 /user/* 组下，不经过 PermissionGate，
@@ -43,6 +52,7 @@ var routeMap = map[string]RouteMeta{
 	"POST /api/v1/user/invoice-titles":       {"用户申请", "保存发票抬头", "user_invoice_title_create", "invoice_title"},
 	"PUT /api/v1/user/invoice-titles/:id":    {"用户申请", "更新发票抬头", "user_invoice_title_update", "invoice_title"},
 	"DELETE /api/v1/user/invoice-titles/:id": {"用户申请", "删除发票抬头", "user_invoice_title_delete", "invoice_title"},
+	"DELETE /api/v1/user/withdrawals/:id":    {"用户申请", "取消提现", "user_withdrawal_cancel", "withdrawal"},
 
 	// ==================== 发票管理 ====================
 	"POST /api/v1/admin/invoices/:id/approve":    {"发票管理", "审批发票", "invoice_admin_approve", "invoice"},
@@ -51,30 +61,77 @@ var routeMap = map[string]RouteMeta{
 	"DELETE /api/v1/admin/invoices/:id":          {"发票管理", "删除发票申请", "invoice_admin_delete", "invoice"},
 
 	// ==================== AI 模型管理 ====================
-	"POST /api/v1/admin/ai-models":                 {"模型管理", "创建模型", "model_create", "ai_model"},
-	"PUT /api/v1/admin/ai-models/:id":              {"模型管理", "更新模型", "model_update", "ai_model"},
-	"DELETE /api/v1/admin/ai-models/:id":           {"模型管理", "删除模型", "model_delete", "ai_model"},
-	"POST /api/v1/admin/ai-models/:id/offline":     {"模型管理", "下线模型", "model_offline", "ai_model"},
-	"POST /api/v1/admin/ai-models/:id/verify":      {"模型管理", "审核模型", "model_verify", "ai_model"},
-	"POST /api/v1/admin/models/batch-check":        {"模型管理", "批量检测(同步)", "model_batch_check", "ai_model"},
-	"POST /api/v1/admin/models/batch-check-sync":   {"模型管理", "批量检测(同步版)", "model_batch_check_sync", "ai_model"},
-	"POST /api/v1/admin/models/check-selected":     {"模型管理", "检测选中模型", "model_check_selected", "ai_model"},
-	"POST /api/v1/admin/models/sync":               {"模型管理", "全量模型同步", "model_sync_all", "ai_model"},
-	"POST /api/v1/admin/models/sync/:channelId":    {"模型管理", "按渠道同步模型", "model_sync_channel_by_id", "ai_model"},
-	"POST /api/v1/admin/models/deprecation-scan":   {"模型管理", "扫描下线模型", "model_deprecation_scan", "ai_model"},
-	"POST /api/v1/admin/models/bulk-deprecate":     {"模型管理", "批量标记下线", "model_bulk_deprecate", "ai_model"},
-	"POST /api/v1/admin/models/batch-labels":       {"模型管理", "批量添加标签", "model_batch_label_add", "ai_model"},
-	"DELETE /api/v1/admin/models/batch-labels":     {"模型管理", "批量移除标签", "model_batch_label_remove", "ai_model"},
-	"POST /api/v1/admin/ai-models/:id/reactivate":  {"模型管理", "重新激活模型", "model_reactivate", "ai_model"},
+	"POST /api/v1/admin/ai-models":                                     {"模型管理", "创建模型", "model_create", "ai_model"},
+	"PUT /api/v1/admin/ai-models/:id":                                  {"模型管理", "更新模型", "model_update", "ai_model"},
+	"DELETE /api/v1/admin/ai-models/:id":                               {"模型管理", "删除模型", "model_delete", "ai_model"},
+	"POST /api/v1/admin/ai-models/:id/offline":                         {"模型管理", "下线模型", "model_offline", "ai_model"},
+	"POST /api/v1/admin/ai-models/:id/verify":                          {"模型管理", "审核模型", "model_verify", "ai_model"},
+	"POST /api/v1/admin/models/batch-check":                            {"模型管理", "批量检测(同步)", "model_batch_check", "ai_model"},
+	"POST /api/v1/admin/models/batch-check-sync":                       {"模型管理", "批量检测(同步版)", "model_batch_check_sync", "ai_model"},
+	"POST /api/v1/admin/models/check-selected":                         {"模型管理", "检测选中模型", "model_check_selected", "ai_model"},
+	"POST /api/v1/admin/models/sync":                                   {"模型管理", "全量模型同步", "model_sync_all", "ai_model"},
+	"POST /api/v1/admin/models/sync/:channelId":                        {"模型管理", "按渠道同步模型", "model_sync_channel_by_id", "ai_model"},
+	"POST /api/v1/admin/models/deprecation-scan":                       {"模型管理", "扫描下线模型", "model_deprecation_scan", "ai_model"},
+	"POST /api/v1/admin/models/bulk-deprecate":                         {"模型管理", "批量标记下线", "model_bulk_deprecate", "ai_model"},
+	"POST /api/v1/admin/models/check-preview":                          {"模型管理", "预览模型检测", "model_check_preview", "ai_model"},
+	"POST /api/v1/admin/models/check-preview-sync":                     {"模型管理", "同步预览模型检测", "model_check_preview_sync", "ai_model"},
+	"POST /api/v1/admin/models/check-task":                             {"模型管理", "创建模型检测任务", "model_check_task_create", "model_check_task"},
+	"POST /api/v1/admin/models/mark-official-deprecated/:supplierCode": {"模型管理", "标记官方下线模型", "model_mark_official_deprecated", "ai_model"},
+	"POST /api/v1/admin/models/batch-labels":                           {"模型管理", "批量添加标签", "model_batch_label_add", "ai_model"},
+	"DELETE /api/v1/admin/models/batch-labels":                         {"模型管理", "批量移除标签", "model_batch_label_remove", "ai_model"},
+	"POST /api/v1/admin/ai-models/:id/labels":                          {"模型管理", "添加模型标签", "model_label_upsert", "model_label"},
+	"DELETE /api/v1/admin/ai-models/:id/labels":                        {"模型管理", "删除模型标签", "model_label_delete", "model_label"},
+	"POST /api/v1/admin/ai-models/:id/reactivate":                      {"模型管理", "重新激活模型", "model_reactivate", "ai_model"},
+
+	// 全局折扣引擎(v2):一个折扣率覆盖所有价格档(基础/思考/缓存/阶梯)
+	"POST /api/v1/admin/ai-models/:id/apply-global-discount":     {"模型管理", "应用全局折扣", "model_apply_global_discount", "model_pricing"},
+	"POST /api/v1/admin/ai-models/:id/preview-global-discount":   {"模型管理", "预览全局折扣", "model_preview_global_discount", "model_pricing"},
+	"PUT /api/v1/admin/ai-models/:id/lock-overrides":             {"模型管理", "解锁价格档", "model_lock_override_set", "model_pricing"},
+	"DELETE /api/v1/admin/ai-models/:id/lock-overrides/:archKey": {"模型管理", "清除解锁档", "model_lock_override_clear", "model_pricing"},
+
+	// 官方定价页 URL 解析(v2)
+	"PUT /api/v1/admin/ai-models/:id/official-price-url": {"模型管理", "覆盖官方定价URL", "model_official_price_url_set", "ai_model"},
+
+	// 统一计价试算端点(BillingQuote)
+	"POST /api/v1/admin/billing/quote-preview": {"价格分析", "BillingQuote 试算", "billing_quote_preview", "billing_quote"},
+
+	// PriceMatrix 矩阵化定价(v3)
+	"PUT /api/v1/admin/ai-models/:id/price-matrix": {"模型管理", "保存价格矩阵", "model_price_matrix_update", "model_pricing"},
 	"POST /api/v1/admin/models/feature-probe":      {"模型管理", "能力探测", "model_feature_probe", "ai_model"},
 	"POST /api/v1/admin/models/batch-retag":        {"模型管理", "批量重算标签", "model_batch_retag", "ai_model"},
 	"POST /api/v1/admin/ai-models/batch-free-tier": {"模型管理", "批量设置免费层", "model_batch_free_tier", "ai_model"},
+	"PUT /api/v1/admin/models/batch-status":        {"模型管理", "批量修改模型状态", "model_batch_status_update", "ai_model"},
+	"DELETE /api/v1/admin/models/batch-delete":     {"模型管理", "批量删除模型", "model_batch_delete", "ai_model"},
+	"POST /api/v1/admin/model-categories":          {"模型管理", "创建模型分类", "model_category_create", "model_category"},
+	"PUT /api/v1/admin/model-categories/:id":       {"模型管理", "更新模型分类", "model_category_update", "model_category"},
+	"DELETE /api/v1/admin/model-categories/:id":    {"模型管理", "删除模型分类", "model_category_delete", "model_category"},
+
+	// ==================== 模型别名与运维 ====================
+	"POST /api/v1/admin/model-aliases":                        {"模型管理", "创建模型别名", "model_alias_create", "model_alias"},
+	"PUT /api/v1/admin/model-aliases/:id":                     {"模型管理", "更新模型别名", "model_alias_update", "model_alias"},
+	"DELETE /api/v1/admin/model-aliases/:id":                  {"模型管理", "删除模型别名", "model_alias_delete", "model_alias"},
+	"POST /api/v1/admin/model-aliases/infer":                  {"模型管理", "推断模型别名", "model_alias_infer", "model_alias"},
+	"POST /api/v1/admin/model-ops/calculators":                {"模型管理", "创建模型计算器", "model_ops_calculator_create", "model_ops"},
+	"PUT /api/v1/admin/model-ops/calculators/:code":           {"模型管理", "更新模型计算器", "model_ops_calculator_update", "model_ops"},
+	"POST /api/v1/admin/model-ops/calculators/reset-defaults": {"模型管理", "重置模型计算器", "model_ops_calculator_reset", "model_ops"},
+	"POST /api/v1/admin/model-ops/calculate-preview":          {"模型管理", "预览模型计算", "model_ops_calculate_preview", "model_ops"},
+	"POST /api/v1/admin/model-ops/batch-preview":              {"模型管理", "预览批量模型操作", "model_ops_batch_preview", "model_ops"},
+	"POST /api/v1/admin/model-ops/batch-execute":              {"模型管理", "执行批量模型操作", "model_ops_batch_execute", "model_ops"},
 
 	// ==================== 定价管理 ====================
 	"PUT /api/v1/admin/ai-models/:id/pricing":        {"定价管理", "调整定价", "pricing_update", "model_pricing"},
 	"POST /api/v1/admin/model-pricings":              {"定价管理", "新建定价", "pricing_create", "model_pricing"},
 	"PUT /api/v1/admin/model-pricings/:id":           {"定价管理", "更新定价", "pricing_update", "model_pricing"},
+	"DELETE /api/v1/admin/model-pricings/:id":        {"定价管理", "删除定价", "pricing_delete", "model_pricing"},
 	"POST /api/v1/admin/model-pricings/repair":       {"定价管理", "一键修复售价", "pricing_repair", "model_pricing"},
+	"POST /api/v1/admin/price-calculate":             {"定价管理", "试算价格", "pricing_calculate", "model_pricing"},
+	// 代理折扣体系已于 2026-04-28 移除,以下 6 条 endpoint 不再注册
+	// "POST /api/v1/admin/level-discounts":         (removed - AgentLevelDiscount)
+	// "PUT /api/v1/admin/level-discounts/:id":      (removed)
+	// "DELETE /api/v1/admin/level-discounts/:id":   (removed)
+	// "POST /api/v1/admin/agent-pricings":          (removed - AgentPricing)
+	// "PUT /api/v1/admin/agent-pricings/:id":       (removed)
+	// "DELETE /api/v1/admin/agent-pricings/:id":    (removed)
 	"POST /api/v1/admin/models/batch-update-selling": {"定价管理", "批量定价", "pricing_batch_update", "model_pricing"},
 	"PUT /api/v1/admin/models/batch-selling-price":   {"定价管理", "批量调整售价", "pricing_batch_selling", "model_pricing"},
 	"PUT /api/v1/admin/models/batch-discount":        {"定价管理", "批量调整折扣", "pricing_batch_discount", "model_pricing"},
@@ -82,8 +139,10 @@ var routeMap = map[string]RouteMeta{
 	"POST /api/v1/admin/price-scrape/apply":          {"定价管理", "应用爬虫价格", "pricing_scrape_apply", "model_pricing"},
 	"POST /api/v1/admin/models/preview-prices":       {"定价管理", "预览爬虫价格", "pricing_scrape_preview", "model_pricing"},
 	"POST /api/v1/admin/models/apply-prices":         {"定价管理", "应用爬虫价格(v2)", "pricing_scrape_apply_v2", "model_pricing"},
+	"POST /api/v1/admin/models/scrape-page":          {"定价管理", "手动抓取价格页", "pricing_scrape_page", "model_pricing"},
 	"POST /api/v1/admin/models/batch-scrape":         {"定价管理", "批量按模型爬价", "pricing_batch_scrape", "model_pricing"},
 	"POST /api/v1/admin/models/batch-scrape/apply":   {"定价管理", "应用批量爬价", "pricing_batch_scrape_apply", "model_pricing"},
+	"POST /api/v1/admin/billing/reconcile":           {"财务管理", "月度账单对账", "billing_reconcile_create", "billing_reconcile"},
 
 	// ==================== 渠道管理 ====================
 	"POST /api/v1/admin/channels":                   {"渠道管理", "新建渠道", "channel_create", "channel"},
@@ -163,13 +222,18 @@ var routeMap = map[string]RouteMeta{
 	"DELETE /api/v1/admin/capability-test/baselines/:id":            {"能力测试", "删除基线", "capability_test_baseline_delete", "capability_test_baseline"},
 
 	// ==================== 用户敏感操作 ====================
-	"POST /api/v1/auth/login":          {"账户安全", "登录", "user_login", "auth"},
-	"POST /api/v1/auth/logout":         {"账户安全", "登出", "user_logout", "auth"},
-	"POST /api/v1/auth/register":       {"账户安全", "注册", "user_register", "auth"},
-	"POST /api/v1/user/password":       {"账户安全", "修改密码", "password_change", "user"},
-	"POST /api/v1/user/api-keys":       {"API Keys", "创建密钥", "apikey_create", "apikey"},
-	"DELETE /api/v1/user/api-keys/:id": {"API Keys", "删除密钥", "apikey_delete", "apikey"},
-	"PUT /api/v1/user/api-keys/:id":    {"API Keys", "更新密钥", "apikey_update", "apikey"},
+	"POST /api/v1/auth/login":               {"账户安全", "登录", "user_login", "auth"},
+	"POST /api/v1/auth/logout":              {"账户安全", "登出", "user_logout", "auth"},
+	"POST /api/v1/auth/register":            {"账户安全", "注册", "user_register", "auth"},
+	"POST /api/v1/user/password":            {"账户安全", "修改密码", "password_change", "user"},
+	"PUT /api/v1/user/password":             {"账户安全", "修改密码", "password_change", "user"},
+	"POST /api/v1/user/change-password":     {"账户安全", "修改密码", "password_change", "user"},
+	"PUT /api/v1/user/profile":              {"账户安全", "更新个人资料", "profile_update", "user"},
+	"POST /api/v1/user/api-keys":            {"API Keys", "创建密钥", "apikey_create", "apikey"},
+	"DELETE /api/v1/user/api-keys/:id":      {"API Keys", "删除密钥", "apikey_delete", "apikey"},
+	"PUT /api/v1/user/api-keys/:id":         {"API Keys", "更新密钥", "apikey_update", "apikey"},
+	"PUT /api/v1/user/api-keys/:id/disable": {"API Keys", "禁用密钥", "apikey_disable", "apikey"},
+	"PUT /api/v1/user/api-keys/:id/enable":  {"API Keys", "启用密钥", "apikey_enable", "apikey"},
 
 	// ==================== 权限管理（v4.0 RBAC） ====================
 	"POST /api/v1/admin/roles":                  {"权限管理", "创建角色", "role_create", "role"},
@@ -201,6 +265,14 @@ var routeMap = map[string]RouteMeta{
 	"POST /api/v1/admin/email/send-batch":              {"邮件管理", "批量发送邮件", "email_send_batch", "email"},
 	"POST /api/v1/admin/email/logs/:id/resend":         {"邮件管理", "重发邮件", "email_log_resend", "email"},
 
+	// ==================== OAuth 登录配置 ====================
+	"PUT /api/v1/admin/oauth/providers/:provider": {"账户安全", "更新第三方登录配置", "oauth_provider_update", "oauth_provider"},
+
+	// ==================== Privacy / Compliance ====================
+	"PATCH /api/v1/admin/privacy/requests/:id":         {"Compliance", "Update privacy request", "privacy_request_update", "privacy_request"},
+	"POST /api/v1/admin/privacy/requests/:id/complete": {"Compliance", "Complete privacy request", "privacy_request_complete", "privacy_request"},
+	"POST /api/v1/admin/privacy/requests/:id/reject":   {"Compliance", "Reject privacy request", "privacy_request_reject", "privacy_request"},
+
 	// ==================== 热门模型参考库 ====================
 	"POST /api/v1/admin/trending-models":       {"模型管理", "新增热门模型", "trending_model_create", "trending_model"},
 	"PUT /api/v1/admin/trending-models/:id":    {"模型管理", "更新热门模型", "trending_model_update", "trending_model"},
@@ -217,19 +289,30 @@ var routeMap = map[string]RouteMeta{
 	"DELETE /api/v1/admin/doc-categories/:id": {"文档管理", "删除分类", "doc_category_delete", "doc_category"},
 
 	// ==================== AI 客服 ====================
-	"POST /api/v1/admin/support/hot-questions":               {"AI 客服", "创建热门问题", "support_hot_question_create", "support_hot_question"},
-	"PUT /api/v1/admin/support/hot-questions/:id":            {"AI 客服", "更新热门问题", "support_hot_question_update", "support_hot_question"},
-	"POST /api/v1/admin/support/hot-questions/:id/publish":   {"AI 客服", "发布热门问题", "support_hot_question_publish", "support_hot_question"},
-	"POST /api/v1/admin/support/hot-questions/:id/unpublish": {"AI 客服", "下线热门问题", "support_hot_question_unpublish", "support_hot_question"},
-	"DELETE /api/v1/admin/support/hot-questions/:id":         {"AI 客服", "删除热门问题", "support_hot_question_delete", "support_hot_question"},
-	"POST /api/v1/admin/support/model-profiles":              {"AI 客服", "创建模型配置", "support_model_profile_create", "support_model_profile"},
-	"PUT /api/v1/admin/support/model-profiles/:id":           {"AI 客服", "更新模型配置", "support_model_profile_update", "support_model_profile"},
-	"DELETE /api/v1/admin/support/model-profiles/:id":        {"AI 客服", "删除模型配置", "support_model_profile_delete", "support_model_profile"},
-	"PATCH /api/v1/admin/support/model-profiles/:id/toggle":  {"AI 客服", "切换模型配置启用", "support_model_profile_toggle", "support_model_profile"},
+	"POST /api/v1/admin/support/hot-questions":                      {"AI 客服", "创建热门问题", "support_hot_question_create", "support_hot_question"},
+	"PUT /api/v1/admin/support/hot-questions/:id":                   {"AI 客服", "更新热门问题", "support_hot_question_update", "support_hot_question"},
+	"POST /api/v1/admin/support/hot-questions/:id/publish":          {"AI 客服", "发布热门问题", "support_hot_question_publish", "support_hot_question"},
+	"POST /api/v1/admin/support/hot-questions/:id/unpublish":        {"AI 客服", "下线热门问题", "support_hot_question_unpublish", "support_hot_question"},
+	"DELETE /api/v1/admin/support/hot-questions/:id":                {"AI 客服", "删除热门问题", "support_hot_question_delete", "support_hot_question"},
+	"POST /api/v1/admin/support/model-profiles":                     {"AI 客服", "创建模型配置", "support_model_profile_create", "support_model_profile"},
+	"PUT /api/v1/admin/support/model-profiles/:id":                  {"AI 客服", "更新模型配置", "support_model_profile_update", "support_model_profile"},
+	"DELETE /api/v1/admin/support/model-profiles/:id":               {"AI 客服", "删除模型配置", "support_model_profile_delete", "support_model_profile"},
+	"PATCH /api/v1/admin/support/model-profiles/:id/toggle":         {"AI 客服", "切换模型配置启用", "support_model_profile_toggle", "support_model_profile"},
+	"POST /api/v1/admin/support/provider-docs":                      {"AI 客服", "创建供应商文档", "support_provider_doc_create", "support_provider_doc"},
+	"PUT /api/v1/admin/support/provider-docs/:id":                   {"AI 客服", "更新供应商文档", "support_provider_doc_update", "support_provider_doc"},
+	"DELETE /api/v1/admin/support/provider-docs/:id":                {"AI 客服", "删除供应商文档", "support_provider_doc_delete", "support_provider_doc"},
+	"POST /api/v1/admin/support/tickets/:id/reply":                  {"AI 客服", "回复工单", "support_ticket_reply", "support_ticket"},
+	"PATCH /api/v1/admin/support/tickets/:id/status":                {"AI 客服", "更新工单状态", "support_ticket_status", "support_ticket"},
+	"PATCH /api/v1/admin/support/tickets/:id/assign":                {"AI 客服", "分配工单", "support_ticket_assign", "support_ticket"},
+	"POST /api/v1/admin/support/accepted-answers/:id/approve":       {"AI 客服", "批准采纳答案", "support_answer_approve", "support_accepted_answer"},
+	"POST /api/v1/admin/support/accepted-answers/:id/reject":        {"AI 客服", "拒绝采纳答案", "support_answer_reject", "support_accepted_answer"},
+	"POST /api/v1/admin/support/knowledge/rebuild":                  {"AI 客服", "重建知识库", "support_knowledge_rebuild", "support_knowledge"},
+	"POST /api/v1/admin/support/knowledge/rebuild/:source_type/:id": {"AI 客服", "重建单条知识", "support_knowledge_rebuild_one", "support_knowledge"},
 
 	// ==================== 渠道管理（补全） ====================
 	"PUT /api/v1/admin/channels/:id/tags":    {"渠道管理", "设置渠道标签", "channel_set_tags", "channel"},
 	"POST /api/v1/admin/channels/:id/verify": {"渠道管理", "验证渠道Key", "channel_verify", "channel"},
+	"PUT /api/v1/admin/channel-models/:id":   {"渠道管理", "更新渠道模型映射", "channel_model_update", "channel_model"},
 	"POST /api/v1/admin/channel-tags":        {"渠道管理", "创建标签", "channel_tag_create", "channel_tag"},
 	"PUT /api/v1/admin/channel-tags/:id":     {"渠道管理", "更新标签", "channel_tag_update", "channel_tag"},
 	"DELETE /api/v1/admin/channel-tags/:id":  {"渠道管理", "删除标签", "channel_tag_delete", "channel_tag"},
@@ -240,6 +323,17 @@ var routeMap = map[string]RouteMeta{
 	"DELETE /api/v1/admin/backup-rules/:id":       {"渠道管理", "删除备份规则", "backup_rule_delete", "backup_rule"},
 	"POST /api/v1/admin/backup-rules/:id/switch":  {"渠道管理", "手动切换备份", "backup_rule_switch", "backup_rule"},
 	"POST /api/v1/admin/backup-rules/:id/recover": {"渠道管理", "手动恢复备份", "backup_rule_recover", "backup_rule"},
+
+	// ==================== 自定义渠道 ====================
+	"POST /api/v1/admin/custom-channels":                   {"渠道管理", "创建自定义渠道", "custom_channel_create", "custom_channel"},
+	"POST /api/v1/admin/custom-channels/default/refresh":   {"渠道管理", "刷新默认渠道", "custom_channel_default_refresh", "custom_channel"},
+	"PUT /api/v1/admin/custom-channels/:id":                {"渠道管理", "更新自定义渠道", "custom_channel_update", "custom_channel"},
+	"DELETE /api/v1/admin/custom-channels/:id":             {"渠道管理", "删除自定义渠道", "custom_channel_delete", "custom_channel"},
+	"PATCH /api/v1/admin/custom-channels/:id/toggle":       {"渠道管理", "启停自定义渠道", "custom_channel_toggle", "custom_channel"},
+	"PATCH /api/v1/admin/custom-channels/:id/set-default":  {"渠道管理", "设为默认渠道", "custom_channel_set_default", "custom_channel"},
+	"PUT /api/v1/admin/custom-channels/:id/access":         {"渠道管理", "更新渠道访问配置", "custom_channel_access_update", "custom_channel"},
+	"POST /api/v1/admin/custom-channels/:id/routes/batch":  {"渠道管理", "批量更新渠道路由", "custom_channel_routes_batch", "custom_channel_route"},
+	"POST /api/v1/admin/custom-channels/:id/routes/import": {"渠道管理", "导入渠道路由", "custom_channel_routes_import", "custom_channel_route"},
 
 	// ==================== 编排流程 ====================
 	"POST /api/v1/admin/orchestrations":       {"系统设置", "创建编排流程", "orchestration_create", "orchestration"},
@@ -276,14 +370,8 @@ var routeMap = map[string]RouteMeta{
 	// ==================== 订单（导出补全） ====================
 	"POST /api/v1/admin/payment/orders/export": {"订单管理", "导出订单CSV", "order_export", "order"},
 
-	// ==================== 余额管理（补全） ====================
-	"POST /api/v1/admin/users/:id/recharge":         {"余额管理", "充值用户余额", "balance_recharge", "balance"},
-	"POST /api/v1/admin/users/:id/recharge-credits": {"余额管理", "充值用户积分", "balance_recharge_credits", "balance"},
-	"PUT /api/v1/admin/users/:id/set-credits":       {"余额管理", "设置用户积分", "balance_set_credits", "balance"},
-
 	// ==================== 限速配置 ====================
 	"PUT /api/v1/admin/rate-limits":              {"系统设置", "更新全局限速", "rate_limit_update", "rate_limit"},
-	"PUT /api/v1/admin/users/:id/limits":         {"用户管理", "更新用户限速", "user_rate_limit_update", "user"},
 	"POST /api/v1/admin/users/batch-rate-limits": {"用户管理", "批量设置限速", "user_rate_limit_batch", "user"},
 
 	// ==================== 守卫配置 ====================
@@ -311,10 +399,27 @@ var routeMap = map[string]RouteMeta{
 
 	// ==================== API 日志回放 ====================
 	"POST /api/v1/admin/api-call-logs/:requestId/replay": {"系统设置", "重放API请求", "api_call_log_replay", "api_call_log"},
+	"POST /api/v1/admin/reconciliation/snapshots":        {"系统设置", "生成扣费对账快照", "reconciliation_snapshot_create", "api_call_log"},
+
+	// ==================== 后台任务 ====================
+	"POST /api/v1/admin/tasks":                  {"系统设置", "创建后台任务", "task_create", "task"},
+	"POST /api/v1/admin/tasks/:id/cancel":       {"系统设置", "取消后台任务", "task_cancel", "task"},
+	"POST /api/v1/admin/tasks/:id/apply-prices": {"系统设置", "应用任务价格", "task_apply_prices", "task"},
+
+	// ==================== 参数映射 ====================
+	"POST /api/v1/admin/param-mappings":                             {"系统设置", "创建参数映射", "param_mapping_create", "param_mapping"},
+	"PUT /api/v1/admin/param-mappings/:id":                          {"系统设置", "更新参数映射", "param_mapping_update", "param_mapping"},
+	"DELETE /api/v1/admin/param-mappings/:id":                       {"系统设置", "删除参数映射", "param_mapping_delete", "param_mapping"},
+	"POST /api/v1/admin/param-mappings/:id/mappings":                {"系统设置", "更新参数映射项", "param_mapping_item_upsert", "param_mapping"},
+	"DELETE /api/v1/admin/param-mappings/mappings/:mappingId":       {"系统设置", "删除参数映射项", "param_mapping_item_delete", "param_mapping"},
+	"PUT /api/v1/admin/param-mappings/supplier/:code":               {"系统设置", "批量更新供应商映射", "param_mapping_supplier_update", "param_mapping"},
+	"POST /api/v1/admin/param-mappings/standard-params/apply":       {"系统设置", "应用标准参数", "param_mapping_standard_apply", "param_mapping"},
+	"POST /api/v1/admin/param-mappings/templates/recommended/apply": {"系统设置", "应用推荐参数模板", "param_mapping_template_apply", "param_mapping"},
 
 	// ==================== 限流监控 ====================
 	"DELETE /api/v1/admin/rate-limits/active/:key": {"系统设置", "解除单个限流", "rate_limit_release", "rate_limit"},
 	"POST /api/v1/admin/rate-limits/reset":         {"系统设置", "批量解除限流", "rate_limit_reset", "rate_limit"},
+	"POST /api/v1/admin/cache/clear/:prefix":       {"系统设置", "按前缀清理缓存", "cache_clear_prefix", "cache"},
 
 	// ==================== 系统升级（schema/seed 迁移）====================
 	"POST /api/v1/admin/system/migrate":    {"系统设置", "触发 schema 升级", "system_migrate", "system"},
@@ -347,29 +452,41 @@ var readRouteMap = map[string]RouteMeta{
 	"GET /api/v1/admin/balance/reconciliation": {"余额管理", "余额对账", "balance_reconciliation_read", "balance"},
 
 	// ==================== 模型管理 ====================
-	"GET /api/v1/admin/ai-models":              {"模型管理", "模型列表", "model_list_read", "ai_model"},
-	"GET /api/v1/admin/ai-models/:id":          {"模型管理", "模型详情", "model_get_read", "ai_model"},
-	"GET /api/v1/admin/ai-models/stats":        {"模型管理", "模型统计", "model_stats_read", "ai_model"},
-	"GET /api/v1/admin/ai-models/:id/labels":   {"模型管理", "模型标签", "model_label_list_read", "model_label"},
-	"GET /api/v1/admin/models/label-keys":      {"模型管理", "标签键列表", "model_label_key_list_read", "model_label"},
-	"GET /api/v1/admin/model-categories":       {"模型管理", "分类列表", "model_category_list_read", "model_category"},
-	"GET /api/v1/admin/model-categories/:id":   {"模型管理", "分类详情", "model_category_get_read", "model_category"},
-	"GET /api/v1/admin/models/check-history":   {"模型管理", "检测历史", "model_check_history_read", "model_check"},
-	"GET /api/v1/admin/models/check-latest":    {"模型管理", "检测汇总", "model_check_latest_read", "model_check"},
-	"GET /api/v1/admin/models/check-tasks":     {"模型管理", "检测任务列表", "model_check_task_list_read", "model_check_task"},
-	"GET /api/v1/admin/models/check-tasks/:id": {"模型管理", "检测任务详情", "model_check_task_get_read", "model_check_task"},
-	"GET /api/v1/admin/models/scanned-offline": {"模型管理", "扫描下线汇总", "model_deprecation_scan_read", "ai_model"},
-	"GET /api/v1/admin/trending-models":        {"模型管理", "热门模型库", "trending_model_list_read", "trending_model"},
+	"GET /api/v1/admin/ai-models":               {"模型管理", "模型列表", "model_list_read", "ai_model"},
+	"GET /api/v1/admin/ai-models/:id":           {"模型管理", "模型详情", "model_get_read", "ai_model"},
+	"GET /api/v1/admin/ai-models/stats":         {"模型管理", "模型统计", "model_stats_read", "ai_model"},
+	"GET /api/v1/admin/ai-models/:id/preflight": {"模型管理", "模型启用预检", "model_preflight_read", "ai_model"},
+	"GET /api/v1/admin/ai-models/:id/labels":    {"模型管理", "模型标签", "model_label_list_read", "model_label"},
+	// 官方定价页 URL 解析(v2)
+	"GET /api/v1/admin/ai-models/:id/official-price-url": {"模型管理", "解析官方定价URL", "model_official_price_url_read", "ai_model"},
+	// PriceMatrix 矩阵读取(v3)
+	"GET /api/v1/admin/ai-models/:id/price-matrix": {"模型管理", "读取价格矩阵", "model_price_matrix_read", "model_pricing"},
+	"GET /api/v1/admin/models/label-keys":          {"模型管理", "标签键列表", "model_label_key_list_read", "model_label"},
+	"GET /api/v1/admin/model-categories":           {"模型管理", "分类列表", "model_category_list_read", "model_category"},
+	"GET /api/v1/admin/model-categories/:id":       {"模型管理", "分类详情", "model_category_get_read", "model_category"},
+	"GET /api/v1/admin/model-aliases":              {"模型管理", "模型别名列表", "model_alias_list_read", "model_alias"},
+	"GET /api/v1/admin/model-aliases/resolve":      {"模型管理", "解析模型别名", "model_alias_resolve_read", "model_alias"},
+	"GET /api/v1/admin/model-ops/profiles":         {"模型管理", "模型运维档案", "model_ops_profile_list_read", "model_ops"},
+	"GET /api/v1/admin/model-ops/calculators":      {"模型管理", "模型计算器列表", "model_ops_calculator_list_read", "model_ops"},
+	"GET /api/v1/admin/model-ops/scenarios":        {"模型管理", "价格场景预设列表", "model_ops_scenarios_read", "model_ops"},
+	"GET /api/v1/admin/models/check-history":       {"模型管理", "检测历史", "model_check_history_read", "model_check"},
+	"GET /api/v1/admin/models/check-latest":        {"模型管理", "检测汇总", "model_check_latest_read", "model_check"},
+	"GET /api/v1/admin/models/check-tasks":         {"模型管理", "检测任务列表", "model_check_task_list_read", "model_check_task"},
+	"GET /api/v1/admin/models/check-tasks/:id":     {"模型管理", "检测任务详情", "model_check_task_get_read", "model_check_task"},
+	"GET /api/v1/admin/models/scanned-offline":     {"模型管理", "扫描下线汇总", "model_deprecation_scan_read", "ai_model"},
+	"GET /api/v1/admin/trending-models":            {"模型管理", "热门模型库", "trending_model_list_read", "trending_model"},
 
 	// ==================== 定价管理 ====================
-	"GET /api/v1/admin/model-pricings":         {"定价管理", "定价列表", "pricing_list_read", "model_pricing"},
-	"GET /api/v1/admin/agent-pricings":         {"定价管理", "代理定价列表", "agent_pricing_list_read", "agent_pricing"},
-	"GET /api/v1/admin/models/price-sync-logs": {"定价管理", "价格同步日志", "pricing_sync_log_read", "pricing_sync_log"},
-	"GET /api/v1/admin/price-matrix":           {"定价管理", "价格矩阵", "price_matrix_read", "price_matrix"},
+	"GET /api/v1/admin/model-pricings":                      {"定价管理", "定价列表", "pricing_list_read", "model_pricing"},
+	// "GET /api/v1/admin/agent-pricings": (removed 2026-04-28 — 代理折扣体系移除)
+	"GET /api/v1/admin/models/price-sync-logs":              {"定价管理", "价格同步日志", "pricing_sync_log_read", "pricing_sync_log"},
+	"GET /api/v1/admin/models/batch-scrape/:task_id/result": {"定价管理", "批量爬价结果", "pricing_batch_scrape_result_read", "model_pricing"},
+	"GET /api/v1/admin/price-matrix":                        {"定价管理", "价格矩阵", "price_matrix_read", "price_matrix"},
 
 	// ==================== 渠道管理 ====================
 	"GET /api/v1/admin/channels":                               {"渠道管理", "渠道列表", "channel_list_read", "channel"},
 	"GET /api/v1/admin/channels/:id":                           {"渠道管理", "渠道详情", "channel_get_read", "channel"},
+	"GET /api/v1/admin/channels/custom-params/schema":          {"渠道管理", "自定义参数Schema", "channel_custom_params_schema_read", "channel"},
 	"GET /api/v1/admin/channel-groups":                         {"渠道管理", "渠道组列表", "channel_group_list_read", "channel_group"},
 	"GET /api/v1/admin/channel-groups/:id":                     {"渠道管理", "渠道组详情", "channel_group_get_read", "channel_group"},
 	"GET /api/v1/admin/channel-groups/:id/channels":            {"渠道管理", "组内渠道列表", "channel_group_channels_read", "channel"},
@@ -405,6 +522,9 @@ var readRouteMap = map[string]RouteMeta{
 	"GET /api/v1/user/invoices/:id":   {"用户申请", "发票详情", "user_invoice_get_read", "invoice"},
 	"GET /api/v1/user/invoice-titles": {"用户申请", "抬头列表", "user_invoice_title_list_read", "invoice_title"},
 
+	// ==================== 用户视角 BillingQuote 查询（A4 任务）====================
+	"GET /api/v1/user/api-call-logs/:requestId/quote": {"用户申请", "查看本次扣费明细", "user_quote_get_read", "api_call_log"},
+
 	// ==================== 提现审核 ====================
 	"GET /api/v1/admin/withdrawals":       {"提现审核", "提现列表", "withdrawal_list_read", "withdrawal"},
 	"GET /api/v1/admin/withdrawals/:id":   {"提现审核", "提现详情", "withdrawal_get_read", "withdrawal"},
@@ -439,7 +559,7 @@ var readRouteMap = map[string]RouteMeta{
 
 	// ==================== 会员等级 ====================
 	"GET /api/v1/admin/member-levels":   {"会员等级", "等级列表", "member_level_list_read", "member_level"},
-	"GET /api/v1/admin/level-discounts": {"会员等级", "等级折扣列表", "member_level_discount_read", "member_level_discount"},
+	// "GET /api/v1/admin/level-discounts": (removed 2026-04-28 — 代理折扣体系移除)
 
 	// ==================== 合作申请 ====================
 	"GET /api/v1/admin/partner-applications":       {"合作申请", "申请列表", "partner_application_list_read", "partner_application"},
@@ -450,6 +570,8 @@ var readRouteMap = map[string]RouteMeta{
 	"GET /api/v1/admin/system/schema-version":                   {"系统设置", "查看 schema 版本", "system_schema_version_read", "system"},
 	"GET /api/v1/admin/system/config/:key":                      {"系统设置", "读取系统配置", "system_config_read", "system_config"},
 	"GET /api/v1/admin/cron-tasks":                              {"系统设置", "定时任务列表", "cron_task_list_read", "cron_task"},
+	"GET /api/v1/admin/cron-task-runs":                          {"系统设置", "定时任务运行记录", "cron_task_run_list_read", "cron_task_run"},
+	"GET /api/v1/admin/cron-tasks/:name/runs":                   {"系统设置", "单任务运行记录", "cron_task_run_by_task_read", "cron_task_run"},
 	"GET /api/v1/admin/audit-logs":                              {"系统设置", "审计日志列表", "audit_log_list_read", "audit_log"},
 	"GET /api/v1/admin/audit-logs/menus":                        {"系统设置", "审计菜单列表", "audit_menu_list_read", "audit_menu"},
 	"GET /api/v1/admin/config-audit":                            {"系统设置", "配置审计列表", "config_audit_list_read", "config_audit"},
@@ -457,6 +579,9 @@ var readRouteMap = map[string]RouteMeta{
 	"GET /api/v1/admin/param-mappings":                          {"系统设置", "参数映射列表", "param_mapping_list_read", "param_mapping"},
 	"GET /api/v1/admin/param-mappings/:id":                      {"系统设置", "参数映射详情", "param_mapping_get_read", "param_mapping"},
 	"GET /api/v1/admin/param-mappings/supplier/:code":           {"系统设置", "供应商参数映射", "param_mapping_by_supplier_read", "param_mapping"},
+	"GET /api/v1/admin/param-mappings/coverage":                 {"系统设置", "参数映射覆盖率", "param_mapping_coverage_read", "param_mapping"},
+	"GET /api/v1/admin/param-mappings/standard-params":          {"系统设置", "标准参数列表", "param_mapping_standard_read", "param_mapping"},
+	"GET /api/v1/admin/param-mappings/templates/recommended":    {"系统设置", "推荐参数模板", "param_mapping_template_read", "param_mapping"},
 	"GET /api/v1/admin/param-support":                           {"系统设置", "参数支持列表", "param_support_read", "param_support"},
 	"GET /api/v1/admin/guard-config":                            {"系统设置", "守卫配置", "guard_config_read", "guard_config"},
 	"GET /api/v1/admin/disposable-emails":                       {"系统设置", "一次性邮箱列表", "disposable_email_list_read", "disposable_email"},
@@ -473,10 +598,11 @@ var readRouteMap = map[string]RouteMeta{
 	"GET /api/v1/admin/api-call-logs/reconciliation/export":     {"System", "API call reconciliation export", "api_call_log_summary_read", "api_call_log"},
 	"GET /api/v1/admin/api-call-logs/:requestId":                {"系统设置", "API调用日志详情", "api_call_log_get_read", "api_call_log"},
 	"GET /api/v1/admin/api-call-logs/:requestId/chain":          {"系统设置", "API调用链路", "api_call_log_chain_read", "api_call_log"},
-	"GET /api/v1/admin/api-call-logs/:requestId/cost-breakdown": {"系统设置", "API调用成本分解", "api_call_log_cost_read", "api_call_log"},
+	"GET /api/v1/admin/api-call-logs/:requestId/cost-breakdown":  {"系统设置", "API调用成本分解", "api_call_log_cost_read", "api_call_log"},
+	"GET /api/v1/admin/api-call-logs/:requestId/three-way-check": {"系统设置", "三方一致性核对", "cost_three_way_check_read", "api_call_log"},
+	"GET /api/v1/admin/cost-consistency/scan":                    {"系统设置", "三方一致性批量扫描", "cost_consistency_scan_read", "api_call_log"},
 	"GET /api/v1/admin/reconciliation":                          {"系统设置", "扣费对账摘要", "api_call_log_summary_read", "api_call_log"},
 	"GET /api/v1/admin/reconciliation/snapshots":                {"系统设置", "扣费对账快照列表", "api_call_log_summary_read", "api_call_log"},
-	"POST /api/v1/admin/reconciliation/snapshots":               {"系统设置", "生成扣费对账快照", "api_call_log_summary_read", "api_call_log"},
 
 	// ==================== 账户安全（登录日志） ====================
 	"GET /api/v1/admin/auth-logs":       {"账户安全", "登录日志列表", "auth_log_list_read", "auth_log"},
@@ -509,6 +635,7 @@ var readRouteMap = map[string]RouteMeta{
 	"GET /api/v1/admin/reports/profit/top-agents":          {"运营报表", "顶级代理", "report_top_agents_read", "report"},
 	"GET /api/v1/admin/reports/profit/drilldown/:tenantId": {"运营报表", "利润下钻", "report_profit_drilldown_read", "report"},
 	"GET /api/v1/admin/stats/registrations":                {"运营报表", "注册统计", "stats_registrations_read", "stats"},
+	"GET /api/v1/admin/stats/daily":                        {"运营报表", "每日统计", "stats_daily_read", "stats"},
 	"GET /api/v1/admin/stats/referrals":                    {"运营报表", "推荐统计", "stats_referrals_read", "stats"},
 	"GET /api/v1/admin/stats/pnl":                          {"运营报表", "损益表", "stats_pnl_read", "stats"},
 	"GET /api/v1/admin/stats/payment-analysis":             {"运营报表", "支付分析", "stats_payment_analysis_read", "stats"},
@@ -522,6 +649,13 @@ var readRouteMap = map[string]RouteMeta{
 	"GET /api/v1/admin/email/templates":     {"邮件管理", "邮件模板列表", "email_template_list_read", "email_template"},
 	"GET /api/v1/admin/email/templates/:id": {"邮件管理", "邮件模板详情", "email_template_get_read", "email_template"},
 	"GET /api/v1/admin/email/logs":          {"邮件管理", "邮件发送记录", "email_log_list_read", "email"},
+
+	// ==================== OAuth 登录配置 ====================
+	"GET /api/v1/admin/oauth/providers": {"账户安全", "第三方登录配置", "oauth_provider_list_read", "oauth_provider"},
+
+	// ==================== Privacy / Compliance ====================
+	"GET /api/v1/admin/privacy/requests":     {"Compliance", "Privacy request list", "privacy_request_list_read", "privacy_request"},
+	"GET /api/v1/admin/privacy/requests/:id": {"Compliance", "Privacy request detail", "privacy_request_get_read", "privacy_request"},
 
 	// ==================== 文档管理 ====================
 	"GET /api/v1/admin/docs":           {"文档管理", "文档列表", "doc_list_read", "doc"},
@@ -559,11 +693,45 @@ func Lookup(method, fullPath string) (RouteMeta, bool) {
 	return RouteMeta{}, false
 }
 
+// LookupAuditMeta 返回写操作审计元数据。
+// 已登记路由使用精确配置；少量用户侧敏感写操作漏配时，退回到统一兜底分类，避免完全无痕。
+func LookupAuditMeta(method, fullPath string) (RouteMeta, bool) {
+	if !isWriteMethod(method) {
+		return RouteMeta{}, false
+	}
+	if m, ok := routeMap[method+" "+fullPath]; ok {
+		return m, true
+	}
+	return fallbackWriteMeta(method, fullPath)
+}
+
 // IsAuditRelevant 返回给定路由是否应记录审计日志
 // 语义：写操作表命中 → true；读操作表命中或未命中 → false
 func IsAuditRelevant(method, fullPath string) bool {
 	_, ok := routeMap[method+" "+fullPath]
 	return ok
+}
+
+func isWriteMethod(method string) bool {
+	switch method {
+	case "POST", "PUT", "PATCH", "DELETE":
+		return true
+	default:
+		return false
+	}
+}
+
+func fallbackWriteMeta(method, fullPath string) (RouteMeta, bool) {
+	switch {
+	case strings.HasPrefix(fullPath, "/api/v1/auth/"):
+		return RouteMeta{"账户安全", "账户敏感操作", "auth_sensitive_write", "auth"}, true
+	case strings.HasPrefix(fullPath, "/api/v1/user/"):
+		return RouteMeta{"用户中心", "用户敏感操作", "user_sensitive_write", "user"}, true
+	case strings.HasPrefix(fullPath, "/api/v1/payment/"):
+		return RouteMeta{"订单管理", "支付敏感操作", "payment_sensitive_write", "payment"}, true
+	default:
+		return RouteMeta{}, false
+	}
 }
 
 // Entry 单条路由条目（含方法/路径 + 元数据 + 读写标志），供 RBAC seed 使用

@@ -17,6 +17,11 @@ const slowThreshold = 3 * time.Second
 // 记录每个请求的信息到 access.log，慢请求额外记录到 slow.log
 func RequestLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if IsHealthPath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+
 		// 生成或复用 X-Request-ID（支持跨服务传递：Nginx/Gateway → Backend）
 		requestID := c.GetHeader("X-Request-ID")
 		if requestID == "" {
@@ -27,11 +32,14 @@ func RequestLogger() gin.HandlerFunc {
 		c.Header("X-Request-ID", requestID)
 
 		start := time.Now()
+		startPerfTrace(c, start)
 
 		c.Next()
 
-		latency := time.Since(start)
+		now := time.Now()
+		latency := now.Sub(start)
 		status := c.Writer.Status()
+		perfStages := finishPerfTrace(c, now)
 
 		fields := []zap.Field{
 			zap.String("request_id", requestID),
@@ -42,6 +50,9 @@ func RequestLogger() gin.HandlerFunc {
 			zap.Duration("latency", latency),
 			zap.String("client_ip", c.ClientIP()),
 			zap.String("user_agent", c.Request.UserAgent()),
+		}
+		if perfStages != "" {
+			fields = append(fields, zap.String("perf_stages", perfStages))
 		}
 
 		// 记录到 access.log

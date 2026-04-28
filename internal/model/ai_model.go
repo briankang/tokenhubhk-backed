@@ -42,43 +42,44 @@ const (
 // - error: 验证失败或API异常
 type AIModel struct {
 	BaseModel
-	CategoryID          uint    `gorm:"index;not null" json:"category_id"`                          // 分类 ID
-	SupplierID          uint    `gorm:"index;not null" json:"supplier_id"`                          // 供应商 ID
-	ModelName           string  `gorm:"type:varchar(100);not null;index" json:"model_name"`          // 模型名称（如 gpt-4o）
-	DisplayName         string  `gorm:"type:varchar(255)" json:"display_name"`                      // 展示名称
-	Description         string  `gorm:"type:text" json:"description,omitempty"`                     // 描述
-	IsActive            bool    `gorm:"default:true" json:"is_active"`                              // 是否启用（管理开关）
-	Status              string  `gorm:"type:varchar(20);default:'offline';index" json:"status"`     // 状态: offline(默认)/online/error
-	MaxTokens           int     `gorm:"default:4096" json:"max_tokens"`                             // 最大输出 Token 数
-	ContextWindow       int     `gorm:"default:4096" json:"context_window"`                         // 上下文窗口大小
-	InputPricePerToken  int64   `gorm:"type:bigint;default:0" json:"input_price_per_token"`          // 输入成本价 (每百万token积分)
-	InputCostRMB        float64 `gorm:"type:decimal(16,4);default:0" json:"input_cost_rmb"`          // 输入成本价 (每百万token人民币)
-	OutputPricePerToken int64   `gorm:"type:bigint;default:0" json:"output_price_per_token"`         // 输出成本价 (每百万token积分)
-	OutputCostRMB       float64 `gorm:"type:decimal(16,4);default:0" json:"output_cost_rmb"`         // 输出成本价 (每百万token人民币)
+	CategoryID          uint    `gorm:"index;not null" json:"category_id"`                      // 分类 ID
+	SupplierID          uint    `gorm:"index;not null" json:"supplier_id"`                      // 供应商 ID
+	ModelName           string  `gorm:"type:varchar(100);not null;index" json:"model_name"`     // 模型名称（如 gpt-4o）
+	DisplayName         string  `gorm:"type:varchar(255)" json:"display_name"`                  // 展示名称
+	Description         string  `gorm:"type:text" json:"description,omitempty"`                 // 描述
+	IsActive            bool    `gorm:"default:true" json:"is_active"`                          // 是否启用（管理开关）
+	Status              string  `gorm:"type:varchar(20);default:'offline';index" json:"status"` // 状态: offline(默认)/online/error
+	MaxTokens           int     `gorm:"default:4096" json:"max_tokens"`                         // 最大输出 Token 数
+	ContextWindow       int     `gorm:"default:4096" json:"context_window"`                     // 上下文窗口大小
+	InputPricePerToken  int64   `gorm:"type:bigint;default:0" json:"input_price_per_token"`     // 输入成本价 (每百万token积分)
+	InputCostRMB        float64 `gorm:"type:decimal(16,4);default:0" json:"input_cost_rmb"`     // 输入成本价 (每百万token人民币)
+	OutputPricePerToken int64   `gorm:"type:bigint;default:0" json:"output_price_per_token"`    // 输出成本价 (每百万token积分)
+	OutputCostRMB       float64 `gorm:"type:decimal(16,4);default:0" json:"output_cost_rmb"`    // 输出成本价 (每百万token人民币)
 	// OutputCostThinkingRMB: 思考模式输出成本价（元/百万token）
 	// 0 = 不区分思考模式（默认与 OutputCostRMB 相同计费）；>0 = 思考模式走独立价格（如阿里云 qwen3.5-plus 思考链 12 元/M，非思考 0.6 元/M）
-	OutputCostThinkingRMB float64 `gorm:"type:decimal(16,4);default:0" json:"output_cost_thinking_rmb"` // 思考模式输出成本价
-	Currency              string  `gorm:"type:varchar(10);default:'CREDIT'" json:"currency"`             // 币种 CREDIT
-	Source              string     `gorm:"type:varchar(20);default:'manual'" json:"source"`           // manual=手动创建, auto=自动发现
-	LastSyncedAt        *time.Time `json:"last_synced_at,omitempty"`                                  // 上次自动同步时间
+	OutputCostThinkingRMB float64    `gorm:"type:decimal(16,4);default:0" json:"output_cost_thinking_rmb"` // 思考模式输出成本价
+	Currency              string     `gorm:"type:varchar(10);default:'CREDIT'" json:"currency"`            // 币种 CREDIT
+	Source                string     `gorm:"type:varchar(20);default:'manual'" json:"source"`              // manual=手动创建, auto=自动发现
+	LastSyncedAt          *time.Time `json:"last_synced_at,omitempty"`                                     // 上次自动同步时间
 
 	// --- 扩展字段（来源于供应商 API 同步） ---
-	ModelType        string `gorm:"type:varchar(50);default:'LLM'" json:"model_type"`           // 模型类型: LLM/VLM/Embedding/ImageGeneration/VideoGeneration 等
-	Version          string `gorm:"type:varchar(100)" json:"version,omitempty"`                 // 模型版本号（火山引擎返回）
-	Domain           string `gorm:"type:varchar(50)" json:"domain,omitempty"`                   // 模型领域（火山引擎原始 domain 字段）
-	TaskTypes        JSON   `gorm:"type:json" json:"task_types,omitempty"`                      // 任务类型列表（如 ["chat","completion"]）
-	InputModalities  JSON   `gorm:"type:json" json:"input_modalities,omitempty"`                // 输入模态（如 ["text","image"]）
-	OutputModalities JSON   `gorm:"type:json" json:"output_modalities,omitempty"`               // 输出模态（如 ["text"]）
-	MaxInputTokens   int    `gorm:"default:0" json:"max_input_tokens"`                         // 最大输入 Token 数（供应商返回）
-	MaxOutputTokens  int    `gorm:"default:0" json:"max_output_tokens"`                        // 最大输出 Token 数（供应商返回，区别于手动设置的 MaxTokens）
-	Features         JSON   `gorm:"type:json" json:"features,omitempty"`                        // 模型特性（如流式/函数调用/JSON模式等，完整 JSON）
-	SupplierStatus   string `gorm:"type:varchar(50);default:'Active'" json:"supplier_status"`   // 供应商侧模型状态（Active/Deprecated 等）
-	ApiCreatedAt     int64  `gorm:"default:0" json:"api_created_at"`                            // 供应商 API 返回的模型创建时间（Unix 时间戳）
-	PricingUnit      string `gorm:"type:varchar(50);default:'per_million_tokens'" json:"pricing_unit"` // 计费单位: per_million_tokens/per_image/per_second/per_minute/per_10k_characters/per_million_characters/per_call/per_hour
-	Variant          string `gorm:"type:varchar(50);default:''" json:"variant,omitempty"`      // 变体/质量档（如 1024x1024、hd、low-latency），同一模型不同 variant 独立定价
-	PriceTiers       JSON   `gorm:"type:json" json:"price_tiers,omitempty"`                    // 阶梯价格配置（供应商原始数据，JSON 格式的 PriceTiersData）
-	ExtraParams      JSON   `gorm:"type:json" json:"extra_params,omitempty"`                  // 自定义参数（传递给上游供应商的额外参数，如 enable_thinking）
-	VideoPricingConfig JSON `gorm:"type:json" json:"video_pricing_config,omitempty"`          // 视频生成模型特殊计价配置（仅 VideoGeneration 类型使用，JSON 格式的 VideoPricingConfig）
+	ModelType          string `gorm:"type:varchar(50);default:'LLM'" json:"model_type"`                  // 模型类型: LLM/VLM/Embedding/ImageGeneration/VideoGeneration 等
+	Version            string `gorm:"type:varchar(100)" json:"version,omitempty"`                        // 模型版本号（火山引擎返回）
+	Domain             string `gorm:"type:varchar(50)" json:"domain,omitempty"`                          // 模型领域（火山引擎原始 domain 字段）
+	TaskTypes          JSON   `gorm:"type:json" json:"task_types,omitempty"`                             // 任务类型列表（如 ["chat","completion"]）
+	InputModalities    JSON   `gorm:"type:json" json:"input_modalities,omitempty"`                       // 输入模态（如 ["text","image"]）
+	OutputModalities   JSON   `gorm:"type:json" json:"output_modalities,omitempty"`                      // 输出模态（如 ["text"]）
+	MaxInputTokens     int    `gorm:"default:0" json:"max_input_tokens"`                                 // 最大输入 Token 数（供应商返回）
+	MaxOutputTokens    int    `gorm:"default:0" json:"max_output_tokens"`                                // 最大输出 Token 数（供应商返回，区别于手动设置的 MaxTokens）
+	Features           JSON   `gorm:"type:json" json:"features,omitempty"`                               // 模型特性（如流式/函数调用/JSON模式等，完整 JSON）
+	SupplierStatus     string `gorm:"type:varchar(50);default:'Active'" json:"supplier_status"`          // 供应商侧模型状态（Active/Deprecated 等）
+	ApiCreatedAt       int64  `gorm:"default:0" json:"api_created_at"`                                   // 供应商 API 返回的模型创建时间（Unix 时间戳）
+	PricingUnit        string `gorm:"type:varchar(50);default:'per_million_tokens'" json:"pricing_unit"` // 计费单位: per_million_tokens/per_image/per_second/per_minute/per_10k_characters/per_million_characters/per_call/per_hour
+	Variant            string `gorm:"type:varchar(50);default:''" json:"variant,omitempty"`              // 变体/质量档（如 1024x1024、hd、low-latency），同一模型不同 variant 独立定价
+	PriceTiers         JSON   `gorm:"type:json" json:"price_tiers,omitempty"`                            // 阶梯价格配置（供应商原始数据，JSON 格式的 PriceTiersData）
+	ExtraParams        JSON   `gorm:"type:json" json:"extra_params,omitempty"`                           // 自定义参数（传递给上游供应商的额外参数，如 enable_thinking）
+	VideoPricingConfig JSON   `gorm:"type:json" json:"video_pricing_config,omitempty"`                   // 视频生成模型特殊计价配置（仅 VideoGeneration 类型使用，JSON 格式的 VideoPricingConfig）
+	DimensionConfig    JSON   `gorm:"type:json" json:"dimension_config,omitempty"`                       // 业务维度声明（M2, 2026-04-28），JSON 格式的 ModelDimensionConfig，定义该模型支持的维度（resolution/audio_mode 等），驱动前端 schema-driven 矩阵编辑器与计费链路 dim 校验
 
 	// --- 缓存定价字段 ---
 	// cache_mechanism: 缓存机制类型
@@ -86,22 +87,35 @@ type AIModel struct {
 	//   explicit - 需显式传 cache_control 参数（Anthropic）
 	//   both     - 同时支持隐式(auto)和显式(explicit)，如阿里云百炼
 	//   none     - 不支持缓存（默认）
-	SupportsCache              bool    `gorm:"default:false" json:"supports_cache"`                               // 是否支持缓存定价
-	CacheMechanism             string  `gorm:"type:varchar(20);default:'none'" json:"cache_mechanism"`            // 缓存机制: auto/explicit/both/none
-	CacheMinTokens             int     `gorm:"default:0" json:"cache_min_tokens"`                                 // 触发缓存的最小Token门槛（用于自动注入 cache_control 时的判断）
-	CacheInputPriceRMB         float64 `gorm:"type:decimal(20,6);default:0" json:"cache_input_price_rmb"`         // 缓存命中(隐式/auto)输入价，元/百万Token
+	SupportsCache              bool    `gorm:"default:false" json:"supports_cache"`                                // 是否支持缓存定价
+	CacheMechanism             string  `gorm:"type:varchar(20);default:'none'" json:"cache_mechanism"`             // 缓存机制: auto/explicit/both/none
+	CacheMinTokens             int     `gorm:"default:0" json:"cache_min_tokens"`                                  // 触发缓存的最小Token门槛（用于自动注入 cache_control 时的判断）
+	CacheInputPriceRMB         float64 `gorm:"type:decimal(20,6);default:0" json:"cache_input_price_rmb"`          // 缓存命中(隐式/auto)输入价，元/百万Token
 	CacheExplicitInputPriceRMB float64 `gorm:"type:decimal(20,6);default:0" json:"cache_explicit_input_price_rmb"` // 显式缓存命中价，元/百万Token（both模式专用，如阿里云显式缓存）
-	CacheWritePriceRMB         float64 `gorm:"type:decimal(20,6);default:0" json:"cache_write_price_rmb"`         // 缓存写入溢价，元/百万Token（Anthropic/阿里云显式缓存专用）
-	CacheStoragePriceRMB       float64 `gorm:"type:decimal(20,6);default:0" json:"cache_storage_price_rmb"`       // 缓存存储价，元/百万Token/小时（火山引擎/Gemini显式缓存）
-	Tags             string  `gorm:"type:varchar(500)" json:"tags,omitempty"`                 // 搜索标签（逗号分隔，如 "DeepSeek,深度求索"），支持跨供应商搜索
-	CallCount        int64   `gorm:"type:bigint;default:0;index" json:"call_count"`           // 累计调用次数
-	Discount         float64 `gorm:"type:decimal(5,4);default:0" json:"discount"`             // 模型独立折扣（0=未设置，继承供应商折扣；>0 如0.85=85折）
+	CacheWritePriceRMB         float64 `gorm:"type:decimal(20,6);default:0" json:"cache_write_price_rmb"`          // 缓存写入溢价，元/百万Token（Anthropic/阿里云显式缓存专用）
+	CacheStoragePriceRMB       float64 `gorm:"type:decimal(20,6);default:0" json:"cache_storage_price_rmb"`        // 缓存存储价，元/百万Token/小时（火山引擎/Gemini显式缓存）
+	PriceSourceCurrency        string  `gorm:"type:varchar(10);default:'CNY'" json:"price_source_currency"`        // 官方原始价格币种，美元来源换算入库时保留 USD
+	PriceSourceExchangeRate    float64 `gorm:"type:decimal(16,6);default:0" json:"price_source_exchange_rate"`     // 原始币种换人民币所用汇率
+	InputCostUSD               float64 `gorm:"type:decimal(20,6);default:0" json:"input_cost_usd"`                 // 换汇前输入成本价，美元/百万Token
+	OutputCostUSD              float64 `gorm:"type:decimal(20,6);default:0" json:"output_cost_usd"`                // 换汇前输出成本价，美元/百万Token
+	OutputCostThinkingUSD      float64 `gorm:"type:decimal(20,6);default:0" json:"output_cost_thinking_usd"`       // 换汇前思考输出成本价，美元/百万Token
+	CacheInputPriceUSD         float64 `gorm:"type:decimal(20,6);default:0" json:"cache_input_price_usd"`          // 换汇前缓存命中价，美元/百万Token
+	CacheExplicitInputPriceUSD float64 `gorm:"type:decimal(20,6);default:0" json:"cache_explicit_input_price_usd"` // 换汇前显式缓存命中价，美元/百万Token
+	CacheWritePriceUSD         float64 `gorm:"type:decimal(20,6);default:0" json:"cache_write_price_usd"`          // 换汇前缓存写入价，美元/百万Token
+	CacheStoragePriceUSD       float64 `gorm:"type:decimal(20,6);default:0" json:"cache_storage_price_usd"`        // 换汇前缓存存储价，美元/百万Token/小时
+	Tags                       string  `gorm:"type:varchar(500)" json:"tags,omitempty"`                            // 搜索标签（逗号分隔，如 "DeepSeek,深度求索"），支持跨供应商搜索
+	CallCount                  int64   `gorm:"type:bigint;default:0;index" json:"call_count"`                      // 累计调用次数
+	Discount                   float64 `gorm:"type:decimal(5,4);default:0" json:"discount"`                        // 模型独立折扣（0=未设置，继承供应商折扣；>0 如0.85=85折）
+	// OfficialPriceURL 模型级官方定价页 URL 覆盖（可空）
+	// 优先级:AIModel.OfficialPriceURL > Supplier.PricingURLs[type_hint 匹配] > Supplier.PricingURL
+	// 留空时由 official_price_resolver 自动按供应商规则解析,允许管理员手动覆盖
+	OfficialPriceURL string `gorm:"type:varchar(500)" json:"official_price_url,omitempty"`
 	// v5.1: 标记免费层可用模型（Free 用户仅能调用 IsFreeTier=true 的模型，充值 >=10 元后解锁全部模型）
-	IsFreeTier       bool    `gorm:"default:false" json:"is_free_tier"`
+	IsFreeTier bool `gorm:"default:false" json:"is_free_tier"`
 
 	Category ModelCategory `gorm:"foreignKey:CategoryID" json:"category,omitempty"` // 关联分类
 	Supplier Supplier      `gorm:"foreignKey:SupplierID" json:"supplier,omitempty"` // 关联供应商
-	Pricing  *ModelPricing  `gorm:"foreignKey:ModelID" json:"pricing,omitempty"`     // 关联售价
+	Pricing  *ModelPricing `gorm:"foreignKey:ModelID" json:"pricing,omitempty"`     // 关联售价
 }
 
 // TableName 指定 AI 模型表名

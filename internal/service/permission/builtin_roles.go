@@ -8,10 +8,10 @@ package permission
 
 // BuiltinRole 内置角色定义
 type BuiltinRole struct {
-	Code        string   // 角色唯一代码
-	Name        string   // 展示名
-	Description string   // 描述
-	DataScope   string   // 数据范围类型：all / own_tenant / own_only
+	Code        string // 角色唯一代码
+	Name        string // 展示名
+	Description string // 描述
+	DataScope   string // 数据范围类型：all / own_tenant / own_only
 	// 权限选取方式（三选一）：
 	AllPermissions bool     // 勾选全部（仅 SUPER_ADMIN）
 	AllReadOnly    bool     // 所有 *_read 权限（仅 AUDITOR）
@@ -50,6 +50,11 @@ var BuiltinRoles = []BuiltinRole{
 			"user_discount_preview",
 			"user_discount_update",
 			"user_discount_delete",
+			// 计费准确性整改：月度账单对账
+			"billing_reconcile_create",
+			// Phase 0 三方一致性核对（财务对账时定位偏差原因）
+			"cost_three_way_check_read",
+			"cost_consistency_scan_read",
 		},
 	},
 	{
@@ -78,14 +83,20 @@ var BuiltinRoles = []BuiltinRole{
 	{
 		Code:        "AI_RESOURCE_MANAGER",
 		Name:        "AI 资源管理员",
-		Description: "负责供应商、渠道、模型、定价与能力测试",
+		Description: "负责供应商、渠道、模型、定价、价格分析与能力测试",
 		DataScope:   "all",
 		Menus: []string{
 			"供应商管理",
 			"渠道管理",
 			"模型管理",
 			"定价管理",
+			"价格分析", // v3 引入,覆盖 BillingQuote 试算/PriceMatrix 编辑等
 			"能力测试",
+		},
+		ExtraCodes: []string{
+			// Phase 0 三方一致性核对（AI 资源管理员需排查"价格变更后偏差"）
+			"cost_three_way_check_read",
+			"cost_consistency_scan_read",
 		},
 	},
 	{

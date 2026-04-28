@@ -100,6 +100,14 @@ func RunSeedLabelDictionary(db *gorm.DB) {
 			NameFr: "Prix de vente à définir", NameDe: "Verkaufspreis offen", NameRu: "Нужна цена продажи",
 			Color: "amber", Icon: "alert-circle", Category: "pricing", Priority: 20, IsActive: true},
 
+		// ============ 系统内部审核标识（category=system）============
+		{Key: "needs_review", NameZhCN: "待审核", NameZhTW: "待審核", NameEn: "Needs Review",
+			NameJa: "審査待ち", NameKo: "검토 필요", NameEs: "Pendiente revisión",
+			NameFr: "À examiner", NameDe: "Prüfung erforderlich", NameRu: "Требуется проверка",
+			NameAr: "بحاجة إلى مراجعة", NamePt: "Aguarda revisão", NameVi: "Cần xét duyệt",
+			NameTh: "รอตรวจสอบ", NameId: "Perlu ditinjau", NameHi: "समीक्षा आवश्यक",
+			Color: "amber", Icon: "alert-circle", Category: "system", Priority: 25, IsActive: true},
+
 		// ============ 供应商品牌（category=brand）============
 		{Key: "qwen", NameZhCN: "通义千问", NameZhTW: "通義千問", NameEn: "Qwen",
 			Color: "blue", Category: "brand", IsActive: true},

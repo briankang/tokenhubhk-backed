@@ -27,14 +27,13 @@ func (h *PaymentHandler) Register(rg *gin.RouterGroup) {
 	rg.POST("/payment/create", h.Create)
 	rg.GET("/payment/query/:orderNo", h.Query)
 	rg.GET("/payment/list", h.List)
-	rg.POST("/payment/refund/:orderNo", h.Refund)
 }
 
 // createPaymentReq 创建支付请求结构体
 type createPaymentReq struct {
-	Gateway   string  `json:"gateway" binding:"required"`   // wechat / alipay / stripe / paypal
+	Gateway   string  `json:"gateway" binding:"required"` // wechat / alipay / stripe / paypal
 	Amount    float64 `json:"amount" binding:"required,gt=0"`
-	Currency  string  `json:"currency" binding:"required"`  // CNY / USD
+	Currency  string  `json:"currency" binding:"required"` // CNY / USD
 	Subject   string  `json:"subject" binding:"required"`
 	ReturnURL string  `json:"return_url"`
 }
@@ -145,7 +144,7 @@ type refundReq struct {
 	Reason string  `json:"reason" binding:"required"`
 }
 
-// Refund 处理退款请求 POST /api/v1/payment/refund/:orderNo（需要管理员权限）
+// Refund 处理旧版订单号退款逻辑；路由已下线，新后台退款入口在 PaymentAdminHandler。
 func (h *PaymentHandler) Refund(c *gin.Context) {
 	orderNo := c.Param("orderNo")
 	if orderNo == "" {

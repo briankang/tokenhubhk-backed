@@ -179,7 +179,9 @@ func classifyAgainstUpstream(m model.AIModel, snapshots map[uint]*upstreamSnapsh
 // 空字符串视为 LLM（按数据库默认值 default:'LLM'）
 //
 // 注意：数据库实际存储的 ModelType 值见 model/ai_model.go 的常量定义：
-//   LLM / Vision / Embedding / ImageGeneration / VideoGeneration / TTS / ASR / Rerank
+//
+//	LLM / Vision / Embedding / ImageGeneration / VideoGeneration / TTS / ASR / Rerank
+//
 // 历史/兼容值还有: VLM / Reasoning（部分供应商）
 // 此函数返回 true 的类型应能在 /v1/models 返回的清单中找到
 func isLLMLikeType(modelType string) bool {
@@ -394,18 +396,24 @@ func (mc *ModelChecker) createDeprecationAnnouncements(ctx context.Context, depr
 		if supplierName == "" {
 			supplierName = fmt.Sprintf("供应商#%d", sid)
 		}
+		supplierNameEn := deprecationAnnouncementSupplierNameEn(supplierName)
 		title := fmt.Sprintf("【%s】部分模型已官方下架", supplierName)
+		titleEn := fmt.Sprintf("[%s] Some models have been officially removed", supplierNameEn)
 
 		var contentBuilder strings.Builder
+		var contentEnBuilder strings.Builder
 		contentBuilder.WriteString(fmt.Sprintf("以下模型已被供应商 **%s** 从官方 API 移除，系统已自动下线：\n\n", supplierName))
+		contentEnBuilder.WriteString(fmt.Sprintf("The following models have been removed from the official API by provider **%s**. The system has automatically taken them offline:\n\n", supplierNameEn))
 		for _, m := range list {
 			name := m.DisplayName
 			if name == "" {
 				name = m.ModelName
 			}
 			contentBuilder.WriteString(fmt.Sprintf("- `%s`\n", name))
+			contentEnBuilder.WriteString(fmt.Sprintf("- `%s`\n", name))
 		}
 		contentBuilder.WriteString("\n如需继续使用相关能力，请前往「模型市场」选择替代方案。本公告将在 7 天后自动过期。")
+		contentEnBuilder.WriteString("\nTo continue using related capabilities, go to Model Marketplace and choose an alternative. This notice will expire automatically in 7 days.")
 
 		// 持久化关联的模型 ID 列表（用于一键检测时跳过已确认下线模型）
 		ids := make([]uint, 0, len(list))
@@ -416,7 +424,9 @@ func (mc *ModelChecker) createDeprecationAnnouncements(ctx context.Context, depr
 
 		ann := &model.Announcement{
 			Title:      title,
+			TitleEn:    titleEn,
 			Content:    contentBuilder.String(),
+			ContentEn:  contentEnBuilder.String(),
 			Type:       "model_deprecation",
 			Priority:   "high",
 			Status:     "active",
@@ -438,6 +448,31 @@ func (mc *ModelChecker) createDeprecationAnnouncements(ctx context.Context, depr
 	}
 
 	return lastID
+}
+
+func deprecationAnnouncementSupplierNameEn(name string) string {
+	switch strings.TrimSpace(name) {
+	case "百度千帆":
+		return "Baidu Qianfan"
+	case "百度文心":
+		return "Baidu Wenxin"
+	case "阿里云百炼":
+		return "Alibaba Cloud Bailian"
+	case "阿里云":
+		return "Alibaba Cloud"
+	case "通义千问":
+		return "Qwen"
+	case "火山引擎":
+		return "Volcengine"
+	case "腾讯混元":
+		return "Tencent Hunyuan"
+	case "智谱":
+		return "Zhipu AI"
+	case "月之暗面":
+		return "Moonshot AI"
+	default:
+		return name
+	}
 }
 
 // IsModelMarkedUnavailableSoft 放宽版的失败标记查询（替代旧 IsModelMarkedUnavailable）
@@ -483,4 +518,3 @@ func (mc *ModelChecker) IsModelMarkedUnavailableSoft(ctx context.Context, modelN
 	// 上游已下架 → 跳过；连续失败达到阈值 → 跳过
 	return hasDeprecated || len(logs) >= FailureThreshold
 }
-

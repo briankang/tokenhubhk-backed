@@ -73,7 +73,7 @@ func TestScheduler_UpdateTaskRun(t *testing.T) {
 	s.registerTask("run_test", "hourly", true)
 
 	// Update with success
-	s.updateTaskRun("run_test", nil)
+	s.updateTaskRun("run_test", nil, 1500*time.Millisecond, "ok")
 	tasks := s.GetTasks()
 	for _, task := range tasks {
 		if task.Name == "run_test" {
@@ -83,16 +83,24 @@ func TestScheduler_UpdateTaskRun(t *testing.T) {
 			if task.LastErr != "" {
 				t.Error("LastErr should be empty on success")
 			}
+			if task.LastStatus != "completed" || task.LastDurationMs != 1500 || task.LastSummary != "ok" {
+				t.Fatalf("unexpected task status fields: status=%s duration=%d summary=%s",
+					task.LastStatus, task.LastDurationMs, task.LastSummary)
+			}
 		}
 	}
 
 	// Update with error
-	s.updateTaskRun("run_test", fmt.Errorf("test error"))
+	s.updateTaskRun("run_test", fmt.Errorf("test error"), 2*time.Second, "failed")
 	tasks = s.GetTasks()
 	for _, task := range tasks {
 		if task.Name == "run_test" {
 			if task.LastErr != "test error" {
 				t.Errorf("expected error 'test error', got '%s'", task.LastErr)
+			}
+			if task.LastStatus != "failed" || task.LastDurationMs != 2000 || task.LastSummary != "failed" {
+				t.Fatalf("unexpected failed task status fields: status=%s duration=%d summary=%s",
+					task.LastStatus, task.LastDurationMs, task.LastSummary)
 			}
 		}
 	}
@@ -131,6 +139,47 @@ func TestScheduler_SafeRunNamed_RunsEnabled(t *testing.T) {
 
 	if !executed {
 		t.Error("enabled task should have been executed")
+	}
+}
+
+func TestScheduler_SafeRunNamed_RecordsRunHistory(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.CronTaskRun{}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Scheduler{
+		db:     db,
+		tasks:  make(map[string]*TaskInfo),
+		stopCh: make(chan struct{}),
+	}
+	s.registerTask("history_task", "test", true)
+
+	s.safeRunNamed("history_task", "历史任务测试", func(ctx context.Context) error {
+		SetTaskRunOutput(ctx, "处理完成 3 条", map[string]interface{}{"processed": 3})
+		return nil
+	})
+
+	var run model.CronTaskRun
+	if err := db.First(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	if run.TaskName != "history_task" || run.Status != "completed" || run.OutputSummary != "处理完成 3 条" {
+		t.Fatalf("unexpected run history: %+v", run)
+	}
+	if run.CompletedAt == nil || run.DurationMs < 0 || run.OutputJSON == "" {
+		t.Fatalf("run history missing detail fields: %+v", run)
+	}
+
+	runs, total, err := s.ListTaskRuns("history_task", "", "", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(runs) != 1 {
+		t.Fatalf("expected 1 run, total=%d len=%d", total, len(runs))
 	}
 }
 

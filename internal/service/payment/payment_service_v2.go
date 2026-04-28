@@ -41,9 +41,10 @@ type UsdToCnyFetcher interface {
 // 根据 payment 的 gateway 字段寻找对应网关实例并调用其 Refund 方法
 //
 // 开发旁路（PAYMENT_CALLBACK_DEV_BYPASS=true）：
-//   跳过真实网关调用，直接返回模拟成功的 RefundResult。
-//   仅用于本地/沙盒环境验证退款审计链路（refund_requests/payments/user_balances/balance_records）。
-//   生产环境必须保持 PAYMENT_CALLBACK_DEV_BYPASS=false。
+//
+//	跳过真实网关调用，直接返回模拟成功的 RefundResult。
+//	仅用于本地/沙盒环境验证退款审计链路（refund_requests/payments/user_balances/balance_records）。
+//	生产环境必须保持 PAYMENT_CALLBACK_DEV_BYPASS=false。
 func (s *PaymentService) InvokeGatewayRefund(ctx context.Context, payment *model.Payment, amount float64, reason string) (*RefundResult, error) {
 	if payment == nil {
 		return nil, fmt.Errorf("nil payment")
@@ -225,6 +226,7 @@ func (s *PaymentService) createOrderOnce(ctx context.Context, req CreatePaymentW
 		CreditAmount:      exchangeResult.CreditAmount,
 		Currency:          "CREDIT",
 		Gateway:           req.Gateway,
+		OrderNo:           &orderNo,
 		Status:            model.PaymentStatusPending,
 		ProviderAccountID: accID,
 		DisplayCurrency:   req.Currency,
@@ -347,12 +349,12 @@ func (s *PaymentService) createWithoutRouting(ctx context.Context, req CreatePay
 	// 补写双币快照（通过 order_no 找回 payment 更新）
 	if result != nil && result.OrderNo != "" && (displayCNY > 0 || displayUSD > 0) {
 		_ = s.db.WithContext(ctx).Model(&model.Payment{}).
-			Where("JSON_EXTRACT(metadata, '$.order_no') = ?", result.OrderNo).
+			Where("order_no = ?", result.OrderNo).
 			Updates(map[string]interface{}{
-				"display_currency":    req.Currency,
-				"display_amount_usd":  displayUSD,
-				"display_amount_cny":  displayCNY,
-				"exchange_rate_used":  rateUsed,
+				"display_currency":   req.Currency,
+				"display_amount_usd": displayUSD,
+				"display_amount_cny": displayCNY,
+				"exchange_rate_used": rateUsed,
 			}).Error
 	}
 	return result, nil
@@ -364,8 +366,11 @@ func pUint64Ptr(v uint) *uint64 {
 	return &u
 }
 
-// extractOrderNoFromMeta 从 payment.Metadata 中提取 order_no
+// extractOrderNoFromMeta 优先从实体列读取 order_no，并回退到历史 metadata。
 func extractOrderNoFromMeta(p *model.Payment) string {
+	if p.OrderNo != nil && *p.OrderNo != "" {
+		return *p.OrderNo
+	}
 	if len(p.Metadata) == 0 {
 		return ""
 	}

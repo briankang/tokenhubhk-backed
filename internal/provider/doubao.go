@@ -52,7 +52,7 @@ func NewDoubaoProvider(cfg ProviderConfig) *DoubaoProvider {
 	}
 }
 
-func (p *DoubaoProvider) Name() string      { return "doubao" }
+func (p *DoubaoProvider) Name() string        { return "doubao" }
 func (p *DoubaoProvider) ModelList() []string { return doubaoModels }
 
 func (p *DoubaoProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
@@ -146,7 +146,7 @@ type volcImageRequest struct {
 
 // volcImageResponse 火山引擎图像响应
 type volcImageResponse struct {
-	Created int64 `json:"created"`
+	Created int64  `json:"created"`
 	Model   string `json:"model"`
 	Data    []struct {
 		URL     string `json:"url,omitempty"`
@@ -225,14 +225,22 @@ const (
 // volcVideoSubmitRequest 火山引擎视频生成提交请求
 // 参考: https://www.volcengine.com/docs/82379/1521309
 type volcVideoSubmitRequest struct {
-	Model   string                 `json:"model"`
-	Content []volcVideoContentItem `json:"content"`
+	Model           string                 `json:"model"`
+	Content         []volcVideoContentItem `json:"content"`
+	GenerateAudio   *bool                  `json:"generate_audio,omitempty"`
+	Draft           *bool                  `json:"draft,omitempty"`
+	Resolution      string                 `json:"resolution,omitempty"`
+	Ratio           string                 `json:"ratio,omitempty"`
+	Duration        int                    `json:"duration,omitempty"`
+	FramesPerSecond int                    `json:"framespersecond,omitempty"`
+	ServiceTier     string                 `json:"service_tier,omitempty"`
 }
 
 type volcVideoContentItem struct {
-	Type     string                 `json:"type"`                // text / image_url
+	Type     string                 `json:"type"` // text / image_url / video_url
 	Text     string                 `json:"text,omitempty"`
 	ImageURL map[string]interface{} `json:"image_url,omitempty"` // {"url":"..."}
+	VideoURL string                 `json:"video_url,omitempty"`
 }
 
 type volcVideoSubmitResponse struct {
@@ -262,17 +270,7 @@ func (p *DoubaoProvider) GenerateVideo(ctx context.Context, req *VideoRequest) (
 		return nil, fmt.Errorf("provider doubao: prompt is required")
 	}
 
-	// 拼接 prompt：附加分辨率/时长/比例参数（火山引擎规范参数直接写在文本里）
 	promptText := req.Prompt
-	if req.Resolution != "" {
-		promptText += " --resolution " + req.Resolution
-	}
-	if req.Duration > 0 {
-		promptText += fmt.Sprintf(" --duration %d", req.Duration)
-	}
-	if req.AspectRatio != "" {
-		promptText += " --ratio " + req.AspectRatio
-	}
 
 	content := []volcVideoContentItem{{Type: "text", Text: promptText}}
 	if req.ImageURL != "" {
@@ -281,10 +279,23 @@ func (p *DoubaoProvider) GenerateVideo(ctx context.Context, req *VideoRequest) (
 			ImageURL: map[string]interface{}{"url": req.ImageURL},
 		})
 	}
+	if req.VideoURL != "" {
+		content = append(content, volcVideoContentItem{
+			Type:     "video_url",
+			VideoURL: req.VideoURL,
+		})
+	}
 
 	submitReq := &volcVideoSubmitRequest{
-		Model:   req.Model,
-		Content: content,
+		Model:           req.Model,
+		Content:         content,
+		GenerateAudio:   req.GenerateAudio,
+		Draft:           req.Draft,
+		Resolution:      strings.ToLower(req.Resolution),
+		Ratio:           req.AspectRatio,
+		Duration:        req.Duration,
+		FramesPerSecond: req.FPS,
+		ServiceTier:     req.ServiceTier,
 	}
 	body, err := MarshalWithExtra(submitReq, req.Extra)
 	if err != nil {

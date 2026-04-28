@@ -509,7 +509,7 @@ func getQianfanSupplementaryPrices() []ScrapedModel {
 
 // normalizeModelID 规范化模型 ID 用于比较（小写 + 去空格）
 func normalizeModelID(id string) string {
-	return strings.ToLower(strings.TrimSpace(id))
+	return NormalizeModelName(id)
 }
 
 // inferQianfanDisplayName 根据模型 ID 推断展示名称
@@ -655,6 +655,11 @@ func GetQianfanDeprecatedModels() map[string]QianfanDeprecation {
 
 // IsQianfanDeprecated 判断模型是否已被千帆官方下线
 func IsQianfanDeprecated(modelName string) (QianfanDeprecation, bool) {
-	dep, ok := GetQianfanDeprecatedModels()[normalizeModelID(modelName)]
-	return dep, ok
+	key := normalizeModelID(modelName)
+	for raw, dep := range GetQianfanDeprecatedModels() {
+		if normalizeModelID(raw) == key {
+			return dep, true
+		}
+	}
+	return QianfanDeprecation{}, false
 }

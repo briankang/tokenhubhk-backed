@@ -29,7 +29,7 @@ import (
 //   - InputPriceRMB / OutputPriceRMB / InputPricePerToken / OutputPricePerToken
 //   - PriceTiers
 //
-// 售价计算：cost × WangsuSellMarkup（当前 1.30×）。已有管理员手动设定的折扣会被覆盖回默认，
+// 售价计算：official × contract_discount × WangsuSellMarkup（当前 1.30×）。已有管理员手动设定的折扣会被覆盖回默认，
 // 如管理员已自定义需谨慎（本期默认触发但可通过 force=false 在未来扩展跳过逻辑）。
 func RunWangsuOfficialPricingMigration(db *gorm.DB) {
 	log := logger.L
@@ -40,6 +40,7 @@ func RunWangsuOfficialPricingMigration(db *gorm.DB) {
 		log.Warn("wangsu_official_pricing: db is nil, skip")
 		return
 	}
+	RunPriceSourceColumnsMigration(db)
 
 	// 定位网宿供应商
 	var sup model.Supplier
@@ -57,11 +58,13 @@ func RunWangsuOfficialPricingMigration(db *gorm.DB) {
 			continue
 		}
 
-		// 1. 默认（非阶梯）成本价
-		inputCostRMB := round6(m.InputUSDPerM * USDCNYSnapshot * m.Discount)
-		outputCostRMB := round6(m.OutputUSDPerM * USDCNYSnapshot * m.Discount)
-		cacheReadCostRMB := round6(m.CacheReadUSDPerM * USDCNYSnapshot * m.Discount)
-		cacheWriteCostRMB := round6(m.CacheWriteUSDPerM * USDCNYSnapshot * m.Discount)
+		// 1. 默认（非阶梯）官网价。折扣只写入 discount 字段，由 buildPriceSummary 计算折后成本。
+		inputCostRMB := round6(m.InputUSDPerM * USDCNYSnapshot)
+		outputCostRMB := round6(m.OutputUSDPerM * USDCNYSnapshot)
+		cacheReadCostRMB := round6(m.CacheReadUSDPerM * USDCNYSnapshot)
+		cacheExplicitReadCostRMB := round6(m.CacheExplicitReadUSDPerM * USDCNYSnapshot)
+		cacheWriteCostRMB := round6(m.CacheWriteUSDPerM * USDCNYSnapshot)
+		cacheStorageCostRMB := round6(m.CacheStorageUSDPerMHour * USDCNYSnapshot)
 
 		// 2. 阶梯成本价（AIModel.PriceTiers）
 		var costTiersJSON model.JSON
@@ -71,10 +74,10 @@ func RunWangsuOfficialPricingMigration(db *gorm.DB) {
 				costTiers = append(costTiers, map[string]any{
 					"label":             t.Label,
 					"max_input_tokens":  t.MaxInputTokens,
-					"input_price_rmb":   round6(t.InputUSDPerM * USDCNYSnapshot * m.Discount),
-					"output_price_rmb":  round6(t.OutputUSDPerM * USDCNYSnapshot * m.Discount),
-					"cache_read_rmb":    round6(t.CacheReadUSDPerM * USDCNYSnapshot * m.Discount),
-					"cache_write_rmb":   round6(t.CacheWriteUSDPerM * USDCNYSnapshot * m.Discount),
+					"input_price_rmb":   round6(t.InputUSDPerM * USDCNYSnapshot),
+					"output_price_rmb":  round6(t.OutputUSDPerM * USDCNYSnapshot),
+					"cache_read_rmb":    round6(t.CacheReadUSDPerM * USDCNYSnapshot),
+					"cache_write_rmb":   round6(t.CacheWriteUSDPerM * USDCNYSnapshot),
 					"source_usd_input":  t.InputUSDPerM,
 					"source_usd_output": t.OutputUSDPerM,
 				})
@@ -85,7 +88,7 @@ func RunWangsuOfficialPricingMigration(db *gorm.DB) {
 		}
 
 		// 3. Description 重写（透明化官网来源 + 映射）
-		desc := fmt.Sprintf("%s - 经网宿网关代理。官网价 $%.4f/$%.4f × 汇率 %.2f × 折扣 %.3f",
+		desc := fmt.Sprintf("%s - 经网宿网关代理。官网价 $%.4f/$%.4f × 汇率 %.2f；合同折扣 %.3f 单独体现在折后成本",
 			m.DisplayName, m.InputUSDPerM, m.OutputUSDPerM, USDCNYSnapshot, m.Discount)
 		if m.MappedFrom != "" {
 			desc += fmt.Sprintf("。官方对标：%s", m.MappedFrom)
@@ -101,15 +104,35 @@ func RunWangsuOfficialPricingMigration(db *gorm.DB) {
 			"input_price_per_token":          int64(math.Round(inputCostRMB * 10000)),
 			"output_price_per_token":         int64(math.Round(outputCostRMB * 10000)),
 			"cache_input_price_rmb":          cacheReadCostRMB,
+			"cache_explicit_input_price_rmb": cacheExplicitReadCostRMB,
 			"cache_write_price_rmb":          cacheWriteCostRMB,
+			"cache_storage_price_rmb":        cacheStorageCostRMB,
+			"price_source_currency":          "USD",
+			"price_source_exchange_rate":     USDCNYSnapshot,
+			"input_cost_usd":                 round6(m.InputUSDPerM),
+			"output_cost_usd":                round6(m.OutputUSDPerM),
+			"cache_input_price_usd":          round6(m.CacheReadUSDPerM),
+			"cache_explicit_input_price_usd": round6(m.CacheExplicitReadUSDPerM),
+			"cache_write_price_usd":          round6(m.CacheWriteUSDPerM),
+			"cache_storage_price_usd":        round6(m.CacheStorageUSDPerMHour),
 			"supports_cache":                 m.SupportsCache,
 			"cache_mechanism":                pickStr(m.CacheMechanism, "none"),
 			"cache_min_tokens":               m.CacheMinTokens,
 			"discount":                       m.Discount,
 			"description":                    desc,
 			"max_output_tokens":              m.MaxOutputTokens,
+			"max_input_tokens":               m.ContextWindow,
 			"context_window":                 m.ContextWindow,
 			"model_type":                     m.ModelType,
+		}
+		if len(m.InputModalities) > 0 {
+			updates["input_modalities"] = jsonStringSlice(m.InputModalities)
+		}
+		if len(m.OutputModalities) > 0 {
+			updates["output_modalities"] = jsonStringSlice(m.OutputModalities)
+		}
+		if m.SupportsThinking && m.OutputUSDPerM > 0 {
+			updates["output_cost_thinking_usd"] = round6(m.OutputUSDPerM)
 		}
 		if costTiersJSON != nil {
 			updates["price_tiers"] = costTiersJSON
@@ -123,9 +146,9 @@ func RunWangsuOfficialPricingMigration(db *gorm.DB) {
 			continue
 		}
 
-		// 5. 更新/创建 ModelPricing（售价 = 成本 × WangsuSellMarkup）
-		sellIn := round6(inputCostRMB * WangsuSellMarkup)
-		sellOut := round6(outputCostRMB * WangsuSellMarkup)
+		// 5. 更新/创建 ModelPricing（售价 = 官网价 × 合同折扣 × 平台默认加价）
+		sellIn := round6(inputCostRMB * m.Discount * WangsuSellMarkup)
+		sellOut := round6(outputCostRMB * m.Discount * WangsuSellMarkup)
 
 		var sellTiersJSON model.JSON
 		if len(m.PriceTiersUSD) > 0 {

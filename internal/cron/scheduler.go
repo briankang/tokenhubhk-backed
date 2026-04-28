@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	aimodelsvc "tokenhub-server/internal/service/aimodel"
 	"tokenhub-server/internal/service/audit"
 	"tokenhub-server/internal/service/authlog"
+	billingsvc "tokenhub-server/internal/service/billing"
 	channelsvc "tokenhub-server/internal/service/channel"
 	emailsvc "tokenhub-server/internal/service/email"
 	"tokenhub-server/internal/service/member"
@@ -65,12 +68,30 @@ type Scheduler struct {
 
 // TaskInfo 定时任务信息（对外暴露）
 type TaskInfo struct {
-	Name        string    `json:"name"`
-	Schedule    string    `json:"schedule"`
-	Description string    `json:"description"`
-	Enabled     bool      `json:"enabled"`
-	LastRun     time.Time `json:"last_run,omitempty"`
-	LastErr     string    `json:"last_error,omitempty"`
+	Name           string    `json:"name"`
+	Schedule       string    `json:"schedule"`
+	Description    string    `json:"description"`
+	Enabled        bool      `json:"enabled"`
+	LastRun        time.Time `json:"last_run,omitempty"`
+	LastErr        string    `json:"last_error,omitempty"`
+	LastStatus     string    `json:"last_status,omitempty"`
+	LastDurationMs int64     `json:"last_duration_ms,omitempty"`
+	LastSummary    string    `json:"last_summary,omitempty"`
+}
+
+type taskRunContextKey struct{}
+
+type taskRunOutput struct {
+	Summary string                 `json:"summary"`
+	Data    map[string]interface{} `json:"data,omitempty"`
+}
+
+// SetTaskRunOutput 为当前定时任务写入可展示的运行摘要和数据汇总。
+func SetTaskRunOutput(ctx context.Context, summary string, data map[string]interface{}) {
+	if out, ok := ctx.Value(taskRunContextKey{}).(*taskRunOutput); ok && out != nil {
+		out.Summary = summary
+		out.Data = data
+	}
 }
 
 // NewScheduler 创建定时任务调度器实例
@@ -136,6 +157,8 @@ func (s *Scheduler) Start() {
 		"滚动3个月消费字段：month_consume_3←2←1←0，为会员降级任务提供滑动窗口数据", true)
 	s.registerTask("member_degrade", "每月1号: 会员降级检查",
 		"遍历V1+会员，检查连续不达标月数，达到DegradeMonths阈值时自动降一级", true)
+	s.registerTask("cache_ratio_audit_reminder", "每月1号09:00: 缓存系数审核提醒",
+		"写入审计日志提醒管理员核验各供应商缓存系数与官网当前规则是否一致", s.auditSvc != nil)
 	s.registerTask("logs_cleanup", "每日04:00: 清理7天前调用日志",
 		"分批删除7天前的api_call_logs和channel_logs，每批5000条+50ms间隔，避免锁表影响业务", true)
 	s.registerTask("audit_cleanup", fmt.Sprintf("每日04:00: 清理%d天前审计日志", AuditRetentionDays),
@@ -148,6 +171,8 @@ func (s *Scheduler) Start() {
 		"分批删除30天前的email_send_logs记录，控制邮件日志表数据量", true)
 	s.registerTask("inflight_reset", "每5分钟: 重置渠道在途请求计数",
 		"删除Redis中channel:inflight和stream:active:global计数键，防止容器崩溃后残留计数导致负载路由偏差", true)
+	s.registerTask("billing_anomaly_check", "每小时整点: 计费异常巡检",
+		"按 5 条 SQL 规则检查近 1 小时 api_call_logs（定价缺失/缓存反常/usage 缺失/单价突变/缓存节省漏算），命中即写 audit_logs 告警", true)
 	s.registerTask("daily_user_agg", "每日01:00: 用户调用日表聚合",
 		"从api_call_logs聚合前一天数据，按用户×模型×日期写入user_daily_stats，在7天清理前完成持久化", s.aggSvc != nil)
 	s.registerTask("daily_billing_reconciliation", "每日01:10: 扣费对账快照",
@@ -207,7 +232,41 @@ func (s *Scheduler) GetTasks() []TaskInfo {
 	for _, t := range s.tasks {
 		result = append(result, *t)
 	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	})
 	return result
+}
+
+// ListTasks 分页查询定时任务列表，支持按名称、执行频率和描述搜索。
+func (s *Scheduler) ListTasks(search string, page, pageSize int) ([]TaskInfo, int64) {
+	all := s.GetTasks()
+	search = strings.ToLower(strings.TrimSpace(search))
+	filtered := make([]TaskInfo, 0, len(all))
+	for _, task := range all {
+		if search == "" ||
+			strings.Contains(strings.ToLower(task.Name), search) ||
+			strings.Contains(strings.ToLower(task.Schedule), search) ||
+			strings.Contains(strings.ToLower(task.Description), search) {
+			filtered = append(filtered, task)
+		}
+	}
+	total := int64(len(filtered))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
+	start := (page - 1) * pageSize
+	if start >= len(filtered) {
+		return []TaskInfo{}, total
+	}
+	end := start + pageSize
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	return filtered[start:end], total
 }
 
 // SetTaskEnabled 启用/禁用指定任务
@@ -231,15 +290,53 @@ func (s *Scheduler) IsTaskEnabled(name string) bool {
 	return ok && t.Enabled
 }
 
-// updateTaskRun 更新任务最后执行时间和错误
-func (s *Scheduler) updateTaskRun(name string, err error) {
+// ListTaskRuns 分页查询定时任务运行历史；taskName 为空时返回全部任务历史。
+func (s *Scheduler) ListTaskRuns(taskName, status, search string, page, pageSize int) ([]model.CronTaskRun, int64, error) {
+	if s.db == nil {
+		return []model.CronTaskRun{}, 0, nil
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
+	query := s.db.Model(&model.CronTaskRun{})
+	if taskName != "" {
+		query = query.Where("task_name = ?", taskName)
+	}
+	if status != "" {
+		query = query.Where("status = ?", status)
+	}
+	if search != "" {
+		like := "%" + search + "%"
+		query = query.Where(
+			"task_name LIKE ? OR task_label LIKE ? OR output_summary LIKE ? OR error_message LIKE ?",
+			like, like, like, like,
+		)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var runs []model.CronTaskRun
+	err := query.Order("id DESC").Offset((page - 1) * pageSize).Limit(pageSize).Find(&runs).Error
+	return runs, total, err
+}
+
+// updateTaskRun 更新任务最后执行时间、状态、耗时和摘要。
+func (s *Scheduler) updateTaskRun(name string, err error, duration time.Duration, summary string) {
 	s.tasksMu.Lock()
 	defer s.tasksMu.Unlock()
 	if t, ok := s.tasks[name]; ok {
 		t.LastRun = time.Now()
+		t.LastDurationMs = duration.Milliseconds()
+		t.LastSummary = summary
 		if err != nil {
+			t.LastStatus = "failed"
 			t.LastErr = err.Error()
 		} else {
+			t.LastStatus = "completed"
 			t.LastErr = ""
 		}
 	}
@@ -272,6 +369,9 @@ func (s *Scheduler) runEveryHour() {
 	s.safeRunNamed("frozen_release", "冻结超时释放", func(ctx context.Context) error {
 		return s.releaseFrozenRecords(ctx)
 	})
+	s.safeRunNamed("billing_anomaly_check", "计费异常巡检", func(ctx context.Context) error {
+		return s.runBillingAnomalyCheck(ctx)
+	})
 
 	// 之后每小时执行
 	ticker := time.NewTicker(time.Hour)
@@ -283,10 +383,35 @@ func (s *Scheduler) runEveryHour() {
 			s.safeRunNamed("frozen_release", "冻结超时释放", func(ctx context.Context) error {
 				return s.releaseFrozenRecords(ctx)
 			})
+			s.safeRunNamed("billing_anomaly_check", "计费异常巡检", func(ctx context.Context) error {
+				return s.runBillingAnomalyCheck(ctx)
+			})
 		case <-s.stopCh:
 			return
 		}
 	}
+}
+
+// runBillingAnomalyCheck 计费异常巡检（每小时整点）
+func (s *Scheduler) runBillingAnomalyCheck(ctx context.Context) error {
+	if s.db == nil {
+		return nil
+	}
+	checker := billingsvc.NewAnomalyChecker(s.db, s.auditSvc)
+	res, err := checker.Run(ctx)
+	if err != nil {
+		return err
+	}
+	SetTaskRunOutput(ctx, fmt.Sprintf("巡检完成，命中告警 %d 条", res.TotalAlerts), map[string]interface{}{
+		"window_start":          res.WindowStart,
+		"window_end":            res.WindowEnd,
+		"pricing_missing":       res.PricingMissing,
+		"cache_field_invalid":   res.CacheFieldInvalid,
+		"stream_usage_missing":  res.StreamUsageMissing,
+		"unit_price_shift":      res.UnitPriceShift,
+		"cache_savings_missing": res.CacheSavingsMissing,
+	})
+	return nil
 }
 
 // ==================== 每日任务 ====================
@@ -343,6 +468,13 @@ func (s *Scheduler) runDaily() {
 					zap.Int("new_models", added),
 					zap.Int("updated_models", updated),
 					zap.Int("errors", errCount))
+				SetTaskRunOutput(ctx, fmt.Sprintf("同步 %d 个渠道，新增 %d 个模型，更新 %d 个模型，错误 %d 个", result.Total, added, updated, errCount), map[string]interface{}{
+					"total_channels": result.Total,
+					"new_models":     added,
+					"updated_models": updated,
+					"errors":         errCount,
+					"new_model_ids":  newModelIDs,
+				})
 
 				// Phase 2：有新模型时自动触发能力测试
 				if len(newModelIDs) > 0 && s.capabilityTester != nil {
@@ -372,6 +504,15 @@ func (s *Scheduler) runDaily() {
 						zap.Int("new_aliases", len(job.Summary.NewModels)),
 						zap.Int("removed_aliases", len(job.Summary.RemovedModels)),
 					)
+					SetTaskRunOutput(ctx, fmt.Sprintf("刷新默认路由：模型 %d 个，路由 %d 条，新增别名 %d 个，移除别名 %d 个",
+						job.Summary.TotalModels, job.Summary.TotalRoutes, len(job.Summary.NewModels), len(job.Summary.RemovedModels)), map[string]interface{}{
+						"total_models":    job.Summary.TotalModels,
+						"total_routes":    job.Summary.TotalRoutes,
+						"new_aliases":     len(job.Summary.NewModels),
+						"removed_aliases": len(job.Summary.RemovedModels),
+					})
+				} else {
+					SetTaskRunOutput(ctx, "默认渠道路由刷新完成", map[string]interface{}{})
 				}
 				return nil
 			})
@@ -390,12 +531,45 @@ func (s *Scheduler) runMonthly() {
 	// 月度任务列表，按执行时间（小时）升序排列
 	type monthlyTask struct {
 		hour int
+		id   string
 		name string
 		fn   func(context.Context) error
 	}
 	tasks := []monthlyTask{
-		{0, "月消费轮转", func(ctx context.Context) error { return s.memberSvc.RotateMonthConsume(ctx) }},
-		{2, "会员降级检查", func(ctx context.Context) error { return s.memberSvc.CheckAndDegradeAll(ctx) }},
+		{0, "consume_rotate", "月消费轮转", func(ctx context.Context) error {
+			if err := s.memberSvc.RotateMonthConsume(ctx); err != nil {
+				return err
+			}
+			SetTaskRunOutput(ctx, "月消费字段轮转完成", map[string]interface{}{"month": time.Now().In(shanghaiLoc).Format("2006-01")})
+			return nil
+		}},
+		{2, "member_degrade", "会员降级检查", func(ctx context.Context) error {
+			if err := s.memberSvc.CheckAndDegradeAll(ctx); err != nil {
+				return err
+			}
+			SetTaskRunOutput(ctx, "会员降级检查完成", map[string]interface{}{"month": time.Now().In(shanghaiLoc).Format("2006-01")})
+			return nil
+		}},
+		{9, "cache_ratio_audit_reminder", "缓存系数审核提醒", func(ctx context.Context) error {
+			if s.auditSvc == nil {
+				return nil
+			}
+			month := time.Now().In(shanghaiLoc).Format("2006-01")
+			s.auditSvc.Enqueue(&model.AuditLog{
+				Action:   "cache_ratio_audit_reminder",
+				Resource: "cache_pricing",
+				Menu:     "缓存系数审核",
+				Feature:  "月度提醒",
+				Method:   "CRON",
+				Path:     "cron://cache_ratio_audit_reminder",
+				Remark: "请管理员前往「模型管理」核验各供应商缓存系数与官网当前规则一致性。" +
+					"参考：OpenAI 0.5（auto）/ Anthropic 0.1+1.25（explicit）/ DeepSeek 0.1 / " +
+					"Moonshot 0.25 / Gemini 0.75 / 阿里云 0.2+0.1+1.25（both）/ " +
+					"百度千帆 0.2+0.1+1.25 / 火山豆包 0.4 / 智谱 0.2",
+			})
+			SetTaskRunOutput(ctx, "缓存系数审核提醒已写入审计日志", map[string]interface{}{"month": month})
+			return nil
+		}},
 	}
 
 	for {
@@ -436,7 +610,7 @@ func (s *Scheduler) runMonthly() {
 				return
 			}
 
-			s.safeRun(task.name, task.fn)
+			s.safeRunNamed(task.id, task.name, task.fn)
 		}
 	}
 }
@@ -490,10 +664,18 @@ func (s *Scheduler) runLogsCleanup() {
 // cleanupOldEmailLogs 清理 email_send_logs 表 30 天前记录
 func (s *Scheduler) cleanupOldEmailLogs(ctx context.Context) error {
 	if emailsvc.Default == nil {
+		SetTaskRunOutput(ctx, "邮件服务未初始化，跳过清理", map[string]interface{}{"skipped": true})
 		return nil
 	}
 	before := time.Now().AddDate(0, 0, -30)
-	_, err := emailsvc.Default.CleanupLogsBefore(ctx, before)
+	deleted, err := emailsvc.Default.CleanupLogsBefore(ctx, before)
+	if err == nil {
+		SetTaskRunOutput(ctx, fmt.Sprintf("清理 30 天前邮件日志 %d 条", deleted), map[string]interface{}{
+			"retention_days": 30,
+			"deleted":        deleted,
+			"before":         before.Format(time.RFC3339),
+		})
+	}
 	return err
 }
 
@@ -505,6 +687,7 @@ func (s *Scheduler) cleanupOldAuthLogs(ctx context.Context) error {
 	}
 	if svc == nil {
 		zap.L().Warn("auth_log cleanup skipped: recorder not available")
+		SetTaskRunOutput(ctx, "认证日志服务未初始化，跳过清理", map[string]interface{}{"skipped": true})
 		return nil
 	}
 	start := time.Now()
@@ -517,6 +700,11 @@ func (s *Scheduler) cleanupOldAuthLogs(ctx context.Context) error {
 		zap.Int64("deleted", deleted),
 		zap.Duration("duration", time.Since(start)),
 	)
+	SetTaskRunOutput(ctx, fmt.Sprintf("清理 %d 天前认证日志 %d 条", AuthLogRetentionDays, deleted), map[string]interface{}{
+		"retention_days": AuthLogRetentionDays,
+		"deleted":        deleted,
+		"duration_ms":    time.Since(start).Milliseconds(),
+	})
 	return nil
 }
 
@@ -528,6 +716,7 @@ func (s *Scheduler) cleanupOldRateLimitEvents(ctx context.Context) error {
 	}
 	if svc == nil {
 		zap.L().Warn("rate_limit_event cleanup skipped: recorder not available")
+		SetTaskRunOutput(ctx, "限流事件服务未初始化，跳过清理", map[string]interface{}{"skipped": true})
 		return nil
 	}
 	start := time.Now()
@@ -540,6 +729,11 @@ func (s *Scheduler) cleanupOldRateLimitEvents(ctx context.Context) error {
 		zap.Int64("deleted", deleted),
 		zap.Duration("duration", time.Since(start)),
 	)
+	SetTaskRunOutput(ctx, fmt.Sprintf("清理 %d 天前限流事件 %d 条", RateLimitEventRetentionDays, deleted), map[string]interface{}{
+		"retention_days": RateLimitEventRetentionDays,
+		"deleted":        deleted,
+		"duration_ms":    time.Since(start).Milliseconds(),
+	})
 	return nil
 }
 
@@ -553,6 +747,7 @@ func (s *Scheduler) cleanupOldAuditLogs(ctx context.Context) error {
 	}
 	if svc == nil {
 		zap.L().Warn("audit cleanup skipped: audit service not available")
+		SetTaskRunOutput(ctx, "审计日志服务未初始化，跳过清理", map[string]interface{}{"skipped": true})
 		return nil
 	}
 
@@ -566,6 +761,11 @@ func (s *Scheduler) cleanupOldAuditLogs(ctx context.Context) error {
 		zap.Int64("deleted", deleted),
 		zap.Duration("duration", time.Since(start)),
 	)
+	SetTaskRunOutput(ctx, fmt.Sprintf("清理 %d 天前审计日志 %d 条", AuditRetentionDays, deleted), map[string]interface{}{
+		"retention_days": AuditRetentionDays,
+		"deleted":        deleted,
+		"duration_ms":    time.Since(start).Milliseconds(),
+	})
 	return nil
 }
 
@@ -610,6 +810,12 @@ func (s *Scheduler) cleanupOldLogs(ctx context.Context) error {
 		zap.Int64("api_call_logs_deleted", apiDeleted),
 		zap.Int64("channel_logs_deleted", channelDeleted),
 	)
+	SetTaskRunOutput(ctx, fmt.Sprintf("清理调用日志 %d 条、渠道日志 %d 条", apiDeleted, channelDeleted), map[string]interface{}{
+		"cutoff":                cutoff.Format(time.RFC3339),
+		"api_call_logs_deleted": apiDeleted,
+		"channel_logs_deleted":  channelDeleted,
+		"total_deleted":         apiDeleted + channelDeleted,
+	})
 	return nil
 }
 
@@ -626,6 +832,7 @@ func (s *Scheduler) runInflightReset() {
 		case <-ticker.C:
 			s.safeRunNamed("inflight_reset", "重置在途请求计数", func(ctx context.Context) error {
 				if s.redis == nil {
+					SetTaskRunOutput(ctx, "Redis 未初始化，跳过在途计数重置", map[string]interface{}{"skipped": true})
 					return nil
 				}
 				deleted, err := s.redis.Del(ctx, "channel:inflight", "stream:active:global").Result()
@@ -635,6 +842,10 @@ func (s *Scheduler) runInflightReset() {
 				if deleted > 0 {
 					zap.L().Debug("在途请求计数已重置", zap.Int64("keys_deleted", deleted))
 				}
+				SetTaskRunOutput(ctx, fmt.Sprintf("重置在途请求计数，删除 Redis Key %d 个", deleted), map[string]interface{}{
+					"keys_deleted": deleted,
+					"keys":         []string{"channel:inflight", "stream:active:global"},
+				})
 				return nil
 			})
 		case <-s.stopCh:
@@ -666,6 +877,10 @@ func (s *Scheduler) settleCommissions(ctx context.Context) error {
 	if result.RowsAffected > 0 {
 		zap.L().Info("佣金自动结算完成", zap.Int64("settled_count", result.RowsAffected))
 	}
+	SetTaskRunOutput(ctx, fmt.Sprintf("结算 PENDING 佣金 %d 条", result.RowsAffected), map[string]interface{}{
+		"settled_count": result.RowsAffected,
+		"before":        sevenDaysAgo.Format(time.RFC3339),
+	})
 
 	return nil
 }
@@ -689,6 +904,10 @@ func (s *Scheduler) releaseFrozenRecords(ctx context.Context) error {
 	}
 
 	if len(records) == 0 {
+		SetTaskRunOutput(ctx, "无超时冻结记录需要释放", map[string]interface{}{
+			"expired_count":  0,
+			"released_count": 0,
+		})
 		return nil // 无超时记录
 	}
 
@@ -727,6 +946,12 @@ func (s *Scheduler) releaseFrozenRecords(ctx context.Context) error {
 	if releasedCount > 0 {
 		zap.L().Info("冻结超时释放完成", zap.Int("released_count", releasedCount), zap.Int("total_expired", len(records)))
 	}
+	SetTaskRunOutput(ctx, fmt.Sprintf("释放超时冻结记录 %d/%d 条", releasedCount, len(records)), map[string]interface{}{
+		"expired_count":  len(records),
+		"released_count": releasedCount,
+		"failed_count":   len(records) - releasedCount,
+		"before":         fiveMinutesAgo.Format(time.RFC3339),
+	})
 
 	return nil
 }
@@ -745,15 +970,6 @@ func (s *Scheduler) safeRunNamed(taskID, taskName string, fn func(context.Contex
 		zap.L().Debug("定时任务已禁用，跳过", zap.String("task", taskName), zap.String("task_id", taskID))
 		return
 	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			zap.L().Error("定时任务 panic 已恢复",
-				zap.String("task", taskName),
-				zap.Any("panic", r),
-			)
-		}
-	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -775,24 +991,87 @@ func (s *Scheduler) safeRunNamed(taskID, taskName string, fn func(context.Contex
 
 	zap.L().Info("定时任务开始执行", zap.String("task", taskName))
 	start := time.Now()
+	runName := taskID
+	if runName == "" {
+		runName = taskName
+	}
+	run := model.CronTaskRun{
+		TaskName:    runName,
+		TaskLabel:   taskName,
+		Status:      "running",
+		StartedAt:   start,
+		TriggerType: "schedule",
+	}
+	if s.db != nil {
+		_ = s.db.Create(&run).Error
+	}
 
-	err := fn(ctx)
+	output := &taskRunOutput{}
+	ctx = context.WithValue(ctx, taskRunContextKey{}, output)
+
+	var err error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("任务执行异常: %v", r)
+				zap.L().Error("定时任务 panic 已恢复",
+					zap.String("task", taskName),
+					zap.Any("panic", r),
+				)
+			}
+		}()
+		err = fn(ctx)
+	}()
+
+	completedAt := time.Now()
+	duration := completedAt.Sub(start)
+	summary := output.Summary
+	if summary == "" {
+		if err != nil {
+			summary = "任务执行失败"
+		} else {
+			summary = "任务执行成功"
+		}
+	}
 	if taskID != "" {
-		s.updateTaskRun(taskID, err)
+		s.updateTaskRun(taskID, err, duration, summary)
+	}
+
+	status := "completed"
+	errMsg := ""
+	if err != nil {
+		status = "failed"
+		errMsg = err.Error()
+	}
+	outputJSON := ""
+	if output.Data != nil {
+		if b, marshalErr := json.Marshal(output.Data); marshalErr == nil {
+			outputJSON = string(b)
+		}
+	}
+	if s.db != nil && run.ID > 0 {
+		_ = s.db.Model(&model.CronTaskRun{}).Where("id = ?", run.ID).Updates(map[string]interface{}{
+			"status":         status,
+			"completed_at":   completedAt,
+			"duration_ms":    duration.Milliseconds(),
+			"output_summary": summary,
+			"output_json":    outputJSON,
+			"error_message":  errMsg,
+		}).Error
 	}
 
 	if err != nil {
 		zap.L().Error("定时任务执行失败",
 			zap.String("task", taskName),
 			zap.Error(err),
-			zap.Duration("duration", time.Since(start)),
+			zap.Duration("duration", duration),
 		)
 		return
 	}
 
 	zap.L().Info("定时任务执行完成",
 		zap.String("task", taskName),
-		zap.Duration("duration", time.Since(start)),
+		zap.Duration("duration", duration),
 	)
 }
 
@@ -817,6 +1096,10 @@ func (s *Scheduler) runDailyAgg() {
 				return err
 			}
 			zap.L().Info("用户调用日表聚合完成", zap.Int64("rows", n))
+			SetTaskRunOutput(ctx, fmt.Sprintf("聚合昨日用户调用日表 %d 行", n), map[string]interface{}{
+				"rows": n,
+				"date": time.Now().In(shanghaiLoc).AddDate(0, 0, -1).Format("2006-01-02"),
+			})
 			return nil
 		})
 	}
@@ -855,6 +1138,14 @@ func (s *Scheduler) runBillingReconciliationForDate(ctx context.Context, date st
 		zap.String("health", snap.ReconciliationHealth),
 		zap.Int64("requests", snap.TotalRequests),
 	)
+	SetTaskRunOutput(ctx, fmt.Sprintf("生成 %s 扣费对账快照：%s，请求 %d 次", date, snap.ReconciliationHealth, snap.TotalRequests), map[string]interface{}{
+		"date":           date,
+		"health":         snap.ReconciliationHealth,
+		"requests":       snap.TotalRequests,
+		"revenue":        snap.ActualRevenueRMB,
+		"cost":           snap.PlatformCostRMB,
+		"variance_units": snap.EstimateVarianceUnits,
+	})
 	return nil
 }
 

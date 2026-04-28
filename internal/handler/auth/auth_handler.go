@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -16,8 +18,9 @@ import (
 
 // AuthHandler 认证接口处理器
 type AuthHandler struct {
-	svc    *authsvc.AuthService
-	geoSvc *geosvc.GeoService // 可选；注册时用于 IP 国家自动检测
+	svc      *authsvc.AuthService
+	oauthSvc *authsvc.OAuthService
+	geoSvc   *geosvc.GeoService // 可选；注册时用于 IP 国家自动检测
 }
 
 // NewAuthHandler 创建认证Handler实例
@@ -30,6 +33,12 @@ func NewAuthHandler(svc *authsvc.AuthService, geoSvc ...*geosvc.GeoService) *Aut
 	if len(geoSvc) > 0 {
 		h.geoSvc = geoSvc[0]
 	}
+	return h
+}
+
+// WithOAuthService 注入第三方 OAuth 登录服务。
+func (h *AuthHandler) WithOAuthService(svc *authsvc.OAuthService) *AuthHandler {
+	h.oauthSvc = svc
 	return h
 }
 
@@ -145,21 +154,89 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	// 登录成功记录 —— user_id 通过 email 回查
 	var userID uint
-	userID = h.lookupUserIDByEmail(c, req.Email)
+	userID = h.lookupUserIDByIdentifier(c, req.Email)
 	emitAuthEvent(c, userID, req.Email, model.AuthEventLoginSuccess, "")
 
 	response.Success(c, tokenPair)
 }
 
-// lookupUserIDByEmail 从 DB 查 user_id 供日志使用（best-effort，失败返 0）
-func (h *AuthHandler) lookupUserIDByEmail(c *gin.Context, email string) uint {
-	if email == "" {
+// OAuthProviders GET /api/v1/auth/oauth/providers
+func (h *AuthHandler) OAuthProviders(c *gin.Context) {
+	if h.oauthSvc == nil {
+		response.Success(c, []authsvc.OAuthProviderDTO{})
+		return
+	}
+	providers, err := h.oauthSvc.ListPublicProviders(c.Request.Context())
+	if err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	response.Success(c, providers)
+}
+
+// OAuthStart GET /api/v1/auth/oauth/:provider/start
+func (h *AuthHandler) OAuthStart(c *gin.Context) {
+	if h.oauthSvc == nil {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "oauth service not initialized")
+		return
+	}
+	authURL, err := h.oauthSvc.BuildAuthURL(
+		c.Request.Context(),
+		c.Param("provider"),
+		c.DefaultQuery("redirect", "/dashboard"),
+		c.Query("invite_code"),
+		c.Query("referral_code"),
+	)
+	if err != nil {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
+		return
+	}
+	c.Redirect(http.StatusFound, authURL)
+}
+
+// OAuthCallback GET /api/v1/auth/oauth/:provider/callback
+func (h *AuthHandler) OAuthCallback(c *gin.Context) {
+	if h.oauthSvc == nil {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, "oauth service not initialized")
+		return
+	}
+	pair, redirectPath, frontendRedirectURL, err := h.oauthSvc.HandleCallback(
+		c.Request.Context(),
+		c.Param("provider"),
+		c.Query("code"),
+		c.Query("state"),
+	)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(strings.ToLower(err.Error()), "disabled") {
+			status = http.StatusForbidden
+		}
+		response.ErrorMsg(c, status, errcode.ErrBadRequest.Code, err.Error())
+		return
+	}
+
+	base := frontendRedirectURL
+	if base == "" {
+		base = "/oauth/callback"
+	}
+	fragment := url.Values{}
+	fragment.Set("access_token", pair.AccessToken)
+	fragment.Set("refresh_token", pair.RefreshToken)
+	fragment.Set("expires_in", fmt.Sprintf("%d", pair.ExpiresIn))
+	fragment.Set("redirect", redirectPath)
+	c.Redirect(http.StatusFound, base+"#"+fragment.Encode())
+}
+
+// lookupUserIDByIdentifier 从 DB 查 user_id 供日志使用（best-effort，失败返 0）
+func (h *AuthHandler) lookupUserIDByIdentifier(c *gin.Context, identifier string) uint {
+	identifier = strings.ToLower(strings.TrimSpace(identifier))
+	if identifier == "" {
 		return 0
 	}
 	type idOnly struct{ ID uint }
 	var row idOnly
 	if err := h.svc.DB().WithContext(c.Request.Context()).
-		Table("users").Select("id").Where("email = ?", email).Scan(&row).Error; err != nil {
+		Table("users").Select("id").Where("email = ? OR username = ?", identifier, identifier).Scan(&row).Error; err != nil {
 		return 0
 	}
 	return row.ID

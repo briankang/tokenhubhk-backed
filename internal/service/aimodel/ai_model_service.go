@@ -229,11 +229,9 @@ func IsTemporaryModelName(name string) bool {
 		strings.HasPrefix(lower, "updated-model_")
 }
 
-// ListOnline 查询所有在线模型（is_active=true 且 status=online）
-// 用于公开模型列表接口
-// modelTypes: 可选类型过滤（如 []string{"ImageGeneration"}）
-//   - 不传 / 空切片 → 默认返回聊天类模型（LLM/VLM）且有价格
-//   - 传入具体类型 → 覆盖默认过滤，不做价格限制（图像/视频多为按张/按秒计费）
+// ListOnline 查询所有公开在线模型（is_active=true 且 status=online）
+// 用于公开模型列表接口。默认返回所有有价格的模型类型，确保 /models 与数据库公开状态所见即所得。
+// modelTypes: 可选类型过滤（如 []string{"ImageGeneration"}），传入具体类型时覆盖默认类型范围，不做价格限制。
 func (s *AIModelService) ListOnline(ctx context.Context, page, pageSize int, modelTypes ...string) ([]model.AIModel, int64, error) {
 	if page < 1 {
 		page = 1
@@ -242,19 +240,17 @@ func (s *AIModelService) ListOnline(ctx context.Context, page, pageSize int, mod
 		pageSize = 20
 	}
 
-	typeFilter := []string{"LLM", "VLM", "Reasoning"}
 	priceFilter := true
+	query := s.db.WithContext(ctx).Model(&model.AIModel{}).
+		Joins("JOIN suppliers ON suppliers.id = ai_models.supplier_id").
+		Where("ai_models.is_active = ? AND ai_models.status = ?", true, "online").
+		Where("suppliers.status = ? AND suppliers.is_active = ?", "active", true)
 	if len(modelTypes) > 0 {
-		typeFilter = modelTypes
+		query = query.Where("ai_models.model_type IN ?", modelTypes)
 		priceFilter = false
 	}
 
 	var total int64
-	query := s.db.WithContext(ctx).Model(&model.AIModel{}).
-		Joins("JOIN suppliers ON suppliers.id = ai_models.supplier_id").
-		Where("ai_models.is_active = ? AND ai_models.status = ?", true, "online").
-		Where("suppliers.status = ? AND suppliers.is_active = ?", "active", true).
-		Where("ai_models.model_type IN ?", typeFilter)
 	if priceFilter {
 		query = query.Where("ai_models.input_cost_rmb > 0 OR ai_models.output_cost_rmb > 0")
 	}

@@ -39,8 +39,9 @@ type previewPricesRequest struct {
 
 // applyPricesRequest 应用价格更新的请求体
 type applyPricesRequest struct {
-	SupplierID uint                             `json:"supplier_id" binding:"required,min=1"`
+	SupplierID uint                              `json:"supplier_id" binding:"required,min=1"`
 	Updates    []pricescraper.PriceUpdateRequest `json:"updates" binding:"required,min=1"`
+	Force      bool                              `json:"force,omitempty"` // P7: 跨度过大变更需强制确认
 }
 
 // PreviewPrices 预览价格变更（不写入数据库）
@@ -78,6 +79,27 @@ func (h *PriceScraperHandler) ApplyPrices(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
 		return
+	}
+
+	// P7: 大幅变动二次确认 — 不传 force=true 时计算每条 update 的相对变化率，
+	// 任意一条 |Δprice / oldPrice| > 20% 则拒绝并返回需确认的列表
+	if !req.Force {
+		highDelta, herr := h.scraperService.PreflightLargeChanges(c.Request.Context(), req.SupplierID, req.Updates)
+		if herr != nil {
+			response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, herr.Error())
+			return
+		}
+		if len(highDelta) > 0 {
+			c.JSON(http.StatusBadRequest, response.R{
+				Code:    40020,
+				Message: fmt.Sprintf("检测到 %d 条价格变动超过 20%% 阈值，需要二次确认", len(highDelta)),
+				Data: gin.H{
+					"requires_confirmation": true,
+					"high_delta_items":      highDelta,
+				},
+			})
+			return
+		}
 	}
 
 	result, err := h.scraperService.ApplyPrices(c.Request.Context(), req.SupplierID, req.Updates)
@@ -132,13 +154,20 @@ type batchScrapeRequest struct {
 
 // batchScrapeApplyRequest 应用请求体
 type batchScrapeApplyRequest struct {
-	TaskID string                    `json:"task_id" binding:"required"`
+	TaskID string                     `json:"task_id" binding:"required"`
 	Items  []pricescraper.AppliedItem `json:"items" binding:"required,min=1"`
 }
 
+type scrapePageRequest struct {
+	SupplierID uint   `json:"supplier_id" binding:"required,min=1"`
+	URL        string `json:"url" binding:"required"`
+	ModelName  string `json:"model_name"`
+	TypeHint   string `json:"type_hint"`
+}
+
 // Redis key 规则
-func batchScrapeResultKey(taskID string) string   { return "batch_scrape:result:" + taskID }
-func batchScrapeDedupKey(hash string) string      { return "batch_scrape:dedup:" + hash }
+func batchScrapeResultKey(taskID string) string { return "batch_scrape:result:" + taskID }
+func batchScrapeDedupKey(hash string) string    { return "batch_scrape:dedup:" + hash }
 
 // BatchScrape 批量按 model_ids 抓取价格（同步执行，返回完整结果）
 // 单体/本地开发模式下直接同步调用；生产三服务模式可切换为 SSEBridge 委派（本 PR 先实现同步版本）
@@ -222,6 +251,26 @@ func (h *PriceScraperHandler) ApplyBatchScrape(c *gin.Context) {
 		return
 	}
 	response.Success(c, report)
+}
+
+// ScrapePage extracts pricing from one official page for the new-model wizard.
+// It is preview-only and never writes model data.
+func (h *PriceScraperHandler) ScrapePage(c *gin.Context) {
+	var req scrapePageRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
+	defer cancel()
+
+	result, err := h.scraperService.ScrapeModelFromPage(ctx, req.SupplierID, req.URL, req.ModelName, req.TypeHint)
+	if err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	response.Success(c, result)
 }
 
 // hashModelIDs 对模型 ID 列表排序后计算 sha1（用于去重 key）

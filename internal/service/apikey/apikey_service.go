@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -29,6 +30,14 @@ const (
 	cacheTTL        = 5 * time.Minute
 	maxRetry        = 10 // 唯一性检查最大重试次数
 )
+
+const lastUsedWriteInterval = time.Minute
+
+type lastUsedCacheEntry struct {
+	expiresAt time.Time
+}
+
+var lastUsedUpdateCache sync.Map
 
 // ApiKeyResult 生成 API Key 后的返回结果（仅此时可见完整密钥）
 type ApiKeyResult struct {
@@ -54,9 +63,9 @@ type ApiKeyInfo struct {
 
 // ApiKeyService API 密钥服务，管理密钥的生成、验证、列表和撤销
 type ApiKeyService struct {
-	db        *gorm.DB
-	redis     *goredis.Client
-	encKey    []byte // AES-256 加密密钥（32字节，由 JWT Secret 派生）
+	db     *gorm.DB
+	redis  *goredis.Client
+	encKey []byte // AES-256 加密密钥（32字节，由 JWT Secret 派生）
 }
 
 // NewApiKeyService 创建 API 密钥服务实例，db 不能为 nil 否则 panic
@@ -127,7 +136,7 @@ func (s *ApiKeyService) decryptKey(encrypted string) (string, error) {
 // CreateKeyOptions 创建 API Key 的选项参数
 type CreateKeyOptions struct {
 	Name            string
-	CustomChannelID *uint  // 关联的自定义渠道ID
+	CustomChannelID *uint // 关联的自定义渠道ID
 	CreditLimit     int64
 	AllowedModels   string
 	RateLimitRPM    int
@@ -240,14 +249,7 @@ func (s *ApiKeyService) Verify(ctx context.Context, key string) (*ApiKeyInfo, er
 		cacheKey := cacheKeyPrefix + hashStr
 		var info ApiKeyInfo
 		if err := s.getFromCache(ctx, cacheKey, &info); err == nil {
-			// 异步更新最后使用时间（fire-and-forget）— safego 防 panic + 短超时防连接池饥饿
-			safego.Go("apikey-update-last-used", func() {
-				bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				defer cancel()
-				_ = s.db.WithContext(bgCtx).Model(&model.ApiKey{}).
-					Where("key_hash = ?", hashStr).
-					Update("last_used_at", time.Now()).Error
-			})
+			s.updateLastUsedAsync(hashStr)
 			return &info, nil
 		}
 	}
@@ -267,9 +269,7 @@ func (s *ApiKeyService) Verify(ctx context.Context, key string) (*ApiKeyInfo, er
 		return nil, fmt.Errorf("api key has expired")
 	}
 
-	// 更新最后使用时间
-	now := time.Now()
-	_ = s.db.WithContext(ctx).Model(&model.ApiKey{}).Where("id = ?", apiKey.ID).Update("last_used_at", now).Error
+	s.updateLastUsedAsync(hashStr)
 
 	info := &ApiKeyInfo{
 		KeyID:           apiKey.ID,
@@ -291,6 +291,41 @@ func (s *ApiKeyService) Verify(ctx context.Context, key string) (*ApiKeyInfo, er
 	}
 
 	return info, nil
+}
+
+func (s *ApiKeyService) updateLastUsedAsync(hashStr string) {
+	if s == nil || s.db == nil || !shouldUpdateLastUsed(hashStr, s.redis) {
+		return
+	}
+	safego.Go("apikey-update-last-used", func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = s.db.WithContext(bgCtx).Model(&model.ApiKey{}).
+			Where("key_hash = ?", hashStr).
+			Update("last_used_at", time.Now()).Error
+	})
+}
+
+func shouldUpdateLastUsed(hashStr string, redis *goredis.Client) bool {
+	if hashStr == "" {
+		return false
+	}
+	now := time.Now()
+	if raw, ok := lastUsedUpdateCache.Load(hashStr); ok {
+		if entry, ok := raw.(lastUsedCacheEntry); ok && now.Before(entry.expiresAt) {
+			return false
+		}
+	}
+	lastUsedUpdateCache.Store(hashStr, lastUsedCacheEntry{expiresAt: now.Add(lastUsedWriteInterval)})
+
+	if redis == nil {
+		return true
+	}
+	ok, err := redis.SetNX(context.Background(), cacheKeyPrefix+"last_used:"+hashStr, now.Unix(), lastUsedWriteInterval).Result()
+	if err != nil {
+		return true
+	}
+	return ok
 }
 
 // ApiKeyWithStats 携带统计信息的 API Key（用于列表展示）
@@ -416,7 +451,7 @@ func (s *ApiKeyService) SoftDelete(ctx context.Context, id uint, userID uint) er
 // UpdateKeyOptions 更新 API Key 的选项参数
 type UpdateKeyOptions struct {
 	Name            *string
-	CustomChannelID *uint   // 关联的自定义渠道ID（传 0 表示清除关联）
+	CustomChannelID *uint // 关联的自定义渠道ID（传 0 表示清除关联）
 	CreditLimit     *int64
 	AllowedModels   *string
 	RateLimitRPM    *int

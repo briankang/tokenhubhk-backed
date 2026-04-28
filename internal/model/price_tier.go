@@ -2,22 +2,38 @@ package model
 
 import "time"
 
-// PriceTier 单个阶梯价格
-// 用于表示供应商按 token 用量分段计价的单个阶梯
-// 对于非 Token 计费单位（per_image 等），可用 Variant 区分质量档（如 "1024x1024"/"hd"），
-// 此时 Input/Output Min/Max 可忽略，InputPrice 表示该档位单价。
+// PriceTier describes one official/selling price tier.
 //
-// 阶梯命中判定同时考虑输入长度区间和输出长度区间（二维 AND 条件）。
-// 未设置任何区间的阶梯默认语义为 (0, +∞] × (0, +∞]（全覆盖）。
+// Token tiers match on input/output token ranges; non-token units can use Variant.
+//
+// 多维度匹配（S1, 2026-04-28 起）：
+//
+//	DimValues 是模型业务维度的显式编码，例如：
+//	  {"resolution": "1080p", "input_has_video": "true"}  → Seedance 2.0
+//	  {"context_tier": "0-128k", "thinking_mode": "true"} → LLM 思考阶梯
+//
+//	匹配优先级（见 SelectTierByDims / SelectTierOrLargest）：
+//	  1. DimValues 全字段匹配（请求侧也提供 dims 时；空值键不参与）
+//	  2. token 区间 InputMin/InputMax × OutputMin/OutputMax 匹配
+//	  3. 兜底取 InputMin 最大档（避免低估）
+//
+//	向后兼容：旧 tier `DimValues=nil` 直接走 token 区间路径，行为不变。
+//	空字符串值被视为"该维度不限定"，例如 {"resolution":""} 等价于不声明该维度。
 type PriceTier struct {
-	Name    string `json:"name"`              // 阶梯名称，如 "(0, 32k]" / "hd"
-	Variant string `json:"variant,omitempty"` // 变体/质量档（非 Token 单位使用）
+	Name    string `json:"name"`
+	Variant string `json:"variant,omitempty"`
 
-	// ---- 输入长度区间 (InputMin, InputMax] 默认 (0, +∞] ----
-	InputMin          int64  `json:"input_min"`                     // 下界
-	InputMinExclusive bool   `json:"input_min_exclusive,omitempty"` // true=开 (, false=闭 [
-	InputMax          *int64 `json:"input_max,omitempty"`           // nil=+∞
-	InputMaxExclusive bool   `json:"input_max_exclusive,omitempty"` // true=开 ), false=闭 ]
+	// DimValues 显式声明该 tier 适用的业务维度组合（多维矩阵编码）
+	//
+	// 维度键应与模型的 ModelDimensionConfig.Dimensions[*].Key 对齐（运行期校验）。
+	// 值统一用 string（bool 用 "true"/"false"，与 PriceMatrix.PriceMatrixCell.DimValues
+	// 兼容，避免 JSON 反序列化的 number/string/bool 类型抖动）。
+	DimValues map[string]string `json:"dim_values,omitempty"`
+
+	InputMin          int64  `json:"input_min"`
+	InputMinExclusive bool   `json:"input_min_exclusive,omitempty"`
+	InputMax          *int64 `json:"input_max,omitempty"`
+	InputMaxExclusive bool   `json:"input_max_exclusive,omitempty"`
 
 	// ---- 输出长度区间 (OutputMin, OutputMax] 默认 (0, +∞] ----
 	OutputMin          int64  `json:"output_min"`
@@ -25,24 +41,16 @@ type PriceTier struct {
 	OutputMax          *int64 `json:"output_max,omitempty"`
 	OutputMaxExclusive bool   `json:"output_max_exclusive,omitempty"`
 
-	// ---- DEPRECATED：旧字段，由 Normalize() 自动同步到 InputMin/InputMax ----
-	// 保留一个大版本以兼容历史数据；写入路径优先使用新字段。
-	MinTokens int64  `json:"min_tokens,omitempty"` // = InputMin（兼容）
-	MaxTokens *int64 `json:"max_tokens,omitempty"` // = InputMax（兼容）
-
-	// ---- 成本价（供应商官方价格）----
-	InputPrice      float64 `json:"input_price"`                 // 输入价格
-	OutputPrice     float64 `json:"output_price"`                // 输出价格
-	CacheInputPrice float64 `json:"cache_input_price,omitempty"` // 缓存命中输入价
-	CacheWritePrice float64 `json:"cache_write_price,omitempty"` // 缓存写入价
-	// OutputPriceThinking: 思考模式输出成本价（0 = 不区分，与 OutputPrice 相同）
-	// 当阿里云等供应商在同一阶梯内将输出价拆分「非思考模式/思考模式」两档时使用
+	InputPrice          float64 `json:"input_price"`
+	OutputPrice         float64 `json:"output_price"`
+	CacheInputPrice     float64 `json:"cache_input_price,omitempty"`
+	CacheWritePrice     float64 `json:"cache_write_price,omitempty"`
 	OutputPriceThinking float64 `json:"output_price_thinking,omitempty"`
 
-	// ---- 新增：阶梯独立售价覆盖（nil=走模型级 selling price，可叠加 DISCOUNT 折扣）----
-	SellingInputPrice         *float64 `json:"selling_input_price,omitempty"`
-	SellingOutputPrice        *float64 `json:"selling_output_price,omitempty"`
-	SellingOutputThinkingPrice *float64 `json:"selling_output_thinking_price,omitempty"` // 思考模式输出售价覆盖
+	// ---- 阶梯独立售价覆盖（nil=走模型级 selling price，可叠加 DISCOUNT 折扣）----
+	SellingInputPrice          *float64 `json:"selling_input_price,omitempty"`
+	SellingOutputPrice         *float64 `json:"selling_output_price,omitempty"`
+	SellingOutputThinkingPrice *float64 `json:"selling_output_thinking_price,omitempty"`
 }
 
 // PriceTiersData 完整阶梯价格数据

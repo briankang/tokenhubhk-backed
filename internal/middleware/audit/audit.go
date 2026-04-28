@@ -64,11 +64,10 @@ func AuditLog(svc *audit.AuditService) gin.HandlerFunc {
 			return
 		}
 
-		// 2. 路由表未命中则跳过（白名单策略）
-		//    注意：Lookup 会查询写+读两张表，审计只记录写操作表命中的条目。
+		// 2. 统一入口查找写操作审计元数据，未命中则跳过（白名单 + 敏感用户操作兜底）。
 		fullPath := c.FullPath()
-		meta, ok := Lookup(method, fullPath)
-		if !ok || !IsAuditRelevant(method, fullPath) {
+		meta, ok := LookupAuditMeta(method, fullPath)
+		if !ok {
 			c.Next()
 			return
 		}

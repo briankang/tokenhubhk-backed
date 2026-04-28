@@ -436,6 +436,47 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 			return 0
 		}
 	}
+	snapshotString := func(key string) string {
+		v, ok := billingSnapshot[key]
+		if !ok || v == nil {
+			return ""
+		}
+		if s, ok := v.(string); ok {
+			return s
+		}
+		return fmt.Sprint(v)
+	}
+
+	// 提取 snapshot.quote(BillingQuote 结构),用于成本分析优先渲染历史快照。
+	//
+	// 数据流来源:扣费链路 BillingService.SettleUsage 通过 buildBillingQuote 写入。
+	// 一致性原则(Spec §一致性规则 #9):有 quote 快照时不得用当前价覆盖历史金额。
+	quoteSnapshot, quoteSource, quoteConsistency := extractQuoteFromSnapshot(billingSnapshot, &log)
+	snapshotStringSlice := func(key string) []string {
+		v, ok := billingSnapshot[key]
+		if !ok || v == nil {
+			return nil
+		}
+		switch list := v.(type) {
+		case []string:
+			return list
+		case []interface{}:
+			out := make([]string, 0, len(list))
+			for _, item := range list {
+				if item != nil {
+					out = append(out, fmt.Sprint(item))
+				}
+			}
+			return out
+		case string:
+			if list == "" {
+				return nil
+			}
+			return []string{list}
+		default:
+			return nil
+		}
+	}
 
 	var user model.User
 	_ = h.db.WithContext(ctx).Select("id, email, name, tenant_id").
@@ -457,12 +498,16 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 		}
 	}
 
-	// 关联供应商名称
+	// 关联供应商名称 + 折扣(2026-04-28 引入,用于真实平台成本计算)
 	supplierName := log.SupplierName
+	supplierDiscountRate := 1.0
 	if modelFound {
 		var sup model.Supplier
-		if err := h.db.WithContext(ctx).Select("id, name").Where("id = ?", aiModel.SupplierID).First(&sup).Error; err == nil {
+		if err := h.db.WithContext(ctx).Select("id, name, discount").Where("id = ?", aiModel.SupplierID).First(&sup).Error; err == nil {
 			supplierName = sup.Name
+			if sup.Discount > 0 && sup.Discount <= 10 {
+				supplierDiscountRate = sup.Discount
+			}
 		}
 	}
 
@@ -692,7 +737,12 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 		if recomputedTotal == 0 && (prompt > 0 || completion > 0) {
 			recomputedTotal = 1 // 保底 1 积分，与计价引擎逻辑一致
 		}
-		platformCostCredits = (inputCostCredits*prompt + outputCostCredits*completion) / 1_000_000
+		// 平台成本采用与 recomputed 相同的"分离截断"方法,
+		// 避免因截断粒度不同(单一截断 vs 分项截断)产生 1 credit 差异。
+		// 这保证了三方一致性: A(扣费) = B(平台成本) = C(计算器) 在售价 = 成本价时严格相等。
+		platformInputCost := inputCostCredits * prompt / 1_000_000
+		platformOutputCost := outputCostCredits * completion / 1_000_000
+		platformCostCredits = platformInputCost + platformOutputCost
 		formulaApplicable = true
 	}
 
@@ -721,18 +771,31 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 	if actualRevenueCredits == 0 && log.CostCredits > 0 && (log.BillingStatus == "" || log.BillingStatus == "settled") {
 		actualRevenueCredits = log.CostCredits
 	}
+	if !snapshotFound && log.PlatformCostRMB > 0 {
+		platformCostCredits = int64(log.PlatformCostRMB*10000 + 0.5)
+	}
+	profitCredits = actualRevenueCredits - platformCostCredits
 	commissionInfo := h.resolveCommissionInfo(ctx, log.UserID, aiModel.ID, float64(actualRevenueCredits)/10000.0)
 	commissionRMB, _ := commissionInfo["commission_rmb"].(float64)
 	netProfitRMB := float64(actualRevenueCredits-platformCostCredits)/10000.0 - commissionRMB
 
 	// ─── v4.0 用户特殊折扣命中信息 ───
 	userDiscountApplied := false
-	var userDiscountDetail *model.UserModelDiscount
+	var userDiscountDetail interface{}
 	if log.UserDiscountID != nil && *log.UserDiscountID > 0 {
 		userDiscountApplied = true
 		var ud model.UserModelDiscount
 		if err := h.db.WithContext(ctx).First(&ud, *log.UserDiscountID).Error; err == nil {
 			userDiscountDetail = &ud
+		}
+	}
+	if userDiscountDetail == nil && snapshotFound {
+		if detail, ok := billingSnapshot["user_discount_detail"].(map[string]interface{}); ok && len(detail) > 0 {
+			userDiscountApplied = true
+			userDiscountDetail = detail
+		}
+		if !userDiscountApplied && (snapshotInt64("user_discount_id") > 0 || snapshotFloat64("user_discount_rate") > 0) {
+			userDiscountApplied = true
 		}
 	}
 
@@ -812,25 +875,101 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 	// v4.0: 用户特殊折扣公式行
 	if userDiscountApplied && userDiscountDetail != nil {
 		line := ""
-		switch userDiscountDetail.PricingType {
+		pricingType := ""
+		note := ""
+		var discountRate *float64
+		var markupRate *float64
+		switch detail := userDiscountDetail.(type) {
+		case *model.UserModelDiscount:
+			pricingType = detail.PricingType
+			discountRate = detail.DiscountRate
+			markupRate = detail.MarkupRate
+			note = detail.Note
+		case map[string]interface{}:
+			pricingType = strings.ToUpper(fmt.Sprint(detail["pricing_type"]))
+			discountRate = mapFloatPtr(detail, "discount_rate")
+			markupRate = mapFloatPtr(detail, "markup_rate")
+			note = fmt.Sprint(detail["note"])
+			if note == "<nil>" {
+				note = ""
+			}
+		}
+		switch pricingType {
 		case "DISCOUNT":
-			if userDiscountDetail.DiscountRate != nil {
-				line = fmt.Sprintf("\n【特殊折扣】× %.2f（用户自定义折扣", *userDiscountDetail.DiscountRate)
+			if discountRate != nil {
+				line = fmt.Sprintf("\n【特殊折扣】× %.2f（用户自定义折扣", *discountRate)
 			}
 		case "FIXED":
 			line = "\n【特殊折扣】固定价格（用户自定义"
 		case "MARKUP":
-			if userDiscountDetail.MarkupRate != nil {
-				line = fmt.Sprintf("\n【特殊折扣】+ %.2f%%（用户自定义加价", *userDiscountDetail.MarkupRate*100)
+			if markupRate != nil {
+				line = fmt.Sprintf("\n【特殊折扣】+ %.2f%%（用户自定义加价", *markupRate*100)
 			}
 		}
 		if line != "" {
-			if userDiscountDetail.Note != "" {
-				line += "：" + userDiscountDetail.Note + "）"
+			if note != "" {
+				line += "：" + note + "）"
 			} else {
 				line += "）"
 			}
 			formula = line + "\n" + formula
+		}
+	}
+
+	calculatorType := snapshotString("calculator_type")
+	if calculatorType == "" {
+		unit := aiModel.PricingUnit
+		if unit == "" || unit == model.UnitPerMillionTokens {
+			if aiModel.SupportsCache || len(priceTiersDetail) > 0 {
+				calculatorType = "token_io_tiered_cache"
+			} else {
+				calculatorType = "token_io"
+			}
+		} else {
+			calculatorType = "generic_" + unit
+		}
+	}
+	calculatorFields := snapshotStringSlice("calculator_fields")
+	hasCalculatorField := func(keys ...string) bool {
+		for _, key := range keys {
+			for _, field := range calculatorFields {
+				if field == key {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	unit := aiModel.PricingUnit
+	if unit == "" {
+		unit = model.UnitPerMillionTokens
+	}
+	showsTokenUsage := unit == model.UnitPerMillionTokens || hasCalculatorField("input_tokens", "output_tokens", "thinking_tokens")
+	displayCapabilities := gin.H{
+		"calculator_type":        calculatorType,
+		"calculator_fields":      calculatorFields,
+		"supports_tier_pricing":  strings.Contains(calculatorType, "tier") || len(priceTiersDetail) > 0,
+		"shows_token_usage":      showsTokenUsage,
+		"shows_output_tokens":    showsTokenUsage && (hasCalculatorField("output_tokens", "thinking_tokens") || len(calculatorFields) == 0),
+		"shows_cache_usage":      aiModel.SupportsCache || strings.Contains(calculatorType, "cache") || hasCalculatorField("cache_read_tokens", "cache_write_tokens"),
+		"shows_image_usage":      unit == model.UnitPerImage || hasCalculatorField("image_count"),
+		"shows_duration_usage":   unit == model.UnitPerSecond || unit == model.UnitPerMinute || unit == model.UnitPerHour || hasCalculatorField("duration_sec", "duration_seconds", "output_seconds"),
+		"shows_character_usage":  unit == model.UnitPer10kCharacters || unit == model.UnitPerKChars || unit == model.UnitPerMillionCharacters || hasCalculatorField("char_count"),
+		"shows_call_usage":       unit == model.UnitPerCall || hasCalculatorField("call_count"),
+		"shows_thinking_pricing": log.ThinkingMode || aiModel.OutputCostThinkingRMB > 0 || mp.OutputPriceThinkingRMB > 0 || hasCalculatorField("thinking_tokens"),
+	}
+
+	// v3 三方一致性:从快照 quote 中提取 PriceMatrix 命中信息,顶层暴露给前端,
+	// 便于 CostAnalysisPanel 展示「命中维度」一行(如 resolution=1080p / has_video=true)。
+	// 缺失或老日志时为空 map,前端隐藏该行。
+	matchedDimValues := map[string]interface{}{}
+	matchedMatrixNote := ""
+	if quoteSnapshot != nil {
+		if dim, ok := quoteSnapshot["matched_dim_values"].(map[string]interface{}); ok {
+			matchedDimValues = dim
+		}
+		if note, ok := quoteSnapshot["matched_matrix_note"].(string); ok {
+			matchedMatrixNote = note
 		}
 	}
 
@@ -843,21 +982,46 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 		"snapshot_total_rmb": snapshotFloat64("total_cost_rmb"),
 		"user_role":          "", // v4.0: role 字段已移除，保留 key 防止前端字段缺失告警
 
-		"model_found":   modelFound,
-		"pricing_found": pricingFound,
-		"model_id":      aiModel.ID,
-		"supplier_id":   aiModel.SupplierID,
-		"supplier_name": supplierName,
-		"model_name":    aiModel.ModelName,
-		"display_name":  aiModel.DisplayName,
-		"pricing_unit":  aiModel.PricingUnit,
+		// 统一计价快照(BillingQuote 真相源)。
+		//   - quote: 历史快照中的 BillingQuote(snapshot 缺失时为 nil)
+		//   - quote_source: billing_snapshot / legacy_snapshot / current_price_recompute_only
+		//   - quote_consistency: snapshot 与日志一致性自检(snapshot_found / line_item_match / amount_delta_credits)
+		"quote":             quoteSnapshot,
+		"quote_source":      quoteSource,
+		"quote_consistency": quoteConsistency,
 
-		// 成本价（ai_models）- 平台向供应商的成本
+		// v3 PriceMatrix 命中信息(三方一致性):
+		//   - matched_dim_values: 命中 cell 的维度值(如 {resolution: "1080p", input_has_video: true})
+		//   - matched_matrix_note: cell.note(管理员可见的备注,如「1080p+有视频不打折」)
+		"matched_dim_values":  matchedDimValues,
+		"matched_matrix_note": matchedMatrixNote,
+
+		"model_found":          modelFound,
+		"pricing_found":        pricingFound,
+		"model_id":             aiModel.ID,
+		"supplier_id":          aiModel.SupplierID,
+		"supplier_name":        supplierName,
+		"model_name":           aiModel.ModelName,
+		"display_name":         aiModel.DisplayName,
+		"pricing_unit":         aiModel.PricingUnit,
+		"calculator_type":      calculatorType,
+		"calculator_fields":    calculatorFields,
+		"display_capabilities": displayCapabilities,
+
+		// 成本价（ai_models）- 平台向供应商的成本(官网原价)
 		// 兜底：若 *_price_per_token 缺失但 *_cost_rmb 有值，反算积分单价
 		"current_input_cost_per_million":  inputCostCredits,
 		"current_output_cost_per_million": outputCostCredits,
 		"current_input_cost_rmb":          aiModel.InputCostRMB,
 		"current_output_cost_rmb":         aiModel.OutputCostRMB,
+
+		// 供应商折扣 + 折后成本(2026-04-28 引入)
+		// 折后成本 = 官网原价 × supplier.discount,= 平台向供应商真实付的钱
+		// 用于:1) 真实平台成本展示 2) 真实毛利计算
+		"supplier_discount_rate":       supplierDiscountRate,
+		"effective_input_cost_rmb":     aiModel.InputCostRMB * supplierDiscountRate,
+		"effective_output_cost_rmb":    aiModel.OutputCostRMB * supplierDiscountRate,
+		"recomputed_platform_cost_rmb": float64(platformCostCredits) / 10000.0,
 		// 思考模式输出成本/售价（0 = 不区分，与普通输出同价；>0 时可用于计算加价）
 		"current_output_cost_thinking_rmb":  aiModel.OutputCostThinkingRMB,
 		"current_output_price_thinking_rmb": mp.OutputPriceThinkingRMB,
@@ -931,6 +1095,39 @@ func (h *ApiCallLogHandler) GetCostBreakdown(c *gin.Context) {
 	}
 
 	response.Success(c, payload)
+}
+
+func mapFloatPtr(values map[string]interface{}, key string) *float64 {
+	raw, ok := values[key]
+	if !ok || raw == nil {
+		return nil
+	}
+	var n float64
+	switch v := raw.(type) {
+	case float64:
+		n = v
+	case float32:
+		n = float64(v)
+	case int:
+		n = float64(v)
+	case int64:
+		n = float64(v)
+	case json.Number:
+		f, err := v.Float64()
+		if err != nil {
+			return nil
+		}
+		n = f
+	case string:
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return nil
+		}
+		n = f
+	default:
+		return nil
+	}
+	return &n
 }
 
 // Reconciliation 返回成本分析对账报表。
@@ -1499,4 +1696,91 @@ func (h *ApiCallLogHandler) Summary(c *gin.Context) {
 		return
 	}
 	response.Success(c, result)
+}
+
+// extractQuoteFromSnapshot 从 api_call_logs.billing_snapshot 中提取 BillingQuote 快照,
+// 并产出 quote_source 与 quote_consistency 自检结果。
+//
+// 取数规则(对齐 Spec §3 成本分析):
+//   - 有 billing_snapshot.quote → quote_source = "billing_snapshot",直接返回快照
+//   - 有 snapshot 但无 quote(老日志) → quote_source = "legacy_snapshot",quote 为 nil
+//   - 无 snapshot → quote_source = "current_price_recompute_only",仅当前价重算可用
+//
+// quote_consistency 一致性自检:
+//   - snapshot_found: snapshot 是否存在
+//   - line_item_match: sum(line_items.cost_credits) 是否等于 quote.total_credits
+//   - amount_delta_credits: log.cost_credits 与 quote.total_credits 的差(0 = 完美一致)
+func extractQuoteFromSnapshot(billingSnapshot map[string]interface{}, log *model.ApiCallLog) (map[string]interface{}, string, map[string]interface{}) {
+	consistency := map[string]interface{}{
+		"snapshot_found":       false,
+		"line_item_match":      true,
+		"amount_delta_credits": int64(0),
+		"replay_status":        "skipped",
+	}
+
+	if billingSnapshot == nil || len(billingSnapshot) == 0 {
+		return nil, "current_price_recompute_only", consistency
+	}
+	consistency["snapshot_found"] = true
+
+	rawQuote, ok := billingSnapshot["quote"].(map[string]interface{})
+	if !ok || rawQuote == nil {
+		return nil, "legacy_snapshot", consistency
+	}
+
+	// line_item_match: 求和验证。snapshot 中的 line_items 是 []map[string]interface{}。
+	totalFromQuote := snapshotMapInt64(rawQuote, "total_credits")
+	if items, ok := rawQuote["line_items"].([]map[string]interface{}); ok {
+		var sum int64
+		for _, li := range items {
+			sum += snapshotMapInt64(li, "cost_credits")
+		}
+		if sum != totalFromQuote {
+			consistency["line_item_match"] = false
+		}
+		consistency["replay_status"] = "pass"
+	} else if items, ok := rawQuote["line_items"].([]interface{}); ok {
+		// JSON 反序列化路径:line_items 是 []interface{}
+		var sum int64
+		for _, raw := range items {
+			if li, ok := raw.(map[string]interface{}); ok {
+				sum += snapshotMapInt64(li, "cost_credits")
+			}
+		}
+		if sum != totalFromQuote {
+			consistency["line_item_match"] = false
+		}
+		consistency["replay_status"] = "pass"
+	}
+
+	// amount_delta_credits: 日志中的实扣金额与快照应扣金额比较。
+	if log != nil {
+		consistency["amount_delta_credits"] = log.CostCredits - totalFromQuote
+	}
+
+	return rawQuote, "billing_snapshot", consistency
+}
+
+// snapshotMapInt64 从 map 中读取 int64,兼容 float64 / json.Number / int 等数值类型。
+func snapshotMapInt64(m map[string]interface{}, key string) int64 {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return 0
+	}
+	switch n := v.(type) {
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case int32:
+		return int64(n)
+	case uint:
+		return int64(n)
+	case float64:
+		return int64(n)
+	case json.Number:
+		i, _ := n.Int64()
+		return i
+	}
+	return 0
 }

@@ -11,6 +11,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 
+	"tokenhub-server/internal/middleware"
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/credits"
 	"tokenhub-server/internal/pkg/errcode"
@@ -259,6 +260,13 @@ func (h *BatchUserHandler) UpdateUserRole(c *gin.Context) {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return
 	}
+	// 受保护管理员账号守卫: 角色变更视为高危,即使 admin 本人也禁止
+	// (避免把自己从 SUPER_ADMIN 降级导致后续无法管理)
+	if middleware.ShouldBlockProtectedAdminCritical(user.Email) {
+		response.ErrorMsg(c, http.StatusForbidden, 40301,
+			"cannot modify role of protected admin account; this is a critical operation forbidden by CLAUDE.md covenant")
+		return
+	}
 	var oldRoleCodes []string
 	h.db.Table("roles").
 		Joins("JOIN user_roles ON roles.id = user_roles.role_id").
@@ -445,6 +453,12 @@ func (h *BatchUserHandler) UpdateUserStatus(c *gin.Context) {
 			return
 		}
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	// 受保护管理员账号守卫: 即使 admin 本人也禁止禁用自己 (避免账号被锁死)
+	if !req.IsActive && middleware.ShouldBlockProtectedAdminCritical(user.Email) {
+		response.ErrorMsg(c, http.StatusForbidden, 40301,
+			"cannot deactivate protected admin account; this is a critical operation forbidden by CLAUDE.md covenant")
 		return
 	}
 

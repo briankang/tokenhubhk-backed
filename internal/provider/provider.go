@@ -64,7 +64,7 @@ func (r *ChatRequest) Validate() error {
 // 下游供应商适配器应通过 TextContent(m.Content) 取扁平文本（用于日志/缓存判断/Token 估算），
 // 通过 m.Content 原样序列化给上游（支持多模态的供应商如豆包/Qwen-VL/GPT-4V 会自动识别数组格式）。
 type Message struct {
-	Role             string      `json:"role"`              // system/user/assistant
+	Role             string      `json:"role"` // system/user/assistant
 	Content          interface{} `json:"content"`
 	ReasoningContent string      `json:"reasoning_content,omitempty"` // 深度思考内容（豆包/Qwen3/DeepSeek-R1等）
 }
@@ -123,11 +123,12 @@ type Usage struct {
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 	// 缓存相关字段（不支持缓存的供应商保持零值）
-	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`  // 缓存命中Token数（OpenAI cached_tokens / Anthropic cache_read_input_tokens）
-	CacheWriteTokens int `json:"cache_write_tokens,omitempty"` // 缓存写入Token数（Anthropic cache_creation_input_tokens）
+	CacheReadTokens    int `json:"cache_read_tokens,omitempty"`     // 缓存命中Token数（OpenAI cached_tokens / Anthropic cache_read_input_tokens）
+	CacheWriteTokens   int `json:"cache_write_tokens,omitempty"`    // 缓存写入Token数（Anthropic cache_creation_input_tokens）
+	CacheWrite1hTokens int `json:"cache_write_1h_tokens,omitempty"` // Anthropic 1h cache write tokens from usage.cache_creation
 	// 思考模式 Token（阿里云 qwen3.x-plus / deepseek-r1 / qwq 系列等；未使用思考时 0）
 	// 从上游返回的 usage.completion_tokens_details.reasoning_tokens / response.reasoning_content 解析
-	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // StreamChunk 单个流式响应分片

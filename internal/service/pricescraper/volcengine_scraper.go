@@ -61,7 +61,7 @@ func NewVolcengineScraper(apiKey string, browserMgr *BrowserManager) *Volcengine
 			Timeout:   15 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		TLSHandshakeTimeout:  15 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		ForceAttemptHTTP2:     false,
 	}
@@ -79,13 +79,13 @@ type volcAPIResponse struct {
 }
 
 type volcAPIModel struct {
-	ID         string           `json:"id"`         // "doubao-seed-2-0-pro-260215"
-	Name       string           `json:"name"`       // "doubao-seed-2.0-pro" (不含版本后缀)
-	Domain     string           `json:"domain"`     // "LLM", "VLM", "Embedding"
-	Status     string           `json:"status"`     // "Shutdown", "Retiring" 或空（活跃）
-	Version    string           `json:"version"`    // "260215"
-	TaskType   []string         `json:"task_type"`  // ["TextGeneration"]
-	Modalities *volcModalities  `json:"modalities"`
+	ID          string           `json:"id"`        // "doubao-seed-2-0-pro-260215"
+	Name        string           `json:"name"`      // "doubao-seed-2.0-pro" (不含版本后缀)
+	Domain      string           `json:"domain"`    // "LLM", "VLM", "Embedding"
+	Status      string           `json:"status"`    // "Shutdown", "Retiring" 或空（活跃）
+	Version     string           `json:"version"`   // "260215"
+	TaskType    []string         `json:"task_type"` // ["TextGeneration"]
+	Modalities  *volcModalities  `json:"modalities"`
 	TokenLimits *volcTokenLimits `json:"token_limits"`
 }
 
@@ -433,11 +433,13 @@ func getVolcengineSupplementaryPrices() map[string]ScrapedModel {
 		// 详见 https://www.volcengine.com/docs/82379/1544106
 		"doubao-seedance-2.0": {
 			ModelName: "doubao-seedance-2.0", DisplayName: "Seedance 2.0",
-			InputPrice: 46.0, OutputPrice: 0, Currency: "CNY",
+			InputPrice: 0, OutputPrice: 46.0, Currency: "CNY",
 			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
 			PriceTiers: []model.PriceTier{
-				// 无视频输入：46 元/百万tokens（单维度阶梯按输入 token 数粗粒度）
-				{Name: "无视频输入", InputMin: 0, InputMinExclusive: true, OutputMin: 0, OutputMinExclusive: true, InputPrice: 46.0, OutputPrice: 0},
+				{Name: "480p/720p 在线推理 · 输入不含视频", InputMin: 0, InputMinExclusive: true, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 46.0},
+				{Name: "480p/720p 在线推理 · 输入包含视频", InputMin: 1, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 28.0},
+				{Name: "1080p 在线推理 · 输入不含视频", InputMin: 1080, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 51.0},
+				{Name: "1080p 在线推理 · 输入包含视频", InputMin: 1081, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 31.0},
 			},
 			VideoPricingConfig: &model.VideoPricingConfig{
 				RequireInputVideo:  true,
@@ -452,15 +454,16 @@ func getVolcengineSupplementaryPrices() map[string]ScrapedModel {
 		},
 		"doubao-seedance-2.0-fast": {
 			ModelName: "doubao-seedance-2.0-fast", DisplayName: "Seedance 2.0 Fast",
-			InputPrice: 20.0, OutputPrice: 0, Currency: "CNY",
+			InputPrice: 0, OutputPrice: 37.0, Currency: "CNY",
 			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
 			PriceTiers: []model.PriceTier{
-				{Name: "无视频输入", InputMin: 0, InputMinExclusive: true, OutputMin: 0, OutputMinExclusive: true, InputPrice: 20.0, OutputPrice: 0},
+				{Name: "在线推理 · 输入不含视频", InputMin: 0, InputMinExclusive: true, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 37.0},
+				{Name: "在线推理 · 输入包含视频", InputMin: 1, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 22.0},
 			},
 			VideoPricingConfig: &model.VideoPricingConfig{
 				RequireInputVideo:  true,
-				HasInputVideoPrice: 12.0,
-				NoInputVideoPrice:  20.0,
+				HasInputVideoPrice: 22.0,
+				NoInputVideoPrice:  37.0,
 				MinTokensRules: []model.VideoMinTokenRule{
 					{OutputDurationSec: 5.0, MinTokens: 116508},
 					{OutputDurationSec: 10.0, MinTokens: 233016},
@@ -469,7 +472,7 @@ func getVolcengineSupplementaryPrices() map[string]ScrapedModel {
 		},
 		"doubao-seedance-2.0-video-input": {
 			ModelName: "doubao-seedance-2.0-video-input", DisplayName: "Seedance 2.0（含视频输入）",
-			InputPrice: 28.0, OutputPrice: 0, Currency: "CNY",
+			InputPrice: 0, OutputPrice: 28.0, Currency: "CNY",
 			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
 			VideoPricingConfig: &model.VideoPricingConfig{
 				RequireInputVideo:  true,
@@ -482,8 +485,9 @@ func getVolcengineSupplementaryPrices() map[string]ScrapedModel {
 		},
 		"doubao-seedance-1.5-pro": {
 			ModelName: "doubao-seedance-1.5-pro", DisplayName: "Seedance 1.5 Pro",
-			InputPrice: 15.0, OutputPrice: 0, Currency: "CNY",
+			InputPrice: 0, OutputPrice: 16.0, Currency: "CNY",
 			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
+			PriceTiers: seedance15PriceTiers(),
 			VideoPricingConfig: &model.VideoPricingConfig{
 				SupportDraft:    true,
 				DraftCoefSilent: 0.7,
@@ -492,8 +496,21 @@ func getVolcengineSupplementaryPrices() map[string]ScrapedModel {
 		},
 		"doubao-seedance-1.0-pro": {
 			ModelName: "doubao-seedance-1.0-pro", DisplayName: "Seedance 1.0 Pro",
-			InputPrice: 10.0, OutputPrice: 0, Currency: "CNY",
+			InputPrice: 0, OutputPrice: 15.0, Currency: "CNY",
 			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
+			PriceTiers: seedanceOnlineOfflineTiers(15.0),
+		},
+		"doubao-seedance-1.0-pro-fast": {
+			ModelName: "doubao-seedance-1.0-pro-fast", DisplayName: "Seedance 1.0 Pro Fast",
+			InputPrice: 0, OutputPrice: 4.2, Currency: "CNY",
+			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
+			PriceTiers: seedanceOnlineOfflineTiers(4.2),
+		},
+		"doubao-seedance-1.0-lite": {
+			ModelName: "doubao-seedance-1.0-lite", DisplayName: "Seedance 1.0 Lite",
+			InputPrice: 0, OutputPrice: 10.0, Currency: "CNY",
+			ModelType: "VideoGeneration", PricingUnit: PricingUnitPerMillionTokens,
+			PriceTiers: seedanceOnlineOfflineTiers(10.0),
 		},
 
 		// ============ 图片生成模型 (Seedream) — 元/张 ============
@@ -678,14 +695,30 @@ func getVolcengineSupplementaryPrices() map[string]ScrapedModel {
 	return prices
 }
 
+func seedance15PriceTiers() []model.PriceTier {
+	return []model.PriceTier{
+		{Name: "在线推理 · 有声视频", InputMin: 0, InputMinExclusive: true, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 16.0},
+		{Name: "在线推理 · 无声视频", InputMin: 1, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 8.0},
+		{Name: "离线推理 · 有声视频", InputMin: 2, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 8.0},
+		{Name: "离线推理 · 无声视频", InputMin: 3, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 4.0},
+	}
+}
+
+func seedanceOnlineOfflineTiers(online float64) []model.PriceTier {
+	return []model.PriceTier{
+		{Name: "在线推理", InputMin: 0, InputMinExclusive: true, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: online},
+		{Name: "离线推理", InputMin: 1, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: online * 0.5},
+	}
+}
+
 // findPrice 为 API 模型查找匹配的价格
 func (s *VolcengineScraper) findPrice(api volcAPIModel, priceMap map[string]ScrapedModel) (ScrapedModel, bool) {
 	// 尝试匹配策略（按优先级）：
 	candidates := []string{
-		strings.ToLower(api.Name),                    // 原始 name
-		normalizeModelName(api.Name),                 // 标准化 name（1-5 → 1.5）
-		strings.ToLower(api.ID),                      // 完整 ID
-		normalizeModelName(api.ID),                   // 标准化 ID
+		strings.ToLower(api.Name),    // 原始 name
+		normalizeModelName(api.Name), // 标准化 name（1-5 → 1.5）
+		strings.ToLower(api.ID),      // 完整 ID
+		normalizeModelName(api.ID),   // 标准化 ID
 	}
 
 	// 去除版本号后缀的 ID（如 doubao-seed-2-0-pro-260215 → doubao-seed-2-0-pro）

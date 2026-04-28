@@ -50,6 +50,33 @@ func TestV1EstimateCost(t *testing.T) {
 	}
 }
 
+func TestV1EstimateCostAllowsAnonymous(t *testing.T) {
+	apiKey := ensureCodingAPIKey(t)
+
+	modelName := "qwen-plus"
+	if first := firstV1ModelID(t, apiKey); first != "" {
+		modelName = first
+	}
+
+	body, status, err := doRawRequest("POST", baseURL+"/v1/estimate/cost", map[string]interface{}{
+		"model":         modelName,
+		"input_tokens":  100,
+		"output_tokens": 50,
+	}, "")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if status == http.StatusNotFound {
+		t.Skip("no priced model available for anonymous estimate")
+	}
+	if status == http.StatusUnauthorized {
+		t.Fatalf("estimate cost should be public for Playground previews, got 401: %s", string(body))
+	}
+	if status != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", status, string(body))
+	}
+}
+
 func firstV1ModelID(t *testing.T, apiKey string) string {
 	t.Helper()
 	body, status, err := doRawRequest("GET", baseURL+"/v1/models", nil, apiKey)

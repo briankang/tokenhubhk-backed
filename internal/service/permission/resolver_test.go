@@ -167,6 +167,9 @@ func TestSubjectPerms_IsSuperAdmin(t *testing.T) {
 	if !(&SubjectPerms{RoleCodes: []string{"SUPER_ADMIN"}}).IsSuperAdmin() {
 		t.Error("SUPER_ADMIN role should match")
 	}
+	if !(&SubjectPerms{RoleCodes: []string{"ADMIN"}}).IsSuperAdmin() {
+		t.Error("legacy ADMIN role should be treated as SUPER_ADMIN")
+	}
 	if (&SubjectPerms{RoleCodes: []string{"FINANCE_MANAGER", "AUDITOR"}}).IsSuperAdmin() {
 		t.Error("non-SUPER_ADMIN roles should not match")
 	}

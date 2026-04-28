@@ -430,22 +430,10 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 			// 阿里云: display_name 就是完整的模型 ID
 			modelType := inferModelTypeFromID(modelName)
 			pricingUnit := inferPricingUnitFromID(modelName, modelType)
-			// 非 LLM/VLM 模型（图像/视频/语音等）默认启用（已对接相应端点 /v1/images/generations、/v1/audio/* 等）
-			// 仅带日期后缀的老旧模型禁用
-			isActive := true
-			if isOldDatedModel(modelName) {
-				isActive = false
-			}
-
-			// 定价策略：模型发现阶段价格字段均为 0
-			//  - 命中免费白名单 → 打 "Free/免费" 标签，保持启用
-			//  - 其他 Token 计费模型 → 打 "NeedsPricing/待定价" 标签；对无价格 API 的供应商
-			//    （如腾讯混元）额外强制 IsActive=false，等待价格手动录入
+			// 自动入库的新模型一律默认禁用（IsActive=false），等待管理员人工审核启用，避免直接对外公开
+			// 后续配置售价不会自动启用 —— 见 pricing_service.autoEnableIfNeedsSellPrice 的 source=='auto' 守卫
 			isFree := pricescraper.IsFreeModel(modelName, 0, 0)
 			priceMissing := !isFree && pricescraper.IsPriceMissing(modelName, pricingUnit, modelType, 0, 0)
-			if priceMissing && isSupplierWithoutPriceAPI(channel.Supplier.Code) {
-				isActive = false
-			}
 
 			aiModel := model.AIModel{
 				ModelName:    modelName,
@@ -454,7 +442,7 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 				SupplierID:   channel.SupplierID,
 				Status:       "offline",
 				Source:       "auto",
-				IsActive:     isActive,
+				IsActive:     false,
 				LastSyncedAt: &now,
 				ModelType:    modelType,
 				PricingUnit:  pricingUnit,
@@ -462,9 +450,10 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 			}
 			// 初始化 features：先继承供应商默认能力，再叠加强制流式标记
 			aiModel.Features = mergeSupplierDefaultFeatures(channel.Supplier.DefaultFeatures, channel.Supplier.Code, modelName, modelType, nil, nil)
-			// 基础品牌标签 + 能力衍生标签 + 定价标签
+			// 基础品牌标签 + 能力衍生标签 + 定价标签 + NeedsReview 待审核标签
 			baseTags := InferModelTagsWithFeatures(modelName, channel.Supplier.Code, modelType, aiModel.Features)
-			aiModel.Tags = pricescraper.AugmentTagsForPricing(baseTags, isFree, priceMissing)
+			tagsWithPricing := pricescraper.AugmentTagsForPricing(baseTags, isFree, priceMissing)
+			aiModel.Tags = addTagToStr(tagsWithPricing, "NeedsReview")
 			if err := s.db.Create(&aiModel).Error; err != nil {
 				if strings.Contains(err.Error(), "Duplicate") || strings.Contains(err.Error(), "UNIQUE") {
 					aiModelSet[modelName] = true
@@ -472,6 +461,9 @@ func (s *DiscoveryService) syncStandardModels(channel model.Channel, models []op
 					result.Errors = append(result.Errors, fmt.Sprintf("写入 AIModel [%s] 失败: %v", modelName, err))
 				}
 			} else {
+				// AIModel.IsActive 字段有 GORM `default:true` tag，Create 时 false 零值会被跳过
+				// 必须显式 UPDATE 才能落地 is_active=false
+				s.db.Table("ai_models").Where("id = ?", aiModel.ID).Update("is_active", false)
 				aiModelSet[modelName] = true
 				result.NewModelIDs = append(result.NewModelIDs, aiModel.ID)
 			}
@@ -611,6 +603,7 @@ func (s *DiscoveryService) syncVolcengineModels(channel model.Channel, models []
 				}
 			}
 			pricingUnit := inferPricingUnitFromID(modelName, inferredType)
+			// 自动入库的新模型一律默认禁用，等待管理员人工审核启用
 			aiModel := model.AIModel{
 				ModelName:        modelName,
 				DisplayName:      volcFields.displayName,
@@ -618,7 +611,7 @@ func (s *DiscoveryService) syncVolcengineModels(channel model.Channel, models []
 				SupplierID:       channel.SupplierID,
 				Status:           "offline",
 				Source:           "auto",
-				IsActive:         true,
+				IsActive:         false,
 				LastSyncedAt:     &now,
 				ModelType:        inferredType,
 				PricingUnit:      pricingUnit,
@@ -634,7 +627,10 @@ func (s *DiscoveryService) syncVolcengineModels(channel model.Channel, models []
 				SupplierStatus:   volcFields.supplierStatus,
 				ApiCreatedAt:     volcFields.apiCreatedAt,
 			}
-			aiModel.Tags = InferModelTagsWithFeatures(modelName, channel.Supplier.Code, inferredType, aiModel.Features)
+			aiModel.Tags = addTagToStr(
+				InferModelTagsWithFeatures(modelName, channel.Supplier.Code, inferredType, aiModel.Features),
+				"NeedsReview",
+			)
 
 			if err := s.db.Create(&aiModel).Error; err != nil {
 				if strings.Contains(err.Error(), "Duplicate") || strings.Contains(err.Error(), "UNIQUE") {
@@ -643,6 +639,9 @@ func (s *DiscoveryService) syncVolcengineModels(channel model.Channel, models []
 					result.Errors = append(result.Errors, fmt.Sprintf("写入 AIModel [%s] 失败: %v", modelName, err))
 				}
 			} else {
+				// AIModel.IsActive 字段有 GORM `default:true` tag，Create 时 false 零值会被跳过
+				// 必须显式 UPDATE 才能落地 is_active=false
+				s.db.Table("ai_models").Where("id = ?", aiModel.ID).Update("is_active", false)
 				aiModelSet[modelName] = true
 				result.NewModelIDs = append(result.NewModelIDs, aiModel.ID)
 			}

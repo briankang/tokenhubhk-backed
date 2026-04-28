@@ -29,8 +29,9 @@ func NewModelCategoryHandler(svc *modelcatsvc.ModelCategoryService) *ModelCatego
 func (h *ModelCategoryHandler) List(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	supplierID64, _ := strconv.ParseUint(c.DefaultQuery("supplier_id", "0"), 10, 64)
 
-	cats, total, err := h.svc.List(c.Request.Context(), page, pageSize)
+	cats, total, err := h.svc.List(c.Request.Context(), page, pageSize, uint(supplierID64))
 	if err != nil {
 		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
 		return

@@ -696,20 +696,33 @@ func TestListOnline_OnlyActiveAndOnline(t *testing.T) {
 		"input_cost_rmb": 0, "output_cost_rmb": 0,
 	})
 
+	// 模型 5: 非聊天模型有价格 → 默认公开列表也应展示，保证 /models 与数据库公开状态一致
+	m5 := createTestModel(t, svc, sup.ID, categoryID, "image-visible-model")
+	db.Model(&model.AIModel{}).Where("id = ?", m5.ID).Updates(map[string]interface{}{
+		"status": "online", "is_active": true, "model_type": "ImageGeneration",
+		"input_cost_rmb": 0.3, "output_cost_rmb": 0,
+	})
+
 	list, total, err := svc.ListOnline(ctx, 1, 20)
 	if err != nil {
 		t.Fatalf("ListOnline: %v", err)
 	}
 
-	// 只有 m1 (online + active + has price) 应该出现
-	if total != 1 {
-		t.Errorf("ListOnline total want 1, got %d", total)
+	// m1 和 m5 (online + active + has price) 应该出现
+	if total != 2 {
+		t.Errorf("ListOnline total want 2, got %d", total)
 	}
-	if len(list) != 1 {
-		t.Errorf("ListOnline list length want 1, got %d", len(list))
+	if len(list) != 2 {
+		t.Errorf("ListOnline list length want 2, got %d", len(list))
 	}
-	if len(list) > 0 && list[0].ModelName != "visible-model" {
-		t.Errorf("expected 'visible-model', got %q", list[0].ModelName)
+	got := map[string]bool{}
+	for _, item := range list {
+		got[item.ModelName] = true
+	}
+	for _, name := range []string{"visible-model", "image-visible-model"} {
+		if !got[name] {
+			t.Errorf("expected %q in ListOnline result, got %#v", name, got)
+		}
 	}
 }
 

@@ -94,7 +94,23 @@ func (h *MiscHandler) ListAuditLogs(c *gin.Context) {
 		return
 	}
 
+	normalizeAuditLogDisplay(logs)
 	response.PageResult(c, logs, total, page, pageSize)
+}
+
+// normalizeAuditLogDisplay 用当前路由元数据修正历史审计记录中的展示字段。
+// 早期版本若因编码问题写入了乱码，列表接口仍然返回可读的菜单/功能名称。
+func normalizeAuditLogDisplay(logs []model.AuditLog) {
+	for i := range logs {
+		meta, ok := auditmw.Lookup(logs[i].Method, logs[i].Path)
+		if !ok {
+			continue
+		}
+		logs[i].Menu = meta.Menu
+		logs[i].Feature = meta.Feature
+		logs[i].Action = meta.Action
+		logs[i].Resource = meta.Resource
+	}
 }
 
 // ListAuditMenus 返回审计日志可用的菜单列表 GET /api/v1/admin/audit-logs/menus

@@ -39,12 +39,17 @@ func Seed(db *gorm.DB) error {
 	if err != nil {
 		return fmt.Errorf("backfill user_roles: %w", err)
 	}
+	defaultAdminEnsured, err := ensureDefaultAdminSuperRole(db, rolesByCode)
+	if err != nil {
+		return fmt.Errorf("ensure default admin role: %w", err)
+	}
 
 	if logger.L != nil {
 		logger.L.Info("permission seed complete",
 			zap.Int("permissions", len(permsByCode)),
 			zap.Int("roles", len(rolesByCode)),
 			zap.Int("user_roles_backfilled", backfilled),
+			zap.Bool("default_admin_super_role_ensured", defaultAdminEnsured),
 			zap.Duration("duration", time.Since(start)),
 		)
 	}
@@ -300,4 +305,46 @@ func backfillUserRoles(db *gorm.DB, rolesByCode map[string]*model.Role) (int, er
 		return 0, fmt.Errorf("insert user_roles: %w", err)
 	}
 	return len(rows), nil
+}
+
+// ensureDefaultAdminSuperRole guarantees the built-in seeded admin keeps root access.
+func ensureDefaultAdminSuperRole(db *gorm.DB, rolesByCode map[string]*model.Role) (bool, error) {
+	superRole, ok := rolesByCode["SUPER_ADMIN"]
+	if !ok || superRole == nil || superRole.ID == 0 {
+		return false, nil
+	}
+
+	var admin struct {
+		ID uint
+	}
+	if err := db.Table("users").
+		Select("id").
+		Where("email = ?", "admin@tokenhubhk.com").
+		Scan(&admin).Error; err != nil {
+		return false, err
+	}
+	if admin.ID == 0 {
+		return false, nil
+	}
+
+	var count int64
+	if err := db.Model(&model.UserRole{}).
+		Where("user_id = ? AND role_id = ?", admin.ID, superRole.ID).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	if count > 0 {
+		return true, nil
+	}
+
+	row := model.UserRole{
+		UserID:    admin.ID,
+		RoleID:    superRole.ID,
+		GrantedBy: 0,
+		GrantedAt: time.Now(),
+	}
+	if err := db.Create(&row).Error; err != nil {
+		return false, err
+	}
+	return true, nil
 }

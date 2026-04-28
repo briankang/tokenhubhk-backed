@@ -13,11 +13,15 @@ import "context"
 type VideoRequest struct {
 	Model          string                 `json:"model"`
 	Prompt         string                 `json:"prompt"`
-	ImageURL       string                 `json:"image_url,omitempty"`    // 鍥剧敓瑙嗛锛坕2v锛夊弬鑰冨浘
-	Duration       int                    `json:"duration,omitempty"`     // 绉掓暟锛岄€氬父 4/5/10
-	Resolution     string                 `json:"resolution,omitempty"`   // "720P"/"1080P"/"480P"
-	AspectRatio    string                 `json:"aspect_ratio,omitempty"` // "16:9"/"9:16"/"1:1"
-	FPS            int                    `json:"fps,omitempty"`          // 甯х巼锛堝彲閫夛紝榛樿渚涘簲鍟嗛粯璁ゅ€硷級
+	ImageURL       string                 `json:"image_url,omitempty"`      // 鍥剧敓瑙嗛锛坕2v锛夊弬鑰冨浘
+	VideoURL       string                 `json:"video_url,omitempty"`      // 输入视频 URL，用于视频到视频任务
+	Duration       int                    `json:"duration,omitempty"`       // 绉掓暟锛岄€氬父 4/5/10
+	Resolution     string                 `json:"resolution,omitempty"`     // "720P"/"1080P"/"480P"
+	AspectRatio    string                 `json:"aspect_ratio,omitempty"`   // "16:9"/"9:16"/"1:1"
+	FPS            int                    `json:"fps,omitempty"`            // 甯х巼锛堝彲閫夛紝榛樿渚涘簲鍟嗛粯璁ゅ€硷級
+	GenerateAudio  *bool                  `json:"generate_audio,omitempty"` // Seedance 1.5 Pro：true=有声视频，false=无声视频
+	ServiceTier    string                 `json:"service_tier,omitempty"`   // default=在线推理，flex=离线推理
+	Draft          *bool                  `json:"draft,omitempty"`          // Seedance 1.5 Pro 样片模式
 	Seed           int64                  `json:"seed,omitempty"`
 	NegativePrompt string                 `json:"negative_prompt,omitempty"`
 	Extra          map[string]interface{} `json:"extra,omitempty"`

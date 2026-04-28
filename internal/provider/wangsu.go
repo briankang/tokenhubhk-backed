@@ -692,6 +692,9 @@ func (p *WangsuProvider) GenerateVideo(ctx context.Context, req *VideoRequest) (
 	if req.ImageURL != "" {
 		body["image_url"] = req.ImageURL
 	}
+	if req.VideoURL != "" {
+		body["video_url"] = req.VideoURL
+	}
 	if req.Duration > 0 {
 		body["duration"] = req.Duration
 	}

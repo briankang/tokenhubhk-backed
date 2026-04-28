@@ -250,3 +250,124 @@ func TestAuthService_ChangePassword(t *testing.T) {
 func TestAuthService_ChangePassword_WrongOld(t *testing.T) {
 	t.Skip("ChangePassword service API was removed; password reset is covered by admin/API flows")
 }
+
+// 回归测试：注册时 invite_code 解析的三表 fallback
+// Bug 历史：v3.1 推荐链路改造后，注册逻辑只查 tenants.domain，导致用户分享的
+// referral_link.code（如 egRtFJBi）注册时报 "invalid invite code"。
+// 修复后应优先白标 tenant，未命中再回退到 referral_links / users.referral_code。
+
+// uniqueRefCode 生成测试用的唯一邀请码（≤20 字符）
+func uniqueRefCode() string {
+	return fmt.Sprintf("rk%d%d", time.Now().UnixNano()%1e8, rand.Intn(1000))
+}
+
+func TestAuthService_Register_InviteCodeFromReferralLink(t *testing.T) {
+	if testDB == nil {
+		t.Skip("database not available")
+	}
+	_ = testDB.AutoMigrate(&model.ReferralLink{})
+
+	svc := auth.NewAuthService(testDB, testRedis, jwtCfg)
+	ctx := context.Background()
+
+	// 准备：注册一个邀请人，并为其创建 referral_link
+	inviterEmail := uniqueEmail()
+	inviter, err := svc.Register(ctx, &auth.RegisterRequest{
+		Email:    inviterEmail,
+		Password: testAuthPassword(inviterEmail, "Test@123456"),
+		Name:     "Inviter",
+	})
+	if err != nil {
+		t.Fatalf("inviter register failed: %v", err)
+	}
+	link := &model.ReferralLink{
+		UserID:   inviter.ID,
+		TenantID: inviter.TenantID,
+		Code:     uniqueRefCode(),
+	}
+	if err := testDB.Create(link).Error; err != nil {
+		t.Fatalf("create referral_link failed: %v", err)
+	}
+
+	// 执行：用 referral_link.code 作为 invite_code 注册新用户
+	inviteeEmail := uniqueEmail()
+	invitee, err := svc.Register(ctx, &auth.RegisterRequest{
+		Email:      inviteeEmail,
+		Password:   testAuthPassword(inviteeEmail, "Test@123456"),
+		Name:       "Invitee FromLink",
+		InviteCode: link.Code,
+	})
+	if err != nil {
+		t.Fatalf("invitee register with referral_link code failed: %v", err)
+	}
+	if invitee == nil || invitee.ID == 0 {
+		t.Fatal("invitee should be created")
+	}
+	// 落到默认租户（不是邀请人的 tenant，因为 referral_link.code != tenants.domain）
+	if invitee.TenantID == 0 {
+		t.Error("invitee should have a tenant (default tenant)")
+	}
+}
+
+func TestAuthService_Register_InviteCodeFromUserReferralCode(t *testing.T) {
+	if testDB == nil {
+		t.Skip("database not available")
+	}
+
+	svc := auth.NewAuthService(testDB, testRedis, jwtCfg)
+	ctx := context.Background()
+
+	// 准备：注册邀请人后，给其 users.referral_code 字段赋值
+	inviterEmail := uniqueEmail()
+	inviter, err := svc.Register(ctx, &auth.RegisterRequest{
+		Email:    inviterEmail,
+		Password: testAuthPassword(inviterEmail, "Test@123456"),
+		Name:     "Inviter UserCode",
+	})
+	if err != nil {
+		t.Fatalf("inviter register failed: %v", err)
+	}
+	refCode := uniqueRefCode()
+	if err := testDB.Model(&model.User{}).Where("id = ?", inviter.ID).
+		Update("referral_code", refCode).Error; err != nil {
+		t.Fatalf("set inviter referral_code failed: %v", err)
+	}
+
+	// 执行：用 users.referral_code 作为 invite_code
+	inviteeEmail := uniqueEmail()
+	invitee, err := svc.Register(ctx, &auth.RegisterRequest{
+		Email:      inviteeEmail,
+		Password:   testAuthPassword(inviteeEmail, "Test@123456"),
+		Name:       "Invitee FromUserCode",
+		InviteCode: refCode,
+	})
+	if err != nil {
+		t.Fatalf("invitee register with users.referral_code failed: %v", err)
+	}
+	if invitee == nil || invitee.ID == 0 {
+		t.Fatal("invitee should be created")
+	}
+}
+
+func TestAuthService_Register_InviteCodeInvalid(t *testing.T) {
+	if testDB == nil {
+		t.Skip("database not available")
+	}
+
+	svc := auth.NewAuthService(testDB, testRedis, jwtCfg)
+	ctx := context.Background()
+
+	email := uniqueEmail()
+	_, err := svc.Register(ctx, &auth.RegisterRequest{
+		Email:      email,
+		Password:   testAuthPassword(email, "Test@123456"),
+		Name:       "Invalid Invite",
+		InviteCode: "noSuchCodeXYZ",
+	})
+	if err == nil {
+		t.Fatal("registration with non-existent invite_code should fail")
+	}
+	if !strings.Contains(err.Error(), "invalid invite code") {
+		t.Errorf("expected 'invalid invite code' error, got: %v", err)
+	}
+}

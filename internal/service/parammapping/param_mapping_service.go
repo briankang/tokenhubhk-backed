@@ -25,11 +25,11 @@ type ParamMappingService struct {
 
 // mappingEntry 运行时缓存的映射条目
 type mappingEntry struct {
-	PlatformParam   string // 平台参数名
-	VendorParam     string // 供应商参数名
-	TransformType   string
-	TransformRule   string
-	Supported       bool
+	PlatformParam string // 平台参数名
+	VendorParam   string // 供应商参数名
+	TransformType string
+	TransformRule string
+	Supported     bool
 }
 
 type ParamCoverageItem struct {
@@ -123,16 +123,24 @@ func (s *ParamMappingService) UpsertMapping(ctx context.Context, mapping *model.
 		First(&existing).Error
 
 	if err == gorm.ErrRecordNotFound {
+		supported := mapping.Supported
 		if err := s.db.WithContext(ctx).Create(mapping).Error; err != nil {
 			return err
+		}
+		if !supported {
+			if err := s.db.WithContext(ctx).Model(&model.SupplierParamMapping{}).
+				Where("id = ?", mapping.ID).
+				Update("supported", false).Error; err != nil {
+				return err
+			}
 		}
 	} else if err == nil {
 		if err := s.db.WithContext(ctx).Model(&model.SupplierParamMapping{}).Where("id = ?", existing.ID).Updates(map[string]interface{}{
 			"vendor_param_name": mapping.VendorParamName,
-			"transform_type":   mapping.TransformType,
-			"transform_rule":   mapping.TransformRule,
-			"supported":        mapping.Supported,
-			"notes":            mapping.Notes,
+			"transform_type":    mapping.TransformType,
+			"transform_rule":    mapping.TransformRule,
+			"supported":         mapping.Supported,
+			"notes":             mapping.Notes,
 		}).Error; err != nil {
 			return err
 		}
@@ -238,11 +246,11 @@ func (s *ParamMappingService) GetCoverageReport(ctx context.Context) (*ParamMapp
 		}
 
 		item := SupplierParamCoverage{
-			SupplierID:       supplier.ID,
-			SupplierCode:     supplier.Code,
-			SupplierName:     supplier.Name,
-			TotalParams:      len(params),
-			MissingParams:    make([]ParamCoverageItem, 0),
+			SupplierID:        supplier.ID,
+			SupplierCode:      supplier.Code,
+			SupplierName:      supplier.Name,
+			TotalParams:       len(params),
+			MissingParams:     make([]ParamCoverageItem, 0),
 			UnsupportedParams: make([]ParamCoverageItem, 0),
 		}
 		if err := s.db.WithContext(ctx).Model(&model.AIModel{}).
@@ -313,12 +321,14 @@ func (s *ParamMappingService) TransformParamsWithContext(ctx context.Context, su
 		if !entry.Supported {
 			// 该供应商不支持此参数，跳过
 			reqID, _ := ctx.Value("request_id").(string)
-			logger.L.Debug("param filtered: not supported by supplier",
-				zap.String("platform_param", entry.PlatformParam),
-				zap.String("supplier", supplierCode),
-				zap.Any("value", value),
-				zap.String("request_id", reqID),
-			)
+			if logger.L != nil {
+				logger.L.Debug("param filtered: not supported by supplier",
+					zap.String("platform_param", entry.PlatformParam),
+					zap.String("supplier", supplierCode),
+					zap.Any("value", value),
+					zap.String("request_id", reqID),
+				)
+			}
 			continue
 		}
 

@@ -376,12 +376,12 @@ func extractTierPrices(cells *goquery.Selection, colMap columnMap) []model.Price
 		tierName := fmt.Sprintf("tier_%d", idx+1)
 		tier := model.PriceTier{
 			Name:       tierName,
-			MinTokens:  int64(idx) * 1000000,
+			InputMin:   int64(idx) * 1000000,
 			InputPrice: pricePerM,
 		}
 		if idx < len(colMap.tierCols)-1 {
 			maxT := int64(idx+1) * 1000000
-			tier.MaxTokens = &maxT
+			tier.InputMax = &maxT
 		}
 
 		tiers = append(tiers, tier)

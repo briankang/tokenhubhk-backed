@@ -75,6 +75,15 @@ func assertSeededImageModel(t *testing.T, db *gorm.DB, modelName string, officia
 	if !almostEqual(ai.InputCostRMB, wantCost) {
 		t.Fatalf("%s cost=%f, want %f", modelName, ai.InputCostRMB, wantCost)
 	}
+	if ai.PriceSourceCurrency != "USD" {
+		t.Fatalf("%s source currency=%q, want USD", modelName, ai.PriceSourceCurrency)
+	}
+	if !almostEqual(ai.PriceSourceExchangeRate, USDCNYSnapshot) {
+		t.Fatalf("%s exchange rate=%f, want %f", modelName, ai.PriceSourceExchangeRate, USDCNYSnapshot)
+	}
+	if !almostEqual(ai.InputCostUSD, officialUSD) {
+		t.Fatalf("%s source usd=%f, want %f", modelName, ai.InputCostUSD, officialUSD)
+	}
 
 	var pricing model.ModelPricing
 	if err := db.Where("model_id = ?", ai.ID).First(&pricing).Error; err != nil {

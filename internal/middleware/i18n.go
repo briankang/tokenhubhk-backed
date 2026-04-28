@@ -12,6 +12,11 @@ import (
 // I18n 国际化中间件，解析 Accept-Language 请求头并将翻译器写入上下文
 func I18n() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if IsHealthPath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+
 		lang := parseLang(c)
 		c.Set("lang", lang)
 		c.Set("i18n_msg", pkgi18n.NewTranslator(lang))

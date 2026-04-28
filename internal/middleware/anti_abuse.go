@@ -59,7 +59,7 @@ func AntiAbuseMiddleware(db *gorm.DB, guardSvc *guard.Service) gin.HandlerFunc {
 		// 4. 获取全局风控与限额配置
 		ctx := c.Request.Context()
 		gCfg := guardSvc.GetConfig(ctx)
-		
+
 		// 获取付费门槛配置
 		paidThreshold := int64(100000) // 默认 10 元
 		var quotaCfg model.QuotaConfig
@@ -67,7 +67,12 @@ func AntiAbuseMiddleware(db *gorm.DB, guardSvc *guard.Service) gin.HandlerFunc {
 			paidThreshold = quotaCfg.PaidThresholdCredits
 		}
 
-		isPaid := balance.TotalRecharged >= paidThreshold
+		_ = balance.TotalRecharged >= paidThreshold
+		isPaid, err := LoadPaidUserStatus(ctx, db, userID)
+		if err != nil {
+			c.Next()
+			return
+		}
 
 		// 5. 设置限速参数 (从配置加载)
 		var rpmLimit int
@@ -120,7 +125,7 @@ func AntiAbuseMiddleware(db *gorm.DB, guardSvc *guard.Service) gin.HandlerFunc {
 		concKey := fmt.Sprintf("abuse:conc:%d", userID)
 		currConc, _ := redis.Get(ctx, concKey).Int()
 		if maxConc > 0 && currConc >= maxConc {
-			response.ErrorMsg(c, http.StatusTooManyRequests, errcode.ErrRateLimit.Code, 
+			response.ErrorMsg(c, http.StatusTooManyRequests, errcode.ErrRateLimit.Code,
 				fmt.Sprintf("Concurrent limit exceeded (%d/%d). Please upgrade or reduce requests.", currConc, maxConc))
 			c.Abort()
 			return
@@ -131,7 +136,7 @@ func AntiAbuseMiddleware(db *gorm.DB, guardSvc *guard.Service) gin.HandlerFunc {
 			tpmKey := fmt.Sprintf("abuse:tpm:%d:%d", userID, time.Now().Unix()/60)
 			currentTPM, _ := redis.Get(ctx, tpmKey).Int64()
 			if currentTPM >= tpmLimit {
-				response.ErrorMsg(c, http.StatusTooManyRequests, errcode.ErrRateLimit.Code, 
+				response.ErrorMsg(c, http.StatusTooManyRequests, errcode.ErrRateLimit.Code,
 					"Minute token consumption limit exceeded. Please recharge to unlock higher limits.")
 				c.Abort()
 				return
@@ -152,7 +157,7 @@ func checkRPM(ctx context.Context, redis *goredis.Client, key string, limit int,
 	}
 
 	if int(count) > limit {
-		response.ErrorMsg(c, http.StatusTooManyRequests, errcode.ErrRateLimit.Code, 
+		response.ErrorMsg(c, http.StatusTooManyRequests, errcode.ErrRateLimit.Code,
 			fmt.Sprintf("Request frequency too high (%d/%d rpm). Please upgrade to normal user.", count, limit))
 		c.Abort()
 		return false

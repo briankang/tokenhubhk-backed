@@ -10,26 +10,26 @@ import (
 
 // ServiceRole 服务角色常量
 const (
-	RoleGateway  = "gateway"  // API 网关 / 模型中转
-	RoleBackend  = "backend"  // 用户 + 管理后台
-	RoleWorker   = "worker"   // 后台任务 + 重操作执行器
-	RoleMonolith = ""         // 单体模式（全功能，向后兼容）
+	RoleGateway  = "gateway" // API 网关 / 模型中转
+	RoleBackend  = "backend" // 用户 + 管理后台
+	RoleWorker   = "worker"  // 后台任务 + 重操作执行器
+	RoleMonolith = ""        // 单体模式（全功能，向后兼容）
 )
 
 // AppConfig 应用程序全局配置结构体
 type AppConfig struct {
-	Service   ServiceConfig   `mapstructure:"service"`
-	Server    ServerConfig    `mapstructure:"server"`
-	Database  DatabaseConfig  `mapstructure:"database"`
-	Redis     RedisConfig     `mapstructure:"redis"`
-	JWT       JWTConfig       `mapstructure:"jwt"`
-	Log       LogConfig       `mapstructure:"log"`
-	RateLimit RateLimitConfig `mapstructure:"ratelimit"`
-	I18n      I18nConfig      `mapstructure:"i18n"`
-	Payment   PaymentConfig   `mapstructure:"payment"`
+	Service      ServiceConfig      `mapstructure:"service"`
+	Server       ServerConfig       `mapstructure:"server"`
+	Database     DatabaseConfig     `mapstructure:"database"`
+	Redis        RedisConfig        `mapstructure:"redis"`
+	JWT          JWTConfig          `mapstructure:"jwt"`
+	Log          LogConfig          `mapstructure:"log"`
+	RateLimit    RateLimitConfig    `mapstructure:"ratelimit"`
+	I18n         I18nConfig         `mapstructure:"i18n"`
+	Payment      PaymentConfig      `mapstructure:"payment"`
 	ExchangeRate ExchangeRateConfig `mapstructure:"exchange_rate"`
-	Geo       GeoConfig       `mapstructure:"geo"`
-	Support   SupportConfig   `mapstructure:"support"`
+	Geo          GeoConfig          `mapstructure:"geo"`
+	Support      SupportConfig      `mapstructure:"support"`
 }
 
 // GeoConfig IP 地理位置服务配置
@@ -46,23 +46,23 @@ type GeoConfig struct {
 
 // SupportConfig AI 客服系统配置
 type SupportConfig struct {
-	Enabled               bool   `mapstructure:"enabled"`                 // 总开关，默认 true
-	InternalBaseURL       string `mapstructure:"internal_base_url"`       // 内部调用 /v1/chat/completions 的基础 URL（默认 http://localhost:8080）
-	InternalAPIKey        string `mapstructure:"internal_api_key"`        // 系统级 API Key（调自家 embedding / chat）
-	EmbeddingModel        string `mapstructure:"embedding_model"`         // 默认 text-embedding-v3
-	BudgetMonthlyCredits  int64  `mapstructure:"budget_monthly_credits"`  // 月预算（积分，默认 5000000 = ¥500）
-	BudgetEconomyPct      int    `mapstructure:"budget_economy_pct"`      // 降级阈值 %（默认 30）
-	BudgetEmergencyPct    int    `mapstructure:"budget_emergency_pct"`    // 熔断阈值 %（默认 5）
-	RagTopK               int    `mapstructure:"rag_top_k"`               // 默认 5
-	RagScoreThreshold     float32 `mapstructure:"rag_score_threshold"`    // 默认 0.5
-	RagMultiSource        bool   `mapstructure:"rag_multi_source"`        // 默认 true
-	MaxHistoryTurns       int    `mapstructure:"max_history_turns"`       // 默认 8
-	MaxMsgLen             int    `mapstructure:"max_msg_len"`             // 默认 2000
-	MemoryTopK            int    `mapstructure:"memory_top_k"`            // 默认 10
-	TicketSLAHours        int    `mapstructure:"ticket_sla_hours"`        // 默认 24
-	ProviderDocsTopK      int    `mapstructure:"provider_docs_top_k"`     // 默认 3
-	RateLimitPerHour      int    `mapstructure:"rate_limit_per_hour"`     // 用户级 chat 限流（默认 60）
-	TicketRateLimitPerDay int    `mapstructure:"ticket_rate_limit_per_day"` // 默认 20
+	Enabled               bool    `mapstructure:"enabled"`                   // 总开关，默认 true
+	InternalBaseURL       string  `mapstructure:"internal_base_url"`         // 内部调用 /v1/chat/completions 的基础 URL（默认 http://localhost:8080）
+	InternalAPIKey        string  `mapstructure:"internal_api_key"`          // 系统级 API Key（调自家 embedding / chat）
+	EmbeddingModel        string  `mapstructure:"embedding_model"`           // 默认 text-embedding-v3
+	BudgetMonthlyCredits  int64   `mapstructure:"budget_monthly_credits"`    // 月预算（积分，默认 5000000 = ¥500）
+	BudgetEconomyPct      int     `mapstructure:"budget_economy_pct"`        // 降级阈值 %（默认 30）
+	BudgetEmergencyPct    int     `mapstructure:"budget_emergency_pct"`      // 熔断阈值 %（默认 5）
+	RagTopK               int     `mapstructure:"rag_top_k"`                 // 默认 5
+	RagScoreThreshold     float32 `mapstructure:"rag_score_threshold"`       // 默认 0.5
+	RagMultiSource        bool    `mapstructure:"rag_multi_source"`          // 默认 true
+	MaxHistoryTurns       int     `mapstructure:"max_history_turns"`         // 默认 8
+	MaxMsgLen             int     `mapstructure:"max_msg_len"`               // 默认 2000
+	MemoryTopK            int     `mapstructure:"memory_top_k"`              // 默认 10
+	TicketSLAHours        int     `mapstructure:"ticket_sla_hours"`          // 默认 24
+	ProviderDocsTopK      int     `mapstructure:"provider_docs_top_k"`       // 默认 3
+	RateLimitPerHour      int     `mapstructure:"rate_limit_per_hour"`       // 用户级 chat 限流（默认 60）
+	TicketRateLimitPerDay int     `mapstructure:"ticket_rate_limit_per_day"` // 默认 20
 	// Phase A1: 向量存储后端。"memory" = 原 JSON + 内存余弦扫描（默认，MySQL/SQLite 通用）；
 	// "polardb" = 使用 PolarDB PolarSearch：VECTOR 列 + HNSW 索引 + DISTANCE() SQL 搜索
 	VectorStore string `mapstructure:"vector_store"`
@@ -124,15 +124,15 @@ func (c *SupportConfig) WithDefaults() SupportConfig {
 
 // ExchangeRateConfig 汇率服务配置
 type ExchangeRateConfig struct {
-	PrimaryURL     string  `mapstructure:"primary_url"`      // 阿里云市场 cmapi00064402
-	BackupURL      string  `mapstructure:"backup_url"`       // 阿里云市场 cmapi00063890
-	PublicURL      string  `mapstructure:"public_url"`       // 第三级兜底公开免费接口 (open.er-api.com)
+	PrimaryURL     string  `mapstructure:"primary_url"` // 阿里云市场 cmapi00064402
+	BackupURL      string  `mapstructure:"backup_url"`  // 阿里云市场 cmapi00063890
+	PublicURL      string  `mapstructure:"public_url"`  // 第三级兜底公开免费接口 (open.er-api.com)
 	AppCode        string  `mapstructure:"appcode"`
 	AppKey         string  `mapstructure:"appkey"`
 	AppSecret      string  `mapstructure:"appsecret"`
-	CacheTTL       int     `mapstructure:"cache_ttl"`        // seconds，默认 86400
-	DefaultRate    float64 `mapstructure:"default_rate"`     // 默认 USD→CNY 7.2
-	RequestTimeout int     `mapstructure:"request_timeout"`  // seconds，默认 10
+	CacheTTL       int     `mapstructure:"cache_ttl"`       // seconds，默认 86400
+	DefaultRate    float64 `mapstructure:"default_rate"`    // 默认 USD→CNY 7.2
+	RequestTimeout int     `mapstructure:"request_timeout"` // seconds，默认 10
 }
 
 // ServiceConfig 服务角色配置
@@ -176,8 +176,8 @@ type PaymentConfig struct {
 type WechatPayConfig struct {
 	AppID          string `mapstructure:"app_id"`
 	MchID          string `mapstructure:"mch_id"`
-	APIKey         string `mapstructure:"api_key"`      // V2 API 密钥（兼容老接入）
-	APIV3Key       string `mapstructure:"api_v3_key"`   // V3 API 密钥（32 字节，用于 AEAD_AES_256_GCM 回调解密）
+	APIKey         string `mapstructure:"api_key"`    // V2 API 密钥（兼容老接入）
+	APIV3Key       string `mapstructure:"api_v3_key"` // V3 API 密钥（32 字节，用于 AEAD_AES_256_GCM 回调解密）
 	CertSerialNo   string `mapstructure:"cert_serial_no"`
 	PrivateKeyPath string `mapstructure:"private_key_path"`
 	NotifyURL      string `mapstructure:"notify_url"`
@@ -207,6 +207,7 @@ type PayPalConfig struct {
 
 // ServerConfig HTTP服务器配置
 type ServerConfig struct {
+	Host string `mapstructure:"host"`
 	Port int    `mapstructure:"port"`
 	Mode string `mapstructure:"mode"`
 }
@@ -262,8 +263,8 @@ func (j *JWTConfig) ExpireDuration() time.Duration {
 type LogConfig struct {
 	Level      string `mapstructure:"level"`
 	Dir        string `mapstructure:"dir"`
-	MaxSize    int    `mapstructure:"max_size"`    // MB
-	MaxAge     int    `mapstructure:"max_age"`     // days
+	MaxSize    int    `mapstructure:"max_size"` // MB
+	MaxAge     int    `mapstructure:"max_age"`  // days
 	MaxBackups int    `mapstructure:"max_backups"`
 }
 
@@ -412,6 +413,7 @@ func bindEnvVars() {
 	_ = viper.BindEnv("service.task_sign_key", "TASK_SIGN_KEY")
 
 	_ = viper.BindEnv("server.port", "SERVER_PORT")
+	_ = viper.BindEnv("server.host", "SERVER_HOST")
 	_ = viper.BindEnv("server.mode", "SERVER_MODE")
 	_ = viper.BindEnv("database.host", "DATABASE_HOST")
 	_ = viper.BindEnv("database.port", "DATABASE_PORT")

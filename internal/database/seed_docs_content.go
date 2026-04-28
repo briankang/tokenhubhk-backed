@@ -1,1023 +1,637 @@
 package database
 
-// ========== 快速入门 ==========
+const contentQuickStart = `## 这篇适合谁？
 
-const contentQuickStart = `## 欢迎使用 TokenHub
+如果你是第一次使用 TokenHub，可以从这里开始。跟着做一遍，你会完成三件事：注册账号、创建 API Key、发出第一条模型请求。
 
-TokenHub 是一个 AI 模型聚合分销平台，为您提供统一的 API 接口来访问国内外主流 AI 模型。
+不用一开始就理解所有参数。先跑通，再慢慢优化。
 
-### 第一步：注册账号
+## 第一步：注册账号
 
-访问平台首页，点击「免费开始」按钮，填写邮箱和密码完成注册。
+1. 打开[注册页面](/register)，或者在首页点击「免费开始」。
+2. 输入邮箱、密码和验证码。密码建议使用 12 位以上，并包含字母、数字和符号。
+3. 如果页面提供 Google 或 GitHub 登录，也可以直接选择第三方账号授权。
+4. 注册完成后进入控制台，先确认右上角显示的是您的邮箱或用户名。
 
-### 第二步：获取 API Key
+## 第二步：确认余额
 
-登录后进入控制台，在左侧菜单选择「API Keys」：
+1. 登录后进入[余额页面](/dashboard/balance)。
+2. 查看「可用余额」和「体验额度」。
+3. 如果余额不足，先按页面提示完成充值。充值完成后刷新页面确认到账。
 
-1. 点击「创建 Key」
-2. 输入备注名称（如 "测试用"）
-3. 复制生成的 Key（以 ` + "`sk-`" + ` 开头）
+## 第三步：创建 API Key
 
-> **重要：** API Key 仅在创建时显示一次，请妥善保存。
+1. 进入 [API Keys](/dashboard/keys) 页面。
+2. 点击「创建 Key」。
+3. 填写便于识别的名称，例如「本地测试」或「生产服务」。
+4. 创建后立即复制完整 Key。完整 Key 只展示一次，之后只能看到部分前缀。
 
-### 第三步：发送第一个请求
+## 第四步：在 Playground 试用模型
 
-使用 curl 测试 API：
+1. 先打开[模型市场](/models)，随便挑一个可用、价格合适的模型，复制模型 ID。
+2. 进入 [Playground](/playground)。
+3. 在模型选择器中选择刚才看的模型。
+4. 输入一条接近真实场景的问题，例如「请用三句话介绍 TokenHub」。
+5. 点击发送，观察模型回复、Request ID 和用量信息。
 
-` + "```bash" + `
+## 第五步：发起 API 请求
+
+把下面示例中的域名、Key 和模型 ID 替换成自己的信息：
+
+~~~bash
 curl -X POST https://your-domain.com/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-your-api-key" \
   -d '{
     "model": "gpt-4o-mini",
     "messages": [
-      {"role": "user", "content": "你好，介绍一下你自己"}
+      {"role": "user", "content": "你好，请介绍一下你自己"}
     ]
   }'
-` + "```" + `
+~~~
 
-使用 Python：
+Python 示例：
 
-` + "```python" + `
+~~~python
 from openai import OpenAI
 
 client = OpenAI(
     api_key="sk-your-api-key",
-    base_url="https://your-domain.com/v1"
+    base_url="https://your-domain.com/v1",
 )
 
 response = client.chat.completions.create(
     model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "你好！"}]
+    messages=[{"role": "user", "content": "你好"}],
 )
 print(response.choices[0].message.content)
-` + "```" + `
+~~~
 
-### 第四步：选择模型
+## 检查结果
 
-TokenHub 支持多种 AI 模型，进入「模型」页面查看所有可用模型和定价。
+调用成功后，响应中会包含 'choices' 和 'usage'。如果返回 401，请检查 API Key；如果返回 402，请检查余额；如果返回 429，请稍后重试或降低请求频率。
 
-| 模型 | 供应商 | 特点 |
-|------|--------|------|
-| GPT-4o | OpenAI | 强大的多模态模型 |
-| Claude 3.5 Sonnet | Anthropic | 擅长代码和分析 |
-| DeepSeek Chat | DeepSeek | 性价比极高 |
-| Qwen Plus | 阿里云 | 中文能力优秀 |
+下一步建议继续看[查看模型与选择模型](/docs/choose-models)，先把模型怎么选搞清楚。`
 
-### 下一步
+const contentAccountSecurity = `## 注册方式
 
-- 查看 [API Key 管理](/docs/api-keys) 了解安全最佳实践
-- 使用 [Playground](/docs/playground) 在线体验模型
-- 参考 [Chat API](/docs/chat-api) 开发您的应用
-`
+平台支持邮箱注册登录；如果当前站点开启了 Google 或 GitHub 登录，也可以使用第三方账号登录。第三方登录会绑定已验证邮箱，后续可继续使用同一邮箱登录。
 
-// ========== 平台使用指南 ==========
+## 登录步骤
 
-const contentApiKeys = `## API Key 管理
+1. 打开「登录」页面。
+2. 输入邮箱和密码，或点击 Google / GitHub 登录按钮。
+3. 登录成功后进入控制台。
+4. 如果页面提示账号不存在，请先完成注册；如果提示密码错误，请使用找回密码或联系客服。
 
-API Key 是访问 TokenHub API 的凭证，用于身份认证和用量计费。
+## 账号安全建议
 
-### 创建 API Key
+- 不要与他人共用账号。
+- 不要把 API Key 粘贴到截图、聊天记录或公开仓库。
+- 生产环境建议为每个项目创建独立 API Key，便于停用和追踪用量。
+- 如果怀疑 Key 泄露，立即删除旧 Key 并创建新 Key。
 
-1. 登录控制台，进入「API Keys」页面
-2. 点击「创建 Key」按钮
-3. 输入一个有意义的备注名称
-4. 系统生成以 ` + "`sk-`" + ` 开头的密钥
+## 退出登录
 
-> **安全提示：** Key 仅在创建时完整显示一次。创建后仅能看到前 8 位。
+在右上角账号菜单中点击「退出登录」。公共电脑使用后建议退出登录，并清除浏览器中保存的敏感信息。`
 
-### 使用方式
+const contentApiKeys = `## API Key 的用途
 
-在 HTTP 请求头中添加：
+API Key 就像你的模型调用通行证。调用 '/v1/chat/completions'、'/v1/models' 这类接口时，都要用它来证明「这是你的账号在调用」。
 
-` + "```" + `
+注意：网页登录状态和 API Key 是两回事。网页登录用来打开控制台，API Key 用来给程序调用模型，不要混着用。
+
+## 创建 API Key
+
+1. 登录控制台。
+2. 进入 [API Keys](/dashboard/keys) 页面。
+3. 点击「创建 Key」。
+4. 输入名称。建议名称包含用途和环境，例如「crm-prod」或「local-test」。
+5. 点击确认后复制完整 Key，并保存到安全位置。
+
+## 保存 API Key
+
+推荐把 Key 放在服务端环境变量中：
+
+~~~bash
+TOKENHUB_API_KEY=sk-your-api-key
+TOKENHUB_BASE_URL=https://your-domain.com/v1
+~~~
+
+不要把 Key 写进前端代码、移动端安装包、公开仓库或可被用户查看的配置文件。
+
+## 删除或轮换 API Key
+
+1. 新建一个 Key，并把应用配置切换到新 Key。
+2. 观察调用是否正常。
+3. 回到「API Keys」页面删除旧 Key。
+4. 如果有多个服务共用旧 Key，需要逐个服务替换后再删除。
+
+## 用量查看
+
+在 [API Keys](/dashboard/keys) 页面可以查看每个 Key 的调用次数、最近使用时间和用量。发现异常增长时，先停用或删除对应 Key，再排查调用来源。
+
+一个小建议：生产环境、本地测试、第三方客户端最好用不同 Key。这样哪边费用异常，一眼就能看出来。`
+
+const contentBalance = `## 余额类型
+
+平台通常会显示两类额度：
+
+- 充值余额：您实际充值后的可用余额。
+- 体验额度：平台赠送的新用户或活动额度。
+
+扣费时一般优先使用体验额度，再使用充值余额。具体以账单页展示为准。
+
+## 充值步骤
+
+1. 进入[余额页面](/dashboard/balance)。
+2. 选择充值金额。
+3. 选择付款方式。页面会展示当前站点已启用的在线支付或对公转账方式。
+4. 完成付款后返回平台。
+5. 刷新余额页，确认充值记录状态为成功。
+
+## 查看账单
+
+1. 进入[余额页面](/dashboard/balance)或账单记录页面。
+2. 按时间筛选充值记录和消费记录。
+3. 对照模型、Token 用量、扣费金额和 Request ID。
+4. 如果账单和调用日志不一致，请保留 Request ID 便于客服排查。
+
+## 余额不足
+
+余额不足时，模型请求可能返回 402。处理方式：
+
+1. 先到[余额页面](/dashboard/balance)确认可用余额。
+2. 完成充值或联系客服补充额度。
+3. 重试请求。
+
+## 对公转账注意事项
+
+如果使用对公转账，请在备注中填写平台要求的信息。转账后通常需要人工确认，到账时间以页面说明为准。`
+
+const contentChooseModels = `## 先去哪里看模型？
+
+想看平台现在能用哪些模型，请直接打开[模型市场](/models)。这里是给用户看的模型入口，不需要关心背后是谁提供能力，也不用记一堆技术名词。
+
+进入模型市场后，建议按这个顺序看：
+
+1. 先用搜索框输入模型名称、用途关键词或能力关键词，比如「长上下文」「图片」「代码」「低价」。
+2. 看模型状态。只有显示可用的模型，才建议放进正式请求里。
+3. 看价格。重点看输入价格和输出价格，输出越长通常花费越多。
+4. 看上下文。上下文越大，能一次放进去的历史消息、文档内容越多。
+5. 看能力标签。比如是否支持图片输入、JSON 输出、联网搜索、深度思考等。
+
+## 不知道选哪个？先这样挑
+
+别一上来就选最贵的模型。大多数场景可以先从便宜、稳定、响应快的模型试起，真的不够用再升级。
+
+| 你的场景 | 优先看什么 |
+| --- | --- |
+| 日常聊天、客服问答 | 价格、响应速度、中文表达 |
+| 总结长文章或长对话 | 上下文长度、最大输出长度 |
+| 写代码、解释代码 | 代码能力、推理能力、上下文长度 |
+| 识别图片或多模态输入 | 是否有图片输入能力标签 |
+| 生产系统接入 | 稳定性、价格、延迟、错误率 |
+
+## 模型 ID 很重要
+
+API 调用时要填的是模型 ID，不是页面里的展示标题。最稳妥的做法是：
+
+1. 在[模型市场](/models)找到目标模型。
+2. 打开或展开模型详情。
+3. 复制页面展示的模型 ID。
+4. 把这个 ID 填到请求里的 'model' 字段。
+
+如果你是通过接口取模型列表，也可以从 '/v1/models' 返回结果里复制模型 ID。想看某个模型具体支持哪些参数，可以去[模型 API 文档](/docs/api-models)搜索这个模型。
+
+## 模型不可用时怎么处理
+
+如果请求提示模型不存在、不可用或没有权限，先别急，按下面排查：
+
+1. 回到[模型市场](/models)，确认这个模型还在列表里，并且状态可用。
+2. 检查请求里的 'model' 有没有大小写、空格或版本号写错。
+3. 换一个同类型模型试一下，确认是不是单个模型临时不可用。
+4. 保存错误响应和 Request ID，联系客服时会省很多来回沟通。`
+
+const contentPricingUsage = `## 先理解一个词：Token
+
+模型不是按「一条消息」收费，而是按 Token 计算。你可以把 Token 理解成模型读和写时使用的小片段：你发出去的内容会产生输入 Token，模型回复的内容会产生输出 Token。
+
+一般来说：
+
+- 提示词越长，输入 Token 越多。
+- 回复越长，输出 Token 越多。
+- 长对话一直带历史记录，费用会慢慢变高。
+- 图片、长文档、多轮上下文等场景，通常也会增加用量。
+
+## 去哪里看价格？
+
+请打开[模型市场](/models)，找到你准备使用的模型。每个模型都会展示价格和能力信息。看价格时，重点看这几项：
+
+1. 输入价格：你发给模型的内容怎么计费。
+2. 输出价格：模型回复给你的内容怎么计费。
+3. 上下文长度：一次请求能放多少内容。
+4. 最大输出：模型一次最多能回复多长。
+
+正式接入前，建议先去 [Playground](/playground) 用几条真实业务问题试一下。这样你能看到大概会消耗多少 Token，心里会更有数。
+
+## 流式响应会不会扣费？
+
+会。流式只是「一边生成一边返回」，不是免费模式。模型已经生成出来的内容，通常都会进入用量统计。
+
+如果用户中途停止了流式输出，一般会按已经生成的部分记录用量。具体账单以余额页和用量记录为准。
+
+## 哪些请求通常不会产生模型费用？
+
+下面这些请求通常还没真正进入模型调用：
+
+- API Key 写错导致 401。
+- 余额不足导致 402。
+- JSON 格式错误导致 400。
+- 模型 ID 写错导致请求被平台拦截。
+
+如果请求已经进入模型并产生了回复，即使你的业务代码没有使用这段回复，也可能会记录用量。
+
+## 怎么把成本控制住？
+
+几个很实用的小习惯：
+
+1. 给 'max_tokens' 设置合理上限，不要让模型无限写。
+2. 不要每次都把整段历史聊天塞进去，长对话可以先做摘要。
+3. 能用轻量模型解决的任务，不要默认上高阶模型。
+4. 批量任务先拿 5 到 10 条样本测试，再扩大规模。
+5. 给不同项目创建不同 API Key，这样账单更容易看清楚。`
+
+const contentPlayground = `## Playground 是做什么的？
+
+[Playground](/playground) 可以理解成一个网页里的模型试验台。你还没写代码之前，可以先在这里试模型、试提示词、试参数，看看回复是否符合预期。
+
+它是真实调用模型的，所以会使用你的余额或体验额度。好处是：你能在正式接入前先看效果，避免代码写完才发现模型不合适。
+
+## 发送第一条消息
+
+1. 打开 [Playground](/playground)。
+2. 在模型选择器里选一个模型。如果不知道选哪个，可以先去[模型市场](/models)看价格和能力。
+3. 在输入框里写一个真实问题，不建议只写「你好」，可以写接近业务场景的问题。
+4. 点击发送。
+5. 等回复完成后，看三样东西：回复内容、Request ID、用量信息。
+
+## 参数怎么调才不容易迷路？
+
+刚开始建议少动参数，先用默认值。需要优化时，再按下面方向调整：
+
+| 参数 | 适合什么时候调 | 简单建议 |
+| --- | --- | --- |
+| temperature | 想控制回复随机性 | 客服、分类、抽取用低一点；创作、营销文案可高一点 |
+| top_p | 想控制采样范围 | 不确定就保持默认，别和 temperature 一起大幅调整 |
+| max_tokens | 想限制回复长度 | 怕模型写太长、费用太高，就给一个明确上限 |
+| stream | 想让回复边生成边显示 | 聊天界面建议开启，后台批处理可以不开 |
+
+## 调好以后怎么放到代码里？
+
+Playground 调到满意后，把下面这些信息带到你的服务端代码里：
+
+1. 模型 ID，也就是请求里的 'model'。
+2. 消息数组，也就是 'messages'。
+3. 你调整过的参数，比如 'temperature'、'max_tokens'、'stream'。
+
+API Key 不建议放在前端页面里。生产环境请放在服务端环境变量中。
+
+## Request ID 要记一下
+
+每次模型回复都会有 Request ID。遇到扣费疑问、响应中断、输出异常时，请把 Request ID 一起发给客服。它就像这次请求的编号，能帮助我们快速定位。`
+
+const contentCustomParams = `## 先用标准参数，够用就别复杂化
+
+大多数情况下，用标准 OpenAI 兼容参数就够了。建议先从下面这些参数开始：
+
+~~~json
+{
+  "model": "gpt-4o-mini",
+  "messages": [{"role": "user", "content": "hello"}],
+  "temperature": 0.7,
+  "top_p": 1,
+  "max_tokens": 1024,
+  "stream": false
+}
+~~~
+
+## 什么时候需要自定义参数？
+
+有些模型会有少量高级选项，比如搜索、思考、特殊输出格式等。只有当标准参数不够用，并且你已经在[模型 API 文档](/docs/api-models)确认目标模型支持时，再把这些选项放入 'extra_body' 或 'custom_params'。
+
+平台会先处理 'model'、'messages'、'temperature' 这类标准参数，再合并这些高级选项。
+
+~~~json
+{
+  "model": "your-model",
+  "messages": [{"role": "user", "content": "请联网检索今天的新闻"}],
+  "extra_body": {
+    "enable_search": true
+  }
+}
+~~~
+
+## 使用建议
+
+1. 先到[模型 API 文档](/docs/api-models)确认目标模型是否支持。
+2. 自定义字段不要和 'model'、'messages'、'stream' 等标准字段重名。
+3. 先在 [Playground](/playground) 测试，再放入生产环境。
+4. 如果返回参数不支持，先删掉这个字段，让基础请求跑通。
+5. 不要把密钥、签名、Authorization、计费字段放进这些自定义对象里。
+
+## 记住这条安全边界
+
+自定义参数只是给模型增加高级选项，不会绕过平台认证、余额检查和模型权限。用户请求里只需要 TokenHub API Key，不需要也不应该传其它平台的密钥或签名。`
+
+const contentAuth = `## 两类认证
+
+TokenHub 常见认证分为两类：
+
+| 场景 | 凭证 | 用途 |
+| --- | --- | --- |
+| 网页控制台 | 登录后的访问令牌 | 访问后台页面、查看账单、管理 Key |
+| 模型 API | API Key | 调用 '/v1/chat/completions'、'/v1/models' |
+
+## 模型调用认证
+
+所有模型调用都在 HTTP Header 中传入 API Key：
+
+~~~http
 Authorization: Bearer sk-your-api-key
-` + "```" + `
+Content-Type: application/json
+~~~
 
-或在 OpenAI SDK 中配置：
+## 网页登录认证
 
-` + "```python" + `
-client = OpenAI(
-    api_key="sk-your-api-key",
-    base_url="https://your-domain.com/v1"
-)
-` + "```" + `
+网页登录后，浏览器会保存登录状态。用户通常不需要手动处理 JWT。请不要把网页登录 Token 当作模型 API Key 使用。
 
-### 安全最佳实践
+## 认证失败排查
 
-- **不要在前端代码中硬编码 Key**，使用环境变量或后端代理
-- **定期轮换** Key，删除不再使用的旧 Key
-- **限制每个 Key 的用途**，为不同项目创建独立的 Key
-- **监控用量**，发现异常及时禁用
+1. 确认 Header 名称是 'Authorization'。
+2. 确认格式是 'Bearer sk-...'，中间有一个空格。
+3. 确认 Key 没有多复制空格、换行或引号。
+4. 确认 Key 没有被删除。
+5. 确认请求地址是当前站点的 '/v1' 地址。`
 
-### Key 管理操作
+const contentChatAPI = `## Endpoint
 
-| 操作 | 说明 |
-|------|------|
-| 创建 | 生成新的 API Key |
-| 查看用量 | 查看该 Key 的调用次数和 Token 消耗 |
-| 删除 | 永久停用该 Key |
-`
+~~~http
+POST /v1/chat/completions
+~~~
 
-const contentPlayground = `## Playground 使用指南
+## 非流式请求
 
-Playground 是 TokenHub 提供的在线模型测试工具，无需编写代码即可体验各种 AI 模型。
-
-### 功能介绍
-
-- **模型切换**：下拉选择不同 AI 模型
-- **参数调节**：Temperature、Max Tokens、Top P 等
-- **流式输出**：实时查看模型响应
-- **历史记录**：自动保存对话历史
-
-### 使用步骤
-
-1. 进入控制台，点击左侧「Playground」
-2. 在顶部选择要测试的模型
-3. 在输入框中输入消息
-4. 点击发送或按 Enter
-5. 实时查看模型的流式响应
-
-### 参数说明
-
-| 参数 | 范围 | 说明 |
-|------|------|------|
-| Temperature | 0-2 | 控制随机性，越高越随机 |
-| Max Tokens | 1-4096 | 最大生成长度 |
-| Top P | 0-1 | 核采样概率 |
-
-### 注意事项
-
-- Playground 使用会消耗您的余额
-- 流式模式下支持随时停止生成
-- 复杂对话建议使用较大的 Max Tokens
-`
-
-const contentBalance = `## 余额充值与额度说明
-
-### 余额体系
-
-TokenHub 采用预付费余额制：
-
-- **余额**：通过充值获得，按使用量实时扣减
-- **体验额度**：新注册用户赠送的免费额度
-
-扣费优先级：先扣体验额度，再扣充值余额。
-
-### 充值方式
-
-平台支持多种充值方式：
-
-| 方式 | 说明 | 到账时间 |
-|------|------|----------|
-| 微信支付 | 扫码支付 | 即时 |
-| 支付宝 | 在线支付 | 即时 |
-| 对公转账 | 银行转账 | 1-3 工作日 |
-| Stripe | 国际信用卡 | 即时 |
-
-### 计费规则
-
-- 按 Token 用量计费，Input 和 Output 分别定价
-- 不同模型定价不同，查看「模型」页面了解详情
-- 计费精度为小数点后 6 位
-
-### 余额查询
-
-` + "```bash" + `
-# 查询余额
-curl -H "Authorization: Bearer sk-your-key" \
-  https://your-domain.com/api/v1/open/balance
-` + "```" + `
-
-### 额度不足
-
-当余额不足时，API 请求将返回 402 状态码。请及时充值以避免服务中断。
-`
-
-// ========== 编码工具 ==========
-
-const contentCursor = `## Cursor 接入 TokenHub
-
-Cursor 是一款强大的 AI 编码 IDE，完全支持 OpenAI 兼容 API。
-
-### 配置步骤
-
-1. 打开 Cursor，进入 **Settings → Models**
-2. 找到 **OpenAI API Key** 配置区
-3. 填写以下信息：
-
-| 配置项 | 值 |
-|--------|-----|
-| API Key | ` + "`sk-your-tokenhub-key`" + ` |
-| Base URL | ` + "`https://your-domain.com/v1`" + ` |
-
-4. 在模型列表中添加需要的模型（如 ` + "`gpt-4o`" + `、` + "`claude-3-5-sonnet-20241022`" + `）
-5. 保存设置后即可使用
-
-### 验证连接
-
-在 Cursor 中发起一次对话，确认模型可以正常响应。如果看到回复内容，说明配置成功。
-
-### 推荐模型
-
-| 模型 | 适用场景 |
-|------|----------|
-| gpt-4o | 通用编码、代码审查 |
-| claude-3-5-sonnet | 复杂代码生成、重构 |
-| deepseek-chat | 日常编码、性价比之选 |
-
-### 常见问题
-
-**Q: 连接超时？**
-A: 检查 Base URL 是否正确，确保网络可以访问 TokenHub 服务器。
-
-**Q: 模型不显示？**
-A: 手动在模型列表中添加模型 ID，Cursor 会自动通过 /v1/models 获取。
-`
-
-const contentContinue = `## Continue.dev 接入指南
-
-Continue 是一个开源的 AI 代码助手 VS Code 插件，支持自定义 OpenAI 兼容端点。
-
-### 配置方法
-
-编辑 Continue 配置文件 ` + "`~/.continue/config.json`" + `：
-
-` + "```json" + `
-{
-  "models": [
-    {
-      "title": "TokenHub GPT-4o",
-      "provider": "openai",
-      "model": "gpt-4o",
-      "apiKey": "sk-your-tokenhub-key",
-      "apiBase": "https://your-domain.com/v1"
-    },
-    {
-      "title": "TokenHub DeepSeek",
-      "provider": "openai",
-      "model": "deepseek-chat",
-      "apiKey": "sk-your-tokenhub-key",
-      "apiBase": "https://your-domain.com/v1"
-    }
-  ],
-  "tabAutocompleteModel": {
-    "title": "TokenHub Autocomplete",
-    "provider": "openai",
-    "model": "deepseek-chat",
-    "apiKey": "sk-your-tokenhub-key",
-    "apiBase": "https://your-domain.com/v1"
-  }
-}
-` + "```" + `
-
-### 功能支持
-
-- **Chat**: 代码对话、问答（/v1/chat/completions）
-- **Tab 补全**: 行内代码补全
-- **Slash 命令**: /edit, /comment, /explain 等
-
-### 特性
-
-Continue 支持 FIM（Fill-in-the-Middle）补全模式，适合代码补全场景。
-`
-
-const contentCline = `## Cline 接入指南
-
-Cline（原 Claude Dev）是 VS Code 中的 AI Agent 插件，可以自主执行编码任务。
-
-### 配置步骤
-
-1. 在 VS Code 中安装 **Cline** 扩展
-2. 打开 Cline 设置面板
-3. 选择 **OpenAI Compatible** 作为 Provider
-4. 填写配置：
-
-| 配置项 | 值 |
-|--------|-----|
-| Base URL | ` + "`https://your-domain.com/v1`" + ` |
-| API Key | ` + "`sk-your-tokenhub-key`" + ` |
-| Model | ` + "`claude-3-5-sonnet-20241022`" + ` 或其他模型 |
-
-5. 点击保存
-
-### 推荐模型
-
-Cline 是 Agent 类工具，建议使用能力较强的模型：
-
-- **claude-3-5-sonnet**: 代码理解和生成最佳
-- **gpt-4o**: 通用能力强
-- **qwen-max**: 中文项目首选
-
-### 注意事项
-
-Cline 可能会连续多次调用 API 来完成任务，请关注 Token 消耗量。建议设置合理的 Max Tokens 上限。
-`
-
-// ========== 对话客户端 ==========
-
-const contentLobeChat = `## LobeChat 接入指南
-
-LobeChat 是一款开源的 AI 对话前端应用，支持 OpenAI 兼容 API。
-
-### Docker 部署方式
-
-` + "```bash" + `
-docker run -d -p 3210:3210 \
-  -e OPENAI_API_KEY=sk-your-tokenhub-key \
-  -e OPENAI_PROXY_URL=https://your-domain.com/v1 \
-  --name lobe-chat \
-  lobehub/lobe-chat
-` + "```" + `
-
-### UI 配置方式
-
-1. 打开 LobeChat 设置
-2. 进入「语言模型」→「OpenAI」
-3. 配置：
-   - API Key: ` + "`sk-your-tokenhub-key`" + `
-   - API 代理地址: ` + "`https://your-domain.com/v1`" + `
-4. 添加自定义模型列表
-
-### 特性支持
-
-- 流式响应 (SSE)
-- 多模型切换
-- 插件系统
-- 助手市场
-- Vision 多模态
-
-### 推荐配置
-
-优先使用 Docker 部署方式，环境变量配置更加安全，不会将 Key 暴露在前端。
-`
-
-const contentNextChat = `## ChatGPT-Next-Web 接入指南
-
-NextChat（ChatGPT-Next-Web）是最流行的 ChatGPT 前端之一，支持 Web、桌面和移动端。
-
-### Docker 部署
-
-` + "```bash" + `
-docker run -d -p 3000:3000 \
-  -e OPENAI_API_KEY=sk-your-tokenhub-key \
-  -e BASE_URL=https://your-domain.com \
-  --name nextchat \
-  yidadaa/chatgpt-next-web
-` + "```" + `
-
-### UI 配置
-
-1. 打开 NextChat 设置
-2. 填写：
-   - API Key: ` + "`sk-your-tokenhub-key`" + `
-   - 接口地址: ` + "`https://your-domain.com`" + `
-3. 自定义模型语法: ` + "`模型名=显示名`" + `
-
-### 自定义模型
-
-在设置中添加自定义模型列表：
-
-` + "```" + `
-gpt-4o=GPT-4o
-deepseek-chat=DeepSeek
-claude-3-5-sonnet-20241022=Claude 3.5
-qwen-plus=Qwen Plus
-` + "```" + `
-
-### 特性
-
-- 轻量级，快速部署
-- 支持 Vercel 一键部署
-- Web/桌面/移动多端支持
-`
-
-const contentOpenWebUI = `## Open WebUI 接入指南
-
-Open WebUI 是一个功能丰富的自托管 AI 前端，支持 Ollama 和 OpenAI 兼容 API。
-
-### Docker 部署
-
-` + "```bash" + `
-docker run -d -p 8080:8080 \
-  -e OPENAI_API_BASE_URL=https://your-domain.com/v1 \
-  -e OPENAI_API_KEY=sk-your-tokenhub-key \
-  -v open-webui:/app/backend/data \
-  --name open-webui \
-  ghcr.io/open-webui/open-webui:main
-` + "```" + `
-
-### 管理后台配置
-
-1. 访问 Open WebUI 管理后台
-2. 进入 **Settings → Connections → OpenAI**
-3. 添加新连接：
-   - URL: ` + "`https://your-domain.com/v1`" + `
-   - API Key: ` + "`sk-your-tokenhub-key`" + `
-4. 点击测试连接
-5. 保存后模型列表将自动获取
-
-### 特性支持
-
-- 用户管理系统
-- 知识库 RAG
-- Web 搜索集成
-- 多模型对话
-- 文件上传分析
-`
-
-// ========== Coding Plan ==========
-
-const contentCodingPlan = `## Coding Plan 产品介绍
-
-TokenHub Coding Plan 是专为 AI 编码工具设计的模型聚合方案。
-
-### 什么是 Coding Plan
-
-Coding Plan 提供标准的 OpenAI 兼容 API（/v1/*），让您可以在任何支持自定义 API 的编码工具中使用 TokenHub 的模型。
-
-### 支持的端点
-
-| 端点 | 方法 | 功能 |
-|------|------|------|
-| /v1/chat/completions | POST | 聊天对话（主要） |
-| /v1/completions | POST | 代码补全/FIM |
-| /v1/models | GET | 模型列表 |
-| /v1/embeddings | POST | 向量嵌入 |
-
-### 支持的编码工具
-
-| 工具 | 支持方式 | 推荐度 |
-|------|----------|--------|
-| Cursor | 原生支持 | ★★★★★ |
-| Continue.dev | 原生支持 | ★★★★★ |
-| Cline | 原生支持 | ★★★★★ |
-| GitHub Copilot | BYOK 支持 | ★★★★ |
-| Windsurf | 部分支持 | ★★★★ |
-| Aider | 环境变量 | ★★★★ |
-| JetBrains AI | 原生支持 | ★★★★ |
-
-### 使用方法
-
-在编码工具中配置以下信息即可：
-
-` + "```" + `
-Base URL: https://your-domain.com/v1
-API Key:  sk-your-tokenhub-key
-` + "```" + `
-
-### 计费
-
-Coding Plan 按 Token 用量计费，与普通 API 调用使用同一余额，无额外费用。
-`
-
-// ========== API 参考 ==========
-
-const contentAuth = `## 认证方式
-
-TokenHub 支持三种认证方式，适用于不同场景。
-
-### 1. JWT Token（Web 前端）
-
-用于前端页面认证，通过登录接口获取：
-
-` + "```bash" + `
-# 登录获取 Token
-curl -X POST https://your-domain.com/api/v1/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email": "user@example.com", "password": "your-password"}'
-` + "```" + `
-
-响应：
-` + "```json" + `
-{
-  "code": 0,
-  "data": {
-    "access_token": "eyJhbGciOiJIUzI1NiIs...",
-    "refresh_token": "eyJhbGciOiJIUzI1NiIs...",
-    "expires_in": 86400
-  }
-}
-` + "```" + `
-
-使用：` + "`Authorization: Bearer <access_token>`" + `
-
-### 2. API Key（OpenAI 兼容）
-
-用于 AI 模型调用，通过控制台创建：
-
-` + "```bash" + `
+~~~bash
 curl -X POST https://your-domain.com/v1/chat/completions \
   -H "Authorization: Bearer sk-your-api-key" \
   -H "Content-Type: application/json" \
-  -d '{"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}'
-` + "```" + `
+  -d '{
+    "model": "gpt-4o-mini",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "请用三句话解释大模型 API"}
+    ],
+    "temperature": 0.7,
+    "max_tokens": 800
+  }'
+~~~
 
-### 3. Bearer Token（Open API）
+## 流式请求
 
-用于企业级 Open API 接口，复用 API Key：
-
-` + "```bash" + `
-curl -H "Authorization: Bearer sk-your-api-key" \
-  https://your-domain.com/api/v1/open/account
-` + "```" + `
-
-### 认证失败
-
-| 状态码 | 含义 |
-|--------|------|
-| 401 | 未提供认证信息或 Token 已过期 |
-| 403 | 权限不足（角色不匹配） |
-`
-
-const contentChatAPI = `## Chat Completions API
-
-TokenHub 完全兼容 OpenAI Chat Completions API。
-
-### 请求
-
-` + "```" + `
-POST /v1/chat/completions
-` + "```" + `
-
-### 请求参数
-
-` + "```json" + `
+~~~json
 {
-  "model": "gpt-4o",
+  "model": "gpt-4o-mini",
   "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Hello!"}
+    {"role": "user", "content": "写一段产品介绍"}
   ],
-  "temperature": 0.7,
-  "max_tokens": 2048,
-  "stream": false
+  "stream": true
 }
-` + "```" + `
+~~~
 
-### 参数说明
+流式响应使用 SSE 格式，客户端会持续收到 'data:' 片段，直到收到 '[DONE]'。
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| model | string | 是 | 模型 ID |
-| messages | array | 是 | 消息列表 |
-| temperature | float | 否 | 随机性 (0-2) |
-| max_tokens | int | 否 | 最大生成 Token 数 |
-| stream | bool | 否 | 是否启用流式输出 |
-| top_p | float | 否 | 核采样 (0-1) |
-| stop | array | 否 | 停止序列 |
+## messages 格式
 
-### 非流式响应
+| role | 用途 |
+| --- | --- |
+| system | 设置助手行为和边界 |
+| user | 用户输入 |
+| assistant | 历史助手回复 |
 
-` + "```json" + `
+## 响应字段
+
+成功响应通常包含：
+
+- 'id'：请求 ID。
+- 'choices'：模型回复。
+- 'usage'：Token 用量。
+- 'model'：实际调用模型。
+
+生产环境建议记录 'id'、模型、用量和业务用户 ID，便于账单核对。`
+
+const contentModelsAPI = `## 这个接口是做什么的？
+
+'/v1/models' 用来获取当前账号可以调用的模型列表。很多第三方客户端会用它自动刷新模型选择器，你自己的系统也可以用它来生成可选模型列表。
+
+如果你只是想人工查看模型、价格和能力，直接打开[模型市场](/models)会更直观。
+
+## Endpoint
+
+~~~http
+GET /v1/models
+~~~
+
+## 请求示例
+
+~~~bash
+curl https://your-domain.com/v1/models \
+  -H "Authorization: Bearer sk-your-api-key"
+~~~
+
+## 按模型查看 API 文档
+
+模型列表接口只返回基础信息。每个模型的参数支持、能力标签、请求示例和注意事项，请进入[模型 API 文档](/docs/api-models)查看。
+
+进入后可以搜索模型名称，点击任意模型打开它自己的 API 文档页面。这里会比 '/v1/models' 更适合阅读，因为它会把参数、示例和注意事项整理好。
+
+## 返回信息
+
+不同站点配置可能不同，常见字段包括：
+
+- 模型 ID：请求里的 'model' 就填它。
+- 模型名称：页面展示用的名称。
+- 上下文长度：一次请求大概能放多少内容。
+- 能力标签：例如图片、JSON、搜索、思考等。
+- 状态：是否可用。
+
+调用 '/v1/chat/completions' 时，请使用模型 ID，不要手打展示名称。
+
+## 没有模型怎么办
+
+1. 确认 API Key 有效。
+2. 确认账号余额充足。
+3. 打开[模型市场](/models)，确认页面上是否有可用模型。
+4. 如果网页有模型但接口返回为空，请联系客服排查账号权限。`
+
+const contentOpenAICompatibleClients = `## 通用配置项
+
+大多数第三方客户端只需要三项信息：
+
+| 配置项 | 填写内容 |
+| --- | --- |
+| API 类型 | OpenAI Compatible 或 OpenAI |
+| Base URL | 'https://your-domain.com/v1' |
+| API Key | 'sk-your-api-key' |
+
+如果客户端要求填写完整接口地址，请填写 'https://your-domain.com/v1/chat/completions'；如果要求填写 Base URL，请只填到 '/v1'。
+
+## 配置步骤
+
+1. 在 TokenHub 创建 API Key。
+2. 打开第三方客户端的模型或接口设置。
+3. 选择 OpenAI Compatible。
+4. 填入 Base URL 和 API Key。
+5. 刷新或手动添加模型 ID。
+6. 发送一条测试消息。
+
+## 常见字段名称
+
+不同客户端命名不同，但含义相同：
+
+- Base URL、API Base、Endpoint、Proxy URL：填写 '/v1' 地址。
+- API Key、Token、Secret Key：填写 'sk-' 开头的 Key。
+- Model、Model ID、Deployment Name：填写 TokenHub 模型 ID。
+
+## 安全提醒
+
+优先在服务端或本地客户端保存 API Key。公共网页、共享配置和团队截图中不要暴露完整 Key。`
+
+const contentChatClients = `## LobeChat
+
+1. 打开 LobeChat 设置。
+2. 进入模型或 OpenAI 设置。
+3. API Key 填写 TokenHub 的 'sk-' Key。
+4. API 代理地址或 Base URL 填写 'https://your-domain.com/v1'。
+5. 保存后刷新模型列表，或手动添加模型 ID。
+6. 新建会话发送测试消息。
+
+## Open WebUI
+
+1. 进入 Open WebUI 管理设置。
+2. 打开 Connections 或模型连接页面。
+3. 新增 OpenAI 连接。
+4. URL 填写 'https://your-domain.com/v1'。
+5. API Key 填写 TokenHub API Key。
+6. 点击测试连接并保存。
+
+## NextChat
+
+1. 打开设置页面。
+2. 接口地址填写站点域名，或按客户端要求填写 '/v1' 地址。
+3. API Key 填写 TokenHub API Key。
+4. 在自定义模型中添加 TokenHub 模型 ID。
+5. 保存后发起测试对话。
+
+## 排查建议
+
+如果客户端提示连接失败，先用 curl 测试同一个 Key 和 Base URL。curl 成功但客户端失败时，通常是 Base URL 填写层级不一致。`
+
+const contentDevClients = `## Cursor
+
+1. 打开 Cursor 设置。
+2. 找到 Models 或 OpenAI Compatible 配置。
+3. API Key 填写 TokenHub API Key。
+4. Base URL 填写 'https://your-domain.com/v1'。
+5. 手动添加需要使用的模型 ID。
+6. 保存后在聊天窗口发送测试问题。
+
+## Continue
+
+在 Continue 配置中添加 OpenAI 兼容模型：
+
+~~~json
 {
-  "id": "chatcmpl-xxx",
-  "object": "chat.completion",
-  "model": "gpt-4o",
-  "choices": [
+  "models": [
     {
-      "index": 0,
-      "message": {"role": "assistant", "content": "Hello!"},
-      "finish_reason": "stop"
+      "title": "TokenHub",
+      "provider": "openai",
+      "model": "gpt-4o-mini",
+      "apiKey": "sk-your-api-key",
+      "apiBase": "https://your-domain.com/v1"
     }
-  ],
-  "usage": {
-    "prompt_tokens": 10,
-    "completion_tokens": 5,
-    "total_tokens": 15
-  }
+  ]
 }
-` + "```" + `
-
-### 流式响应
-
-设置 ` + "`stream: true`" + ` 后，响应为 SSE 格式：
-
-` + "```" + `
-data: {"id":"chatcmpl-xxx","choices":[{"delta":{"content":"Hello"}}]}
-data: {"id":"chatcmpl-xxx","choices":[{"delta":{"content":"!"}}]}
-data: [DONE]
-` + "```" + `
-
-### 可用模型
-
-通过 ` + "`GET /v1/models`" + ` 获取所有可用模型列表。
-`
-
-const contentOpenAPI = `## Open API 企业接口
-
-Open API 提供企业级的消费查询、用量统计、余额管理等接口。
-
-### 认证
-
-使用 API Key 的 Bearer Token 认证：
-` + "```" + `
-Authorization: Bearer sk-your-api-key
-` + "```" + `
-
-### 接口列表
-
-#### 账户信息
-` + "```" + `
-GET /api/v1/open/account
-` + "```" + `
-
-#### 余额查询
-` + "```" + `
-GET /api/v1/open/balance
-GET /api/v1/open/balance/recharge-records
-` + "```" + `
+~~~
 
-#### 消费查询
-` + "```" + `
-GET /api/v1/open/consumption/summary?start_date=2026-01-01&end_date=2026-01-31
-GET /api/v1/open/consumption/details?page=1&page_size=20
-GET /api/v1/open/consumption/export?format=csv
-` + "```" + `
+## 使用建议
 
-#### 用量统计
-` + "```" + `
-GET /api/v1/open/usage/stats?period=day
-GET /api/v1/open/usage/trend?days=30
-` + "```" + `
+开发客户端可能会连续发起多次请求。建议：
 
-#### 模型定价
-` + "```" + `
-GET /api/v1/open/models/pricing
-` + "```" + `
+- 单独创建一个开发客户端专用 Key。
+- 先选择成本可控的模型测试。
+- 在账单页观察调用频率和 Token 消耗。
+- 重要项目开启日志记录，保存 Request ID。`
 
-#### Key 管理
-` + "```" + `
-GET /api/v1/open/account/keys
-GET /api/v1/open/account/keys/:id/usage
-` + "```" + `
+const contentErrorCodes = `## 常见 HTTP 状态码
 
-### 限流
+| 状态码 | 含义 | 处理方式 |
+| --- | --- | --- |
+| 400 | 请求参数错误 | 检查 JSON、model、messages 和参数类型 |
+| 401 | 认证失败 | 检查 API Key 和 Authorization Header |
+| 402 | 余额不足 | 充值或联系客服补充额度 |
+| 403 | 无权限 | 确认账号或 Key 是否允许调用该模型 |
+| 404 | 路径或资源不存在 | 检查 URL、模型 ID 或文档路径 |
+| 429 | 请求过快 | 降低频率，稍后重试 |
+| 500 | 平台内部错误 | 保留 Request ID 并联系支持 |
+| 502/503 | 模型服务暂时不可用 | 稍后重试或切换模型 |
 
-Open API 限流 60 req/min，超过限制返回 429 状态码。
-`
+## 认证失败
 
-const contentErrorCodes = `## 错误码参考
+检查以下内容：
 
-TokenHub API 使用标准 HTTP 状态码配合自定义错误码。
-
-### HTTP 状态码
-
-| 状态码 | 含义 |
-|--------|------|
-| 200 | 请求成功 |
-| 400 | 请求参数错误 |
-| 401 | 认证失败 |
-| 402 | 余额不足 |
-| 403 | 权限不足 |
-| 404 | 资源不存在 |
-| 429 | 请求频率超限 |
-| 500 | 服务器内部错误 |
-
-### 响应格式
-
-成功：
-` + "```json" + `
-{
-  "code": 0,
-  "message": "success",
-  "data": { ... }
-}
-` + "```" + `
-
-失败：
-` + "```json" + `
-{
-  "code": 40001,
-  "message": "参数错误: model is required"
-}
-` + "```" + `
-
-### 自定义错误码
-
-| 错误码 | 含义 |
-|--------|------|
-| 0 | 成功 |
-| 40001 | 参数校验失败 |
-| 40101 | Token 无效或已过期 |
-| 40102 | API Key 无效 |
-| 40201 | 余额不足 |
-| 40301 | 权限不足 |
-| 40401 | 资源不存在 |
-| 42901 | 请求频率超限 |
-| 50001 | 服务器内部错误 |
-| 50002 | 上游供应商错误 |
-| 50003 | 模型不可用 |
-`
-
-// ========== 部署指南 ==========
-
-const contentDockerDeploy = `## Docker Compose 一键部署
-
-使用 Docker Compose 可以快速部署 TokenHub 平台。
-
-### 前置条件
-
-- Docker 20.10+
-- Docker Compose v2+
-- 至少 2GB 可用内存
-
-### 部署步骤
-
-1. **克隆项目**
-
-` + "```bash" + `
-git clone https://github.com/your-org/tokenhub.git
-cd tokenhub
-` + "```" + `
-
-2. **配置环境变量**
-
-` + "```bash" + `
-cp .env.example .env
-# 编辑 .env 文件，设置数据库密码、JWT 密钥等
-` + "```" + `
-
-3. **启动服务**
-
-` + "```bash" + `
-docker-compose up -d
-` + "```" + `
-
-4. **访问平台**
-
-- 前端: http://localhost:3000
-- API: http://localhost:8090
-- 安装向导: http://localhost:3000/setup
-
-### docker-compose.yml
-
-` + "```yaml" + `
-version: '3.8'
-services:
-  app:
-    build: ./server/go-server
-    ports:
-      - "8090:8090"
-    environment:
-      - DB_HOST=mysql
-      - DB_PORT=3306
-      - DB_NAME=tokenhub
-      - DB_USER=root
-      - DB_PASSWORD=your-password
-      - REDIS_ADDR=redis:6379
-      - JWT_SECRET=your-jwt-secret
-    depends_on:
-      - mysql
-      - redis
-
-  mysql:
-    image: mysql:8.0
-    environment:
-      MYSQL_ROOT_PASSWORD: your-password
-      MYSQL_DATABASE: tokenhub
-    volumes:
-      - mysql_data:/var/lib/mysql
-    ports:
-      - "3306:3306"
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
-volumes:
-  mysql_data:
-` + "```" + `
-
-### 验证部署
-
-` + "```bash" + `
-# 检查服务状态
-docker-compose ps
-
-# 查看日志
-docker-compose logs -f app
-
-# 健康检查
-curl http://localhost:8090/health
-` + "```" + `
-`
-
-const contentManualDeploy = `## 手动部署与环境变量
-
-如果不使用 Docker，可以手动部署 TokenHub。
-
-### 环境要求
-
-| 组件 | 最低版本 | 推荐版本 |
-|------|----------|----------|
-| Go | 1.21 | 1.22+ |
-| MySQL | 8.0 | 8.0+ |
-| Redis | 6.0 | 7.0+ |
-| Node.js | 18 | 20+ |
-
-### 后端部署
-
-` + "```bash" + `
-# 进入后端目录
-cd server/go-server
-
-# 编译
-go build -o tokenhub-server ./cmd/server
-
-# 运行
-./tokenhub-server
-` + "```" + `
-
-### 前端构建
-
-` + "```bash" + `
-# 安装依赖
-npm install
-
-# 构建
-npm run build
-
-# 产物在 dist/ 目录
-` + "```" + `
-
-### 环境变量参考
-
-| 变量名 | 必填 | 默认值 | 说明 |
-|--------|------|--------|------|
-| DB_HOST | 是 | localhost | MySQL 主机 |
-| DB_PORT | 否 | 3306 | MySQL 端口 |
-| DB_NAME | 是 | tokenhub | 数据库名 |
-| DB_USER | 是 | root | 数据库用户 |
-| DB_PASSWORD | 是 | - | 数据库密码 |
-| REDIS_ADDR | 是 | localhost:6379 | Redis 地址 |
-| REDIS_PASSWORD | 否 | - | Redis 密码 |
-| JWT_SECRET | 是 | - | JWT 签名密钥 |
-| SERVER_PORT | 否 | 8090 | 服务端口 |
-| LOG_LEVEL | 否 | info | 日志级别 |
-| PAYMENT_ENCRYPT_KEY | 否 | - | 支付配置加密密钥 |
-
-### Nginx 配置
-
-` + "```nginx" + `
-server {
-    listen 80;
-    server_name your-domain.com;
-
-    # 前端静态文件
-    location / {
-        root /path/to/dist;
-        try_files $uri $uri/ /index.html;
-    }
-
-    # API 代理
-    location /api/ {
-        proxy_pass http://127.0.0.1:8090;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-
-    # OpenAI 兼容路由代理
-    location /v1/ {
-        proxy_pass http://127.0.0.1:8090;
-        proxy_set_header Host $host;
-        proxy_buffering off;
-    }
-}
-` + "```" + `
-
-### 生产环境建议
-
-- 使用 HTTPS（Let's Encrypt 免费证书）
-- 设置强密码的 JWT_SECRET
-- 开启 MySQL 慢查询日志
-- 配置 Redis 持久化
-- 使用 systemd 管理后端进程
-`
+1. Header 是否为 'Authorization: Bearer sk-your-api-key'。
+2. Key 是否完整，没有空格和换行。
+3. Key 是否已删除。
+4. 请求是否发到了正确域名。
 
-// ========== 平台使用指南 - 代理分销 ==========
+## 余额不足
 
-// contentAgentDistribution 代理商分销指南文档内容
-const contentAgentDistribution = `## 代理商分销指南
+1. 进入余额页确认可用余额。
+2. 查看是否有未完成的充值订单。
+3. 充值后重试请求。
 
-TokenHub 提供三级代理分销体系，代理商可以通过推广平台获取持续佣金收入。
+## 模型不可用
 
-### 三级代理体系
+1. 检查模型 ID。
+2. 到[模型市场](/models)确认模型状态。
+3. 尝试同类其他模型。
+4. 保留错误响应和 Request ID。`
 
-| 级别 | 佣金比例 | 说明 |
-|------|----------|------|
-| L1 一级代理 | 15% | 直接推荐用户的消费提成 |
-| L2 二级代理 | 8% | 下级推荐用户的消费提成 |
-| L3 三级代理 | 3% | 三级下线用户的消费提成 |
+const contentFAQ = `## API Key 创建后还能再次查看完整内容吗？
 
-### 代理申请流程
+不能。完整 API Key 只在创建时显示一次。如果忘记保存，请删除旧 Key 并创建新 Key。
 
-1. **注册账号** — 在平台完成正常注册
-2. **联系管理员** — 提交代理申请，说明推广计划
-3. **审核通过** — 管理员审核并升级为代理角色
-4. **获取专属链接** — 进入代理面板获取推广链接和邀请码
+## Base URL 应该填什么？
 
-### 代理面板功能
+大多数 SDK 和客户端填写 'https://your-domain.com/v1'。如果工具要求填写完整接口地址，再填写 'https://your-domain.com/v1/chat/completions'。
 
-登录后进入「代理面板」，可以：
+## Playground 会扣费吗？
 
-- **查看团队统计** — 直属下级数、团队总人数、本月佣金、累计收益
-- **团队管理** — 查看下级树形结构，了解每个成员的消费和佣金
-- **佣金明细** — 查看每笔佣金的来源、金额、状态
-- **推广链接** — 复制专属推广链接和邀请码
+会。Playground 发起的是真实模型请求，会按模型用量扣减余额或体验额度。
 
-### 佣金计算规则
+## 为什么同一段提示词每次回复不同？
 
-佣金基于下级用户的实际 Token 消费金额计算：
+模型生成具有随机性。降低 'temperature'，并固定提示词和上下文，可以让输出更稳定。
 
-` + "```" + `
-佣金 = 下级消费金额 × 对应级别佣金比例
+## 如何降低费用？
 
-示例：
-- 您的直属用户 A 消费了 $100
-  L1 佣金 = $100 × 15% = $15
-- A 推荐的用户 B 消费了 $200
-  L2 佣金 = $200 × 8% = $16
-- B 推荐的用户 C 消费了 $300
-  L3 佣金 = $300 × 3% = $9
-` + "```" + `
+选择合适模型、减少不必要上下文、设置 'max_tokens'、避免重复发送大段历史消息，并按项目拆分 API Key 观察成本。
 
-### 佣金结算
+## 需要填写其它平台的密钥吗？
 
-- **计算时机** — 每笔消费完成后异步计算
-- **状态流转** — 待结算 → 已结算 → 已提现
-- **提现门槛** — 累计佣金达到最低提现金额后可申请提现
-- **结算周期** — 月结，每月初统一结算上月佣金
+不需要。用户只使用 TokenHub API Key。不要在请求里填写其它平台的密钥、签名或 Authorization。
 
-### 注意事项
+## 遇到问题应该提供什么信息？
 
-- 代理商自己的消费不计入佣金
-- 佣金比例可能根据平台政策调整
-- 作弊行为（刷单等）将导致代理资格被取消
-`
-
-// contentPersonalReferral 个人邀请返现指南文档内容
-const contentPersonalReferral = `## 个人邀请返现指南
-
-TokenHub 为所有用户提供邀请返现机制，邀请朋友注册即可获取返现奖励。
-
-### 获取邀请码
-
-1. 登录 TokenHub 平台
-2. 进入「控制台」→「设置」页面
-3. 在「我的邀请码」区域查看您的专属邀请码
-4. 或进入「推荐有奖」页面获取完整的推广链接
-
-### 分享方式
-
-- **邀请链接** — 复制您的专属注册链接发送给朋友
-- **邀请码** — 朋友注册时填写您的邀请码（8 位字母数字）
-
-### 返现规则
-
-| 项目 | 说明 |
-|------|------|
-| 返现比例 | 被邀请用户消费金额的 5%（默认） |
-| 邀请人奖励 | 被邀请用户每次消费自动返现到您的余额 |
-| 被邀请人奖励 | 新用户注册时获得额外免费额度 |
-| 绑定关系 | 永久绑定，不可更改 |
-
-### 返现计算示例
-
-` + "```" + `
-您邀请了用户 D，用户 D 当月消费 $50
-
-您的返现 = $50 × 5% = $2.50
-返现自动充入您的账户余额
-` + "```" + `
-
-### 查看返现记录
-
-进入「推荐有奖」页面，可以查看：
-
-- **邀请统计** — 已邀请人数、活跃用户数
-- **返现汇总** — 累计返现金额、本月返现
-- **明细记录** — 每笔返现的来源和金额
-
-### 与代理分销的区别
-
-| 对比项 | 个人邀请返现 | 代理商分销 |
-|--------|------------|----------|
-| 适用对象 | 所有用户 | 代理商角色 |
-| 层级 | 仅一级 | 三级 |
-| 返现比例 | 5% | 15%/8%/3% |
-| 管理面板 | 推荐有奖页面 | 专属代理面板 |
-| 申请方式 | 自动开通 | 需管理员审核 |
-
-### 常见问题
-
-**Q: 邀请返现可以提现吗？**
-A: 返现直接充入余额，用于 API 调用抵扣，不支持直接提现。
-
-**Q: 邀请关系可以解除吗？**
-A: 邀请关系一旦绑定为永久关系，无法解除。
-
-**Q: 我可以同时是代理商和普通用户吗？**
-A: 可以。升级为代理商后，您的推荐关系会自动切换为代理分销体系（更高佣金）。
-`
+请提供请求时间、模型 ID、Request ID、错误码和必要的请求摘要。不要发送完整 API Key。`

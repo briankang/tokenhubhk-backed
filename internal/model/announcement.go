@@ -8,8 +8,12 @@ type Announcement struct {
 	BaseModel
 	// 公告标题
 	Title string `gorm:"type:varchar(255);not null" json:"title"`
+	// English announcement title for non-Chinese locales.
+	TitleEn string `gorm:"type:varchar(255)" json:"title_en,omitempty"`
 	// 公告正文（支持 Markdown）
 	Content string `gorm:"type:text" json:"content"`
+	// English announcement content for non-Chinese locales.
+	ContentEn string `gorm:"type:text" json:"content_en,omitempty"`
 	// 公告类型: info | warning | success | error | model_deprecation | system
 	Type string `gorm:"type:varchar(30);not null;default:'info'" json:"type"`
 	// 优先级: low | normal | high | urgent

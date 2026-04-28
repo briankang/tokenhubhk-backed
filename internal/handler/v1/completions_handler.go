@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,12 +22,14 @@ import (
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/logger"
 	pkgredis "tokenhub-server/internal/pkg/redis"
+	"tokenhub-server/internal/pkg/tokenestimator"
 	"tokenhub-server/internal/provider"
 	"tokenhub-server/internal/service/apikey"
 	balancesvc "tokenhub-server/internal/service/balance"
 	billingsvc "tokenhub-server/internal/service/billing"
 	channelsvc "tokenhub-server/internal/service/channel"
 	codingsvc "tokenhub-server/internal/service/coding"
+	modelaliassvc "tokenhub-server/internal/service/modelalias"
 	"tokenhub-server/internal/service/parammapping"
 	"tokenhub-server/internal/service/pricing"
 	referralsvc "tokenhub-server/internal/service/referral"
@@ -43,10 +46,33 @@ type CompletionsHandler struct {
 	balanceSvc     *balancesvc.BalanceService
 	billingSvc     *billingsvc.Service
 	commissionCalc *referralsvc.CommissionCalculator
+	aliasSvc       *modelaliassvc.Service
 	paramSvc       *parammapping.ParamMappingService
 	tpmLimiter     *middleware.TPMLimiter
 	logger         *zap.Logger
 }
+
+const completionsLocalCacheTTL = 30 * time.Second
+const completionsLogQueueCapacity = 4096
+const completionsLogBatchSize = 100
+const completionsLogFlushInterval = 200 * time.Millisecond
+const completionsLogEnqueueTimeout = 100 * time.Millisecond
+
+type cachedModelMeta struct {
+	meta      modelMeta
+	expiresAt time.Time
+}
+
+type cachedPricedModel struct {
+	err       error
+	expiresAt time.Time
+}
+
+var completionsModelMetaCache sync.Map
+var completionsPricedModelCache sync.Map
+var completionsLogWorkersOnce sync.Once
+var channelLogQueue chan *model.ChannelLog
+var apiCallLogQueue chan *model.ApiCallLog
 
 // NewCompletionsHandler 创建 CompletionsHandler 实例，注入所有依赖
 func NewCompletionsHandler(
@@ -60,7 +86,7 @@ func NewCompletionsHandler(
 	paramSvc *parammapping.ParamMappingService,
 	tpmLimiter *middleware.TPMLimiter,
 ) *CompletionsHandler {
-	return &CompletionsHandler{
+	h := &CompletionsHandler{
 		db:             db,
 		codingSvc:      codingSvc,
 		channelRouter:  channelRouter,
@@ -69,10 +95,107 @@ func NewCompletionsHandler(
 		balanceSvc:     balSvc,
 		billingSvc:     billingsvc.NewService(db, pricingCalc, balSvc),
 		commissionCalc: commCalc,
+		aliasSvc:       modelaliassvc.NewService(db),
 		paramSvc:       paramSvc,
 		tpmLimiter:     tpmLimiter,
 		logger:         logger.L,
 	}
+	startCompletionsLogWorkers(db, h.logger)
+	return h
+}
+
+func startCompletionsLogWorkers(db *gorm.DB, log *zap.Logger) {
+	if db == nil {
+		return
+	}
+	completionsLogWorkersOnce.Do(func() {
+		channelLogQueue = make(chan *model.ChannelLog, completionsLogQueueCapacity)
+		apiCallLogQueue = make(chan *model.ApiCallLog, completionsLogQueueCapacity)
+		go runChannelLogBatchWorker(db, log)
+		go runAPICallLogBatchWorker(db, log)
+	})
+}
+
+func runChannelLogBatchWorker(db *gorm.DB, log *zap.Logger) {
+	ticker := time.NewTicker(completionsLogFlushInterval)
+	defer ticker.Stop()
+
+	batch := make([]*model.ChannelLog, 0, completionsLogBatchSize)
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := insertChannelLogBatch(db, batch); err != nil && log != nil {
+			log.Error("v1: 批量记录渠道日志失败", zap.Int("count", len(batch)), zap.Error(err))
+		}
+		for i := range batch {
+			batch[i] = nil
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case item := <-channelLogQueue:
+			if item == nil {
+				continue
+			}
+			batch = append(batch, item)
+			if len(batch) >= completionsLogBatchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func runAPICallLogBatchWorker(db *gorm.DB, log *zap.Logger) {
+	ticker := time.NewTicker(completionsLogFlushInterval)
+	defer ticker.Stop()
+
+	batch := make([]*model.ApiCallLog, 0, completionsLogBatchSize)
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := insertAPICallLogBatch(db, batch); err != nil && log != nil {
+			log.Error("v1: 批量记录API调用日志失败", zap.Int("count", len(batch)), zap.Error(err))
+		}
+		for i := range batch {
+			batch[i] = nil
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case item := <-apiCallLogQueue:
+			if item == nil {
+				continue
+			}
+			batch = append(batch, item)
+			if len(batch) >= completionsLogBatchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func insertChannelLogBatch(db *gorm.DB, batch []*model.ChannelLog) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	return db.CreateInBatches(batch, len(batch)).Error
+}
+
+func insertAPICallLogBatch(db *gorm.DB, batch []*model.ApiCallLog) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	return db.CreateInBatches(batch, len(batch)).Error
 }
 
 // Register 注册路由到 /v1/ 路由组
@@ -116,6 +239,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 
 	// 步骤2：解析请求参数
 	// 先读取原始请求体，以便提取标准字段之外的扩展参数（如 enable_thinking）
+	middleware.EnsurePaidUserContext(c, h.db, keyInfo.UserID)
 	rawBody, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -140,7 +264,10 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 	// 提取用户请求中的扩展参数（非标准 OpenAI 字段）
 	var rawMap map[string]json.RawMessage
 	json.Unmarshal(rawBody, &rawMap)
+	normalizeChatCompletionRequest(&req, rawMap)
 	userExtraParams := extractChatExtraParams(rawMap)
+	providerPassthroughParams := extractProviderPassthroughParams(userExtraParams)
+	requestedModel := req.Model
 
 	if len(req.Messages) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -196,6 +323,33 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 	// 拦截 offline/非激活 模型和非 chat 类型（如 ImageGeneration/VideoGeneration/TTS 等）
 	// 的请求，避免无效请求到达上游并污染渠道健康指标。
 	// 若模型不存在（例如别名映射/聚合路由），则跳过守卫，后续 SelectChannel 会再次校验。
+	// Resolve platform-side model aliases before model metadata checks and routing.
+	aliasRes, aliasErr := h.resolveModelAlias(req.Model)
+	if aliasErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{
+				"message": aliasErr.Error(),
+				"type":    "invalid_request_error",
+				"code":    "model_alias_error",
+			},
+		})
+		return
+	}
+	if aliasRes.IsAlias {
+		req.Model = aliasRes.ResolvedModel
+		c.Set("requested_model", requestedModel)
+		c.Set("model_alias", aliasRes.Alias.AliasName)
+		c.Set("resolved_model", aliasRes.ResolvedModel)
+		c.Set("model_alias_type", aliasRes.Alias.AliasType)
+		h.logger.Info("v1 chat: resolved model alias",
+			zap.String("requested_model", requestedModel),
+			zap.String("resolved_model", aliasRes.ResolvedModel),
+			zap.String("alias_type", aliasRes.Alias.AliasType))
+	}
+
+	if h.rejectPremiumModelForFreeUser(c, req.Model) {
+		return
+	}
 	if meta, err := h.loadModelMeta(req.Model); err == nil {
 		if !meta.IsActive || strings.EqualFold(meta.Status, "offline") {
 			h.logger.Warn("v1 chat: model offline or inactive",
@@ -207,19 +361,6 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 					"message": fmt.Sprintf("Model %s has been disabled, please choose another model", req.Model),
 					"type":    "model_unavailable",
 					"code":    "model_offline",
-				},
-			})
-			return
-		}
-
-		// v5.1: 免费层模型限制 —— Free 用户仅能调用 IsFreeTier=true 的模型
-		isPaid, _ := c.Get("isPaidUser")
-		if isPaidBool, ok := isPaid.(bool); ok && !isPaidBool && !meta.IsFreeTier {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": gin.H{
-					"message": fmt.Sprintf("Model %s is a premium model. Please recharge at least ¥10 to unlock all models.", req.Model),
-					"type":    "access_denied",
-					"code":    "premium_model_only",
 				},
 			})
 			return
@@ -272,7 +413,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 		ApiKeyID:     keyInfo.KeyID,
 		ClientIP:     c.ClientIP(),
 		Endpoint:     "/v1/chat/completions",
-		RequestModel: req.Model,
+		RequestModel: requestedModel,
 		IsStream:     req.Stream,
 		MessageCount: len(req.Messages),
 		MaxTokens:    req.MaxTokens,
@@ -480,6 +621,14 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 				extra = h.paramSvc.TransformParamsWithContext(c.Request.Context(), supplierCode, extra)
 			}
 		}
+		if len(providerPassthroughParams) > 0 {
+			if extra == nil {
+				extra = make(map[string]interface{})
+			}
+			for k, v := range providerPassthroughParams {
+				extra[k] = v
+			}
+		}
 		chatReq.Extra = extra
 
 		// 3.4 执行请求
@@ -501,6 +650,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 			// 连接已建立，开始流式传输（不可再重试）
 			c.Header("X-Request-ID", requestID)
 			c.Header("X-Actual-Model", chatReq.Model)
+			h.setModelDebugHeaders(c)
 			c.Header("X-Channel-ID", fmt.Sprintf("%d", ch.ID))
 			c.Header("X-Upstream-Latency-Ms", fmt.Sprintf("%d", time.Since(start).Milliseconds()))
 			includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
@@ -583,7 +733,23 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 					// 无 usage 但有 thinking-only 警告，仍写入一条日志
 					h.recordLog(ch.ID, chatReq.Model, keyInfo, requestID, 0, 0, int(latency), 200, warnMsg)
 				} else {
-					h.releaseBillingFreeze(c, freezeID)
+					// P1 修复：上游 usage 缺失时按请求估算扣费，避免白嫖
+					estimated := h.estimateUsageFromRequest(c, chatReq)
+					h.recordLog(ch.ID, chatReq.Model, keyInfo, requestID,
+						estimated.PromptTokens, estimated.CompletionTokens, int(latency), 200, "warn:usage_estimated")
+					cost, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, estimated, requestID)
+					if h.commissionCalc != nil && cost > 0 {
+						h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, cost, req.Model)
+					}
+					callLog.PromptTokens = estimated.PromptTokens
+					callLog.CompletionTokens = estimated.CompletionTokens
+					callLog.TotalTokens = estimated.TotalTokens
+					callLog.CostCredits = cost
+					callLog.CostRMB = costRMB
+					applyMatchedTierFromCtx(c, callLog)
+					if h.tpmLimiter != nil && estimated.TotalTokens > 0 {
+						h.tpmLimiter.RecordTPM(c.Request.Context(), keyInfo.UserID, estimated.TotalTokens)
+					}
 				}
 				callLog.ChannelID = ch.ID
 				callLog.ActualModel = chatReq.Model
@@ -657,6 +823,7 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 		// 在响应头和响应体中注入 request_id
 		c.Header("X-Request-ID", requestID)
 		c.Header("X-Actual-Model", chatReq.Model)
+		h.setModelDebugHeaders(c)
 		c.Header("X-Channel-ID", fmt.Sprintf("%d", ch.ID))
 		c.Header("X-Upstream-Latency-Ms", fmt.Sprintf("%d", latency))
 		// 将 resp 转为 map 以注入 request_id
@@ -664,6 +831,11 @@ func (h *CompletionsHandler) ChatCompletions(c *gin.Context) {
 		var respMap map[string]interface{}
 		json.Unmarshal(respBytes, &respMap)
 		respMap["request_id"] = requestID
+		if aliasName, ok := c.Get("model_alias"); ok {
+			respMap["model_alias"] = aliasName
+			respMap["requested_model"] = requestedModel
+			respMap["resolved_model"] = req.Model
+		}
 		c.JSON(http.StatusOK, respMap)
 		return
 	}
@@ -793,7 +965,14 @@ func (h *CompletionsHandler) handleStreamChat(
 		h.releaseBillingFreeze(c, h.billingFreezeID(c))
 		h.recordLog(ch.ID, req.Model, keyInfo, requestID, 0, 0, int(latency), 200, warnMsg)
 	} else {
-		h.releaseBillingFreeze(c, h.billingFreezeID(c))
+		// P1 修复：上游 usage 缺失时按请求估算扣费，避免白嫖
+		estimated := h.estimateUsageFromRequest(c, req)
+		h.recordLog(ch.ID, req.Model, keyInfo, requestID,
+			estimated.PromptTokens, estimated.CompletionTokens, int(latency), 200, "warn:usage_estimated")
+		cost, _ := h.calculateAndDeductCost(c, req.Model, keyInfo, estimated, requestID)
+		if h.commissionCalc != nil && cost > 0 {
+			h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, cost, req.Model)
+		}
 	}
 }
 
@@ -826,6 +1005,8 @@ func (h *CompletionsHandler) FIMCompletions(c *gin.Context) {
 		return
 	}
 
+	middleware.EnsurePaidUserContext(c, h.db, keyInfo.UserID)
+
 	var req fimCompletionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -835,6 +1016,31 @@ func (h *CompletionsHandler) FIMCompletions(c *gin.Context) {
 			},
 		})
 		return
+	}
+	requestedModel := req.Model
+
+	// Resolve platform-side model aliases before coding routing and billing.
+	aliasRes, aliasErr := h.resolveModelAlias(req.Model)
+	if aliasErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{
+				"message": aliasErr.Error(),
+				"type":    "invalid_request_error",
+				"code":    "model_alias_error",
+			},
+		})
+		return
+	}
+	if aliasRes.IsAlias {
+		req.Model = aliasRes.ResolvedModel
+		c.Set("requested_model", requestedModel)
+		c.Set("model_alias", aliasRes.Alias.AliasName)
+		c.Set("resolved_model", aliasRes.ResolvedModel)
+		c.Set("model_alias_type", aliasRes.Alias.AliasType)
+		h.logger.Info("v1 completions: resolved model alias",
+			zap.String("requested_model", requestedModel),
+			zap.String("resolved_model", aliasRes.ResolvedModel),
+			zap.String("alias_type", aliasRes.Alias.AliasType))
 	}
 
 	// 检查余额
@@ -848,6 +1054,10 @@ func (h *CompletionsHandler) FIMCompletions(c *gin.Context) {
 			})
 			return
 		}
+	}
+
+	if h.rejectPremiumModelForFreeUser(c, req.Model) {
+		return
 	}
 
 	requestID := "cmpl-" + uuid.New().String()
@@ -905,6 +1115,7 @@ func (h *CompletionsHandler) FIMCompletions(c *gin.Context) {
 
 	// 创建提供商实例
 	p := h.codingSvc.CreateProviderForChannel(ch)
+	h.setModelDebugHeaders(c)
 
 	// 检查是否是 DeepSeek 提供商（支持原生 FIM）
 	if deepseekP, ok := p.(*provider.CodingDeepSeekProvider); ok {
@@ -1056,7 +1267,30 @@ func (h *CompletionsHandler) handleDeepSeekFIM(
 			}
 			h.recordFIMApiCallLog(c, req, ch, keyInfo, requestID, usage, int(latency), 200, cost, costRMB, "")
 		} else {
-			h.releaseBillingFreeze(c, h.billingFreezeID(c))
+			// P1 修复：FIM 流式 usage 缺失时估算扣费
+			estPrompt := tokenestimator.EstimateRawText(req.Prompt + req.Suffix)
+			estCompletion := req.MaxTokens
+			if estCompletion <= 0 || estCompletion > 4000 {
+				estCompletion = 200
+			}
+			estimated := provider.Usage{
+				PromptTokens:     estPrompt,
+				CompletionTokens: estCompletion,
+				TotalTokens:      estPrompt + estCompletion,
+			}
+			c.Set("usage_estimated", true)
+			c.Set("usage_source", "estimator")
+			h.logger.Warn("FIM upstream usage missing, fallback to estimator",
+				zap.String("model", req.Model),
+				zap.Int("estimated_prompt", estPrompt),
+				zap.Int("estimated_completion", estCompletion))
+			h.recordLog(ch.ID, req.Model, keyInfo, requestID,
+				estimated.PromptTokens, estimated.CompletionTokens, int(latency), 200, "warn:usage_estimated")
+			cost, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, estimated, requestID)
+			if h.commissionCalc != nil && cost > 0 {
+				h.commissionCalc.CalculateCommissionsAsyncByModelName(keyInfo.UserID, keyInfo.TenantID, cost, req.Model)
+			}
+			h.recordFIMApiCallLog(c, req, ch, keyInfo, requestID, &estimated, int(latency), 200, cost, costRMB, "warn:usage_estimated")
 		}
 		return
 	}
@@ -1097,6 +1331,10 @@ func (h *CompletionsHandler) handleDeepSeekFIM(
 
 // authenticateAPIKey 从请求头提取并验证 API Key
 func (h *CompletionsHandler) authenticateAPIKey(c *gin.Context) (*apikey.ApiKeyInfo, error) {
+	if info, ok := apiKeyInfoFromContext(c); ok {
+		return info, nil
+	}
+
 	auth := c.GetHeader("Authorization")
 	if auth == "" {
 		return nil, fmt.Errorf("missing authorization header")
@@ -1110,6 +1348,140 @@ func (h *CompletionsHandler) authenticateAPIKey(c *gin.Context) (*apikey.ApiKeyI
 		return nil, fmt.Errorf("empty api key")
 	}
 	return h.apiKeySvc.Verify(c.Request.Context(), key)
+}
+
+func apiKeyInfoFromContext(c *gin.Context) (*apikey.ApiKeyInfo, bool) {
+	keyID, ok := contextUint(c, "apiKeyId")
+	if !ok || keyID == 0 {
+		return nil, false
+	}
+	userID, ok := contextUint(c, "userId")
+	if !ok || userID == 0 {
+		return nil, false
+	}
+	tenantID, ok := contextUint(c, "tenantId")
+	if !ok || tenantID == 0 {
+		return nil, false
+	}
+
+	info := &apikey.ApiKeyInfo{
+		KeyID:    keyID,
+		UserID:   userID,
+		TenantID: tenantID,
+	}
+	if customChannelID, ok := contextUint(c, "customChannelID"); ok && customChannelID > 0 {
+		info.CustomChannelID = &customChannelID
+	}
+	if allowedModels, ok := c.Get("allowedModels"); ok {
+		if s, ok := allowedModels.(string); ok {
+			info.AllowedModels = s
+		}
+	}
+	if creditLimit, ok := contextInt64(c, "creditLimit"); ok {
+		info.CreditLimit = creditLimit
+	}
+	if creditUsed, ok := contextInt64(c, "creditUsed"); ok {
+		info.CreditUsed = creditUsed
+	}
+	if rpm, ok := contextInt(c, "rateLimitRPM"); ok {
+		info.RateLimitRPM = rpm
+	}
+	if tpm, ok := contextInt(c, "rateLimitTPM"); ok {
+		info.RateLimitTPM = tpm
+	}
+	return info, true
+}
+
+func contextUint(c *gin.Context, key string) (uint, bool) {
+	v, ok := c.Get(key)
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case uint:
+		return n, true
+	case uint64:
+		return uint(n), true
+	case uint32:
+		return uint(n), true
+	case int:
+		if n >= 0 {
+			return uint(n), true
+		}
+	case int64:
+		if n >= 0 {
+			return uint(n), true
+		}
+	}
+	return 0, false
+}
+
+func contextInt(c *gin.Context, key string) (int, bool) {
+	v, ok := c.Get(key)
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case int32:
+		return int(n), true
+	case uint:
+		return int(n), true
+	}
+	return 0, false
+}
+
+func contextInt64(c *gin.Context, key string) (int64, bool) {
+	v, ok := c.Get(key)
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case uint:
+		return int64(n), true
+	case uint64:
+		return int64(n), true
+	}
+	return 0, false
+}
+
+func (h *CompletionsHandler) resolveModelAlias(modelName string) (modelaliassvc.Resolution, error) {
+	if h.aliasSvc == nil {
+		return modelaliassvc.Resolution{RequestedModel: modelName, ResolvedModel: modelName}, nil
+	}
+	return h.aliasSvc.Resolve(modelName)
+}
+
+func (h *CompletionsHandler) setModelDebugHeaders(c *gin.Context) {
+	if aliasName, ok := c.Get("model_alias"); ok {
+		if s, ok := aliasName.(string); ok && s != "" {
+			c.Header("X-Model-Alias", s)
+		}
+	}
+	if resolved, ok := c.Get("resolved_model"); ok {
+		if s, ok := resolved.(string); ok && s != "" {
+			c.Header("X-Resolved-Model", s)
+		}
+	}
+	if requested, ok := c.Get("requested_model"); ok {
+		if s, ok := requested.(string); ok && s != "" {
+			c.Header("X-Requested-Model", s)
+		}
+	}
+	if aliasType, ok := c.Get("model_alias_type"); ok {
+		if s, ok := aliasType.(string); ok && s != "" {
+			c.Header("X-Alias-Type", s)
+		}
+	}
 }
 
 // recordLog 异步保存渠道调用日志（同时写入 channel_logs 和 api_call_logs）
@@ -1126,26 +1498,44 @@ func (h *CompletionsHandler) recordLog(
 ) {
 	// 预先计算 ErrorCategory（避免在 goroutine 里重复推断）
 	category := inferErrorCategory(statusCode, errMsg)
-	go func() {
-		log := &model.ChannelLog{
-			ChannelID:           channelID,
-			ModelName:           modelName,
-			TenantID:            keyInfo.TenantID,
-			UserID:              keyInfo.UserID,
-			ApiKeyID:            keyInfo.KeyID,
-			RequestTokens:       promptTokens,
-			ResponseTokens:      completionTokens,
-			LatencyMs:           latencyMs,
-			StatusCode:          statusCode,
-			ErrorMessage:        errMsg,
-			ErrorCategory:       category,
-			RequestID:           requestID,
-			MatchedPriceTierIdx: -1,
+	log := &model.ChannelLog{
+		ChannelID:           channelID,
+		ModelName:           modelName,
+		TenantID:            keyInfo.TenantID,
+		UserID:              keyInfo.UserID,
+		ApiKeyID:            keyInfo.KeyID,
+		RequestTokens:       promptTokens,
+		ResponseTokens:      completionTokens,
+		LatencyMs:           latencyMs,
+		StatusCode:          statusCode,
+		ErrorMessage:        errMsg,
+		ErrorCategory:       category,
+		RequestID:           requestID,
+		MatchedPriceTierIdx: -1,
+	}
+	if h.enqueueChannelLog(log) {
+		return
+	}
+	if err := h.db.Create(log).Error; err != nil {
+		h.logger.Error("v1: 记录渠道日志失败", zap.Error(err))
+	}
+}
+
+func (h *CompletionsHandler) enqueueChannelLog(log *model.ChannelLog) bool {
+	if log == nil || channelLogQueue == nil {
+		return false
+	}
+	timer := time.NewTimer(completionsLogEnqueueTimeout)
+	defer timer.Stop()
+	select {
+	case channelLogQueue <- log:
+		return true
+	case <-timer.C:
+		if h.logger != nil {
+			h.logger.Warn("v1: 渠道日志队列已满，降级同步写入", zap.Int("capacity", cap(channelLogQueue)))
 		}
-		if err := h.db.Create(log).Error; err != nil {
-			h.logger.Error("v1: 记录渠道日志失败", zap.Error(err))
-		}
-	}()
+		return false
+	}
 }
 
 // inferErrorCategory 基于 status_code 与 errMsg 字符串推断错误类别
@@ -1282,6 +1672,12 @@ func (h *CompletionsHandler) ensureModelPriced(ctx context.Context, modelName st
 	if h.pricingCalc == nil || modelName == "" {
 		return nil
 	}
+	if raw, ok := completionsPricedModelCache.Load(modelName); ok {
+		if cached, ok := raw.(*cachedPricedModel); ok && time.Now().Before(cached.expiresAt) {
+			return cached.err
+		}
+		completionsPricedModelCache.Delete(modelName)
+	}
 	var m model.AIModel
 	if err := h.db.WithContext(ctx).
 		Select("id").
@@ -1290,16 +1686,38 @@ func (h *CompletionsHandler) ensureModelPriced(ctx context.Context, modelName st
 		return nil // 模型不存在交给渠道路由处理
 	}
 	_, err := h.pricingCalc.CalculatePrice(ctx, 0, m.ID, 0, 0)
+	completionsPricedModelCache.Store(modelName, &cachedPricedModel{
+		err:       err,
+		expiresAt: time.Now().Add(completionsLocalCacheTTL),
+	})
 	return err
 }
 
 // recordApiCallLog 异步保存 API 调用全链路日志
 func (h *CompletionsHandler) recordApiCallLog(log *model.ApiCallLog) {
-	go func() {
-		if err := h.db.Create(log).Error; err != nil {
-			h.logger.Error("v1: 记录API调用日志失败", zap.Error(err))
+	if h.enqueueAPICallLog(log) {
+		return
+	}
+	if err := h.db.Create(log).Error; err != nil {
+		h.logger.Error("v1: 记录API调用日志失败", zap.Error(err))
+	}
+}
+
+func (h *CompletionsHandler) enqueueAPICallLog(log *model.ApiCallLog) bool {
+	if log == nil || apiCallLogQueue == nil {
+		return false
+	}
+	timer := time.NewTimer(completionsLogEnqueueTimeout)
+	defer timer.Stop()
+	select {
+	case apiCallLogQueue <- log:
+		return true
+	case <-timer.C:
+		if h.logger != nil {
+			h.logger.Warn("v1: API调用日志队列已满，降级同步写入", zap.Int("capacity", cap(apiCallLogQueue)))
 		}
-	}()
+		return false
+	}
 }
 
 // calculateAndDeductCost 计算用量费用并从余额中扣减，返回积分（int64）和人民币金额（float64）
@@ -1311,6 +1729,43 @@ func (h *CompletionsHandler) calculateAndDeductCost(
 ) (int64, float64) {
 	cost, costRMB, _ := h.calculateAndDeductCostWithErr(c, modelName, keyInfo, usage, requestID)
 	return cost, costRMB
+}
+
+// estimateUsageFromRequest 当上游 usage 缺失时基于请求参数粗估
+//
+// P1 修复：流式响应 chunk 不含 usage 字段时的兜底，防止用户白嫖。
+// 估算策略：
+//   - prompt_tokens：tokenestimator 按 messages 全部内容估算（含 20% 安全裕量）
+//   - completion_tokens：优先用 req.MaxTokens；缺失或异常时退回 200（保守值）
+//
+// 返回的 Usage 会被打上 c.Set("usage_source", "estimator") 标记。
+func (h *CompletionsHandler) estimateUsageFromRequest(c *gin.Context, req *provider.ChatRequest) provider.Usage {
+	if req == nil {
+		return provider.Usage{}
+	}
+	msgs := make([]tokenestimator.Message, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		msgs = append(msgs, tokenestimator.Message{
+			Role:    m.Role,
+			Content: provider.TextContent(m.Content),
+		})
+	}
+	promptTokens := tokenestimator.EstimatePromptTokens(msgs)
+	completionTokens := req.MaxTokens
+	if completionTokens <= 0 || completionTokens > 4000 {
+		completionTokens = 200
+	}
+	c.Set("usage_estimated", true)
+	c.Set("usage_source", "estimator")
+	h.logger.Warn("upstream usage missing, fallback to estimator",
+		zap.String("model", req.Model),
+		zap.Int("estimated_prompt", promptTokens),
+		zap.Int("estimated_completion", completionTokens))
+	return provider.Usage{
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      promptTokens + completionTokens,
+	}
 }
 
 // calculateAndDeductCostWithErr 带错误返回的扣费版本，供流式/重试场景显式判断扣费是否成功
@@ -1357,10 +1812,11 @@ func (h *CompletionsHandler) calculateAndDeductCostWithErr(
 	var err error
 	if usage.CacheReadTokens > 0 || usage.CacheWriteTokens > 0 {
 		costResult, err = h.pricingCalc.CalculateCostWithCache(ctx, keyInfo.UserID, &aiModel, keyInfo.TenantID, 0, pricing.CacheUsageInput{
-			InputTokens:      usage.PromptTokens,
-			OutputTokens:     usage.CompletionTokens,
-			CacheReadTokens:  usage.CacheReadTokens,
-			CacheWriteTokens: usage.CacheWriteTokens,
+			InputTokens:        usage.PromptTokens,
+			OutputTokens:       usage.CompletionTokens,
+			CacheReadTokens:    usage.CacheReadTokens,
+			CacheWriteTokens:   usage.CacheWriteTokens,
+			CacheWrite1hTokens: usage.CacheWrite1hTokens,
 		})
 	} else {
 		costResult, err = h.pricingCalc.CalculateCost(ctx, keyInfo.UserID, aiModel.ID, keyInfo.TenantID, 0, usage.PromptTokens, usage.CompletionTokens)
@@ -1450,10 +1906,11 @@ func (h *CompletionsHandler) calculateAndDeductCostWithErr(
 			_, savingsRMB, sErr := h.pricingCalc.CalculateWithCache(
 				context.Background(), keyInfo.UserID, &aiModel, keyInfo.TenantID, 0,
 				pricing.CacheUsageInput{
-					InputTokens:      usage.PromptTokens,
-					OutputTokens:     usage.CompletionTokens,
-					CacheReadTokens:  usage.CacheReadTokens,
-					CacheWriteTokens: usage.CacheWriteTokens,
+					InputTokens:        usage.PromptTokens,
+					OutputTokens:       usage.CompletionTokens,
+					CacheReadTokens:    usage.CacheReadTokens,
+					CacheWriteTokens:   usage.CacheWriteTokens,
+					CacheWrite1hTokens: usage.CacheWrite1hTokens,
 				},
 			)
 			if sErr != nil {
@@ -1699,9 +2156,30 @@ type modelMeta struct {
 	Features   model.JSON
 }
 
-// loadModelMeta 从 ai_models 表查找模型的可用状态与类型
-// 返回 ErrRecordNotFound 视为"未知模型"，由后续 SelectChannel 统一处理
-func (h *CompletionsHandler) loadModelMeta(modelName string) (*modelMeta, error) {
+func (h *CompletionsHandler) rejectPremiumModelForFreeUser(c *gin.Context, modelName string) bool {
+	if isPaid, ok := c.Get("isPaidUser"); ok {
+		if paid, ok := isPaid.(bool); ok && paid {
+			return false
+		}
+	}
+	meta, err := h.loadModelMetaFresh(modelName)
+	if err != nil {
+		return false
+	}
+	if meta.IsFreeTier {
+		return false
+	}
+	c.JSON(http.StatusForbidden, gin.H{
+		"error": gin.H{
+			"message": fmt.Sprintf("Model %s is a premium model. Please recharge at least ¥10 to unlock all models.", modelName),
+			"type":    "access_denied",
+			"code":    "premium_model_only",
+		},
+	})
+	return true
+}
+
+func (h *CompletionsHandler) loadModelMetaFresh(modelName string) (*modelMeta, error) {
 	var m modelMeta
 	err := h.db.Table("ai_models").
 		Select("id, model_name, model_type, status, is_active, is_free_tier, features").
@@ -1710,6 +2188,36 @@ func (h *CompletionsHandler) loadModelMeta(modelName string) (*modelMeta, error)
 	if err != nil {
 		return nil, err
 	}
+	completionsModelMetaCache.Store(modelName, &cachedModelMeta{
+		meta:      m,
+		expiresAt: time.Now().Add(completionsLocalCacheTTL),
+	})
+	return &m, nil
+}
+
+// loadModelMeta 从 ai_models 表查找模型的可用状态与类型
+// 返回 ErrRecordNotFound 视为"未知模型"，由后续 SelectChannel 统一处理
+func (h *CompletionsHandler) loadModelMeta(modelName string) (*modelMeta, error) {
+	if raw, ok := completionsModelMetaCache.Load(modelName); ok {
+		if cached, ok := raw.(*cachedModelMeta); ok && time.Now().Before(cached.expiresAt) {
+			meta := cached.meta
+			return &meta, nil
+		}
+		completionsModelMetaCache.Delete(modelName)
+	}
+
+	var m modelMeta
+	err := h.db.Table("ai_models").
+		Select("id, model_name, model_type, status, is_active, is_free_tier, features").
+		Where("model_name = ?", modelName).
+		Take(&m).Error
+	if err != nil {
+		return nil, err
+	}
+	completionsModelMetaCache.Store(modelName, &cachedModelMeta{
+		meta:      m,
+		expiresAt: time.Now().Add(completionsLocalCacheTTL),
+	})
 	return &m, nil
 }
 

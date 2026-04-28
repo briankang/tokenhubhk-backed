@@ -2,7 +2,9 @@ package pricing
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"gorm.io/gorm"
@@ -159,12 +161,20 @@ func (s *PricingService) DeleteModelPricing(ctx context.Context, id uint) error 
 // autoEnableIfNeedsSellPrice 若模型因未配置售价（NeedsSellPrice 标签）而被停用，
 // 在售价配置完成后自动恢复 is_active=true 并移除该标签。
 // 仅影响因缺少售价被禁用的模型，不会影响因其他原因（能力测试失败、管理员手动禁用）停用的模型。
+//
+// 安全守卫：source='auto' 的模型（自动同步入库）即便配置了售价也不自动启用，
+// 必须管理员人工审核后手动开关。原因是这类模型未经能力测试也未经人工核对，
+// 直接对外公开存在质量与计费风险。
 func (s *PricingService) autoEnableIfNeedsSellPrice(ctx context.Context, modelID uint) {
 	var m model.AIModel
-	if err := s.db.WithContext(ctx).Select("id, is_active, tags").First(&m, modelID).Error; err != nil {
+	if err := s.db.WithContext(ctx).Select("id, is_active, source, tags").First(&m, modelID).Error; err != nil {
 		return
 	}
 	if m.IsActive || !strings.Contains(m.Tags, "NeedsSellPrice") {
+		return
+	}
+	// 自动入库的模型不自动启用
+	if m.Source == "auto" {
 		return
 	}
 	newTags := removePricingTag(m.Tags, "NeedsSellPrice")
@@ -227,6 +237,7 @@ func (s *PricingService) SetLevelDiscount(ctx context.Context, discount *model.A
 	if discount.ModelID != nil {
 		s.calculator.InvalidateCache(ctx, *discount.ModelID, nil)
 	}
+	clearDiscountMissCache()
 	return nil
 }
 
@@ -282,6 +293,7 @@ func (s *PricingService) UpdateLevelDiscount(ctx context.Context, id uint, disco
 	if existing.ModelID != nil {
 		s.calculator.InvalidateCache(ctx, *existing.ModelID, nil)
 	}
+	clearDiscountMissCache()
 	return nil
 }
 
@@ -303,6 +315,7 @@ func (s *PricingService) DeleteLevelDiscount(ctx context.Context, id uint) error
 	if existing.ModelID != nil {
 		s.calculator.InvalidateCache(ctx, *existing.ModelID, nil)
 	}
+	clearDiscountMissCache()
 	return nil
 }
 
@@ -349,6 +362,7 @@ func (s *PricingService) SetAgentPricing(ctx context.Context, pricing *model.Age
 
 	tid := pricing.TenantID
 	s.calculator.InvalidateCache(ctx, pricing.ModelID, &tid)
+	clearDiscountMissCache()
 	return nil
 }
 
@@ -415,6 +429,7 @@ func (s *PricingService) UpdateAgentPricing(ctx context.Context, id uint, pricin
 
 	tid := existing.TenantID
 	s.calculator.InvalidateCache(ctx, existing.ModelID, &tid)
+	clearDiscountMissCache()
 	return nil
 }
 
@@ -435,5 +450,86 @@ func (s *PricingService) DeleteAgentPricing(ctx context.Context, id uint) error 
 	}
 	tid := existing.TenantID
 	s.calculator.InvalidateCache(ctx, existing.ModelID, &tid)
+	clearDiscountMissCache()
 	return nil
+}
+
+// ValidatePriceTiersForModel 校验模型的阶梯定价是否符合单调性
+//
+// P4 修复：检查 ModelPricing.PriceTiers 与 AIModel.PriceTiers 的单价是否随
+// input token 区间单调递增。返回 warning 字符串列表（不强制阻断）。
+//
+// 用例：
+//   - 阶梯[1] InputMin=32k 单价 0.9 < 阶梯[0] InputMin=0 单价 1.2 → 反向激励信号
+//
+// 仅查输入单价（SellingInputPrice 优先，否则 InputPrice）。
+// 长上下文降价是合法业务场景，故为 warning 而非 error。
+func (s *PricingService) ValidatePriceTiersForModel(ctx context.Context, modelID uint) ([]string, error) {
+	if modelID == 0 {
+		return nil, fmt.Errorf("model_id is required")
+	}
+	var warnings []string
+	// 检查 ModelPricing.PriceTiers
+	var mp model.ModelPricing
+	if err := s.db.WithContext(ctx).Where("model_id = ?", modelID).First(&mp).Error; err == nil {
+		if ws := ValidatePriceTiersMonotonic(mp.PriceTiers, "ModelPricing"); len(ws) > 0 {
+			warnings = append(warnings, ws...)
+		}
+	} else if err != gorm.ErrRecordNotFound {
+		return nil, fmt.Errorf("query model pricing: %w", err)
+	}
+	// 检查 AIModel.PriceTiers（成本阶梯）
+	var aiModel model.AIModel
+	if err := s.db.WithContext(ctx).Select("id, price_tiers").First(&aiModel, modelID).Error; err == nil {
+		if ws := ValidatePriceTiersMonotonic(aiModel.PriceTiers, "AIModel(成本)"); len(ws) > 0 {
+			warnings = append(warnings, ws...)
+		}
+	}
+	return warnings, nil
+}
+
+// ValidatePriceTiersMonotonic 校验阶梯输入单价是否随 InputMin 升序单调递增
+//
+// 返回 warning 列表（不强制阻断）。空 tiers / 单 tier / 无价 → 不警告。
+func ValidatePriceTiersMonotonic(rawTiers model.JSON, source string) []string {
+	if len(rawTiers) == 0 || string(rawTiers) == "null" {
+		return nil
+	}
+	var data model.PriceTiersData
+	if err := json.Unmarshal(rawTiers, &data); err != nil {
+		return nil
+	}
+	if len(data.Tiers) < 2 {
+		return nil
+	}
+	tiers := make([]model.PriceTier, len(data.Tiers))
+	copy(tiers, data.Tiers)
+	sort.SliceStable(tiers, func(i, j int) bool {
+		return tiers[i].InputMin < tiers[j].InputMin
+	})
+	var warnings []string
+	var prevPrice float64
+	var prevName string
+	for i, t := range tiers {
+		price := t.InputPrice
+		if t.SellingInputPrice != nil {
+			price = *t.SellingInputPrice
+		}
+		if i > 0 && price > 0 && prevPrice > 0 && price < prevPrice {
+			label := t.Name
+			if label == "" {
+				label = fmt.Sprintf("idx=%d", i)
+			}
+			prevLabel := prevName
+			if prevLabel == "" {
+				prevLabel = fmt.Sprintf("idx=%d", i-1)
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"[%s] 阶梯 %s (InputMin=%d) 单价 %.4f 低于前阶梯 %s 单价 %.4f；消费越多反而越便宜，建议复核配置",
+				source, label, t.InputMin, price, prevLabel, prevPrice))
+		}
+		prevPrice = price
+		prevName = t.Name
+	}
+	return warnings
 }

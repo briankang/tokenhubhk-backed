@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
@@ -111,7 +112,10 @@ func (s *UserService) Update(ctx context.Context, id uint, updates map[string]in
 	return nil
 }
 
-// Deactivate 停用指定用户账号
+// Deactivate 停用指定用户账号（仅置 is_active=0,保留 email/数据,可恢复）
+//
+// 用于"暂停账号但保留所有信息"场景。被停用账号无法登录,但 email 仍占用唯一索引槽位,
+// 同邮箱无法用于新账号注册。如需释放邮箱请用 Delete。
 func (s *UserService) Deactivate(ctx context.Context, id uint) error {
 	if id == 0 {
 		return fmt.Errorf("user id is required")
@@ -124,6 +128,72 @@ func (s *UserService) Deactivate(ctx context.Context, id uint) error {
 		return fmt.Errorf("user not found")
 	}
 	return nil
+}
+
+// Delete 软删除用户并释放原邮箱(tombstone 模式)
+//
+// 实现:在同一事务内
+//  1. 把 email 改写成 deleted_<id>_<unix_ts>@deleted.tombstone(占住唯一索引槽位但与真实邮箱完全隔离)
+//  2. 把 referral_code 改成 deleted_<id>_<unix_ts>(防止它被新注册者复用)
+//  3. is_active=0
+//  4. GORM 软删除(自动写 deleted_at)
+//
+// 副作用:
+//   - 原 email 立即可被新注册者复用
+//   - 原 referral_code 不再有效(归因/邀请校验默认 WHERE deleted_at IS NULL)
+//   - 关联的 referral_attributions / user_balances / api_keys 等不动,保留审计与历史归因
+//   - 受 GORM 软删除特性影响,GetByID/List 默认不会返回该用户
+//
+// 该方法是 Delete 的目标语义("彻底删除/释放邮箱"),与 Deactivate(暂停)语义区分。
+func (s *UserService) Delete(ctx context.Context, id uint) error {
+	if id == 0 {
+		return fmt.Errorf("user id is required")
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 先确认用户存在(否则 RowsAffected=0 时无法区分"已删除"和"不存在")
+		var user model.User
+		if err := tx.First(&user, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("user not found")
+			}
+			return fmt.Errorf("failed to load user: %w", err)
+		}
+
+		// Step 1+2+3: tombstone email + referral_code, 停用
+		ts := time.Now().Unix()
+		tombstoneEmail := fmt.Sprintf("deleted_%d_%d@deleted.tombstone", id, ts)
+		tombstoneRef := fmt.Sprintf("deleted_%d_%d", id, ts)
+		updates := map[string]interface{}{
+			"email":         tombstoneEmail,
+			"referral_code": tombstoneRef,
+			"is_active":     false,
+		}
+		if err := tx.Model(&model.User{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+			return fmt.Errorf("failed to tombstone user: %w", err)
+		}
+
+		// Step 4: 软删除(GORM 自动写 deleted_at)
+		if err := tx.Where("id = ?", id).Delete(&model.User{}).Error; err != nil {
+			return fmt.Errorf("failed to soft delete user: %w", err)
+		}
+		return nil
+	})
+}
+
+// EmailExists 查询邮箱是否已被注册
+//
+// 仅返回是否存在,不暴露用户 ID、姓名等敏感信息;供前端注册页 onBlur 预检使用。
+// GORM 默认 WHERE deleted_at IS NULL,所以软删除的 tombstone 用户不会命中。
+func (s *UserService) EmailExists(ctx context.Context, email string) (bool, error) {
+	email = strings.TrimSpace(strings.ToLower(email))
+	if email == "" {
+		return false, fmt.Errorf("email is required")
+	}
+	var count int64
+	if err := s.db.WithContext(ctx).Model(&model.User{}).Where("LOWER(email) = ?", email).Count(&count).Error; err != nil {
+		return false, fmt.Errorf("failed to check email existence: %w", err)
+	}
+	return count > 0, nil
 }
 
 // ChangePassword 修改密码，验证旧密码后设置新密码（最少 8 位）

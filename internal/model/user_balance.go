@@ -16,6 +16,11 @@ type UserBalance struct {
 	TotalConsumed    int64   `gorm:"type:bigint;default:0" json:"totalConsumed"`     // 累计消费（积分 credits）
 	TotalConsumedRMB float64 `gorm:"type:decimal(16,4);default:0" json:"totalConsumedRmb"` // 累计消费等值人民币
 	FrozenAmount     int64   `gorm:"type:bigint;default:0" json:"frozenAmount"`      // 冻结金额（积分 credits）
+	BalanceUnits        int64 `gorm:"type:bigint;default:0" json:"balanceUnits"`        // 当前可用余额（billing_units）
+	FreeQuotaUnits      int64 `gorm:"type:bigint;default:0" json:"freeQuotaUnits"`      // 赠送体验额度（billing_units）
+	TotalConsumedUnits  int64 `gorm:"type:bigint;default:0" json:"totalConsumedUnits"`  // 累计消费（billing_units）
+	FrozenUnits         int64 `gorm:"type:bigint;default:0" json:"frozenUnits"`         // 冻结金额（billing_units）
+	TotalRechargedUnits int64 `gorm:"type:bigint;default:0" json:"totalRechargedUnits"` // 累计充值（billing_units）
 	Currency         string  `gorm:"size:10;default:CREDIT" json:"currency"`         // 币种统一为 CREDIT
 	// v5.1: 免费额度过期时间（注册后 7 天自动失效，防止屯号）
 	FreeQuotaExpiredAt *time.Time `gorm:"type:datetime" json:"freeQuotaExpiredAt"`

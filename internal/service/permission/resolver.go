@@ -83,7 +83,7 @@ func (s *SubjectPerms) IsSuperAdmin() bool {
 		return false
 	}
 	for _, c := range s.RoleCodes {
-		if c == "SUPER_ADMIN" {
+		if c == "SUPER_ADMIN" || LegacyRoleMapping[c] == "SUPER_ADMIN" {
 			return true
 		}
 	}

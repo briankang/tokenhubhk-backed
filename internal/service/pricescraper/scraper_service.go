@@ -15,6 +15,7 @@ import (
 	"tokenhub-server/internal/middleware"
 	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/logger"
+	"tokenhub-server/internal/service/pricing"
 )
 
 // =====================================================
@@ -457,6 +458,14 @@ func (s *PriceScraperService) ApplyPrices(ctx context.Context, supplierID uint, 
 				result.Errors = append(result.Errors, fmt.Sprintf("更新模型 %s 价格失败: %v", aiModel.ModelName, err))
 				result.SkippedCount++
 				continue
+			}
+
+			// M4 (2026-04-28): scraper 写完 PriceTiers 后立即同步 PriceMatrix
+			// 让 selectPriceForTokens 步骤 0（PriceMatrix 优先命中）能用上最新数据
+			// 重新 fetch 一次最新的 aiModel（带刚写入的 price_tiers），传给 RefreshPriceMatrixForModel
+			var refreshedModel model.AIModel
+			if err := tx.First(&refreshedModel, aiModel.ID).Error; err == nil {
+				pricing.RefreshPriceMatrixForModel(tx, &refreshedModel)
 			}
 
 			changes = append(changes, change)
@@ -1073,4 +1082,103 @@ func isValidModelName(name string) bool {
 		}
 	}
 	return true
+}
+
+// LargeDeltaItem P7: 大幅变动条目（用于强制二次确认）
+type LargeDeltaItem struct {
+	ModelID      uint    `json:"model_id"`
+	ModelName    string  `json:"model_name"`
+	OldInputRMB  float64 `json:"old_input_rmb"`
+	NewInputRMB  float64 `json:"new_input_rmb"`
+	InputDelta   float64 `json:"input_delta_pct"` // 百分比变化（如 0.35 表示 +35%）
+	OldOutputRMB float64 `json:"old_output_rmb"`
+	NewOutputRMB float64 `json:"new_output_rmb"`
+	OutputDelta  float64 `json:"output_delta_pct"`
+}
+
+// PreflightLargeChanges 检测 updates 中是否有相对变化 > 20% 的条目
+//
+// P7 修复：价格爬虫一键应用前的二次确认机制。
+// 任一条 input 或 output 价格变化超过阈值 → 返回该条目，前端弹窗强制确认
+// 后通过 force=true 重新提交才能继续。
+//
+// 阈值固定 20%，新模型（DB 无旧记录）不参与检查（视为正常新增）。
+func (s *PriceScraperService) PreflightLargeChanges(
+	ctx context.Context,
+	supplierID uint,
+	updates []PriceUpdateRequest,
+) ([]LargeDeltaItem, error) {
+	const thresholdPct = 0.20
+	if len(updates) == 0 {
+		return nil, nil
+	}
+	modelIDs := make([]uint, 0, len(updates))
+	for _, u := range updates {
+		if u.ModelID > 0 {
+			modelIDs = append(modelIDs, u.ModelID)
+		}
+	}
+	if len(modelIDs) == 0 {
+		return nil, nil
+	}
+	var rows []struct {
+		ID            uint
+		ModelName     string
+		InputCostRMB  float64
+		OutputCostRMB float64
+	}
+	if err := s.db.WithContext(ctx).
+		Table("ai_models").
+		Select("id, model_name, input_cost_rmb, output_cost_rmb").
+		Where("id IN ?", modelIDs).
+		Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("加载现价失败: %w", err)
+	}
+	type oldRow struct {
+		Name   string
+		Input  float64
+		Output float64
+	}
+	priceMap := make(map[uint]oldRow, len(rows))
+	for _, r := range rows {
+		priceMap[r.ID] = oldRow{r.ModelName, r.InputCostRMB, r.OutputCostRMB}
+	}
+
+	var hits []LargeDeltaItem
+	for _, u := range updates {
+		if u.ModelID == 0 {
+			continue
+		}
+		old, ok := priceMap[u.ModelID]
+		if !ok {
+			continue
+		}
+		var inputDelta, outputDelta float64
+		if old.Input > 0 {
+			inputDelta = (u.InputCostRMB - old.Input) / old.Input
+		}
+		if old.Output > 0 {
+			outputDelta = (u.OutputCostRMB - old.Output) / old.Output
+		}
+		if absFloat(inputDelta) > thresholdPct || absFloat(outputDelta) > thresholdPct {
+			hits = append(hits, LargeDeltaItem{
+				ModelID:      u.ModelID,
+				ModelName:    old.Name,
+				OldInputRMB:  old.Input,
+				NewInputRMB:  u.InputCostRMB,
+				InputDelta:   inputDelta,
+				OldOutputRMB: old.Output,
+				NewOutputRMB: u.OutputCostRMB,
+				OutputDelta:  outputDelta,
+			})
+		}
+	}
+	return hits, nil
+}
+
+func absFloat(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }

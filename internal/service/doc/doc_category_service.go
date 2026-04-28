@@ -3,6 +3,7 @@ package doc
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"go.uber.org/zap"
 	"gorm.io/gorm"
@@ -106,6 +107,11 @@ func (s *DocCategoryService) List(ctx context.Context) ([]model.DocCategory, err
 // GetCategoryTree 获取分类树，一级分类嵌套子分类，每个分类包含已发布的文档文章列表
 // 返回结构：一级分类 → Children(子分类) → Articles(文档列表)
 func (s *DocCategoryService) GetCategoryTree(ctx context.Context) ([]model.DocCategory, error) {
+	return s.GetCategoryTreeByLocale(ctx, "zh")
+}
+
+func (s *DocCategoryService) GetCategoryTreeByLocale(ctx context.Context, locale string) ([]model.DocCategory, error) {
+	locale = NormalizeLocale(locale)
 	var allCats []model.DocCategory
 	// 查询所有分类，按排序字段排列
 	err := s.db.WithContext(ctx).
@@ -116,11 +122,7 @@ func (s *DocCategoryService) GetCategoryTree(ctx context.Context) ([]model.DocCa
 	}
 
 	// 查询每个分类下已发布的文档数量和文档列表
-	var allArticles []model.DocArticle
-	err = s.db.WithContext(ctx).
-		Where("is_published = ?", true).
-		Order("sort_order ASC, id ASC").
-		Find(&allArticles).Error
+	allArticles, err := s.publishedArticlesByLocale(ctx, locale)
 	if err != nil {
 		return nil, fmt.Errorf("查询文档列表失败: %w", err)
 	}
@@ -153,14 +155,97 @@ func (s *DocCategoryService) GetCategoryTree(ctx context.Context) ([]model.DocCa
 		}
 	}
 
-	return roots, nil
+	if locale != "zh" {
+		localizeDocCategories(roots, locale)
+	}
+
+	return prunePublicDocCategories(roots), nil
+}
+
+func prunePublicDocCategories(cats []model.DocCategory) []model.DocCategory {
+	if len(cats) == 0 {
+		return cats
+	}
+	out := make([]model.DocCategory, 0, len(cats))
+	for _, cat := range cats {
+		if isPlaceholderDocCategory(cat) {
+			continue
+		}
+		cat.Children = prunePublicDocCategories(cat.Children)
+		if len(cat.Articles) == 0 && len(cat.Children) == 0 {
+			continue
+		}
+		out = append(out, cat)
+	}
+	return out
+}
+
+func isPlaceholderDocCategory(cat model.DocCategory) bool {
+	slug := strings.TrimSpace(strings.ToLower(cat.Slug))
+	name := strings.TrimSpace(strings.ToLower(cat.Name))
+	return strings.HasPrefix(slug, "cat_") || strings.HasPrefix(name, "category cat_")
+}
+
+type localizedDocCategory struct {
+	Name        string
+	Description string
+}
+
+var localizedDocCategoryText = map[string]map[string]localizedDocCategory{
+	"en": {
+		"getting-started":    {Name: "Getting Started", Description: "Register, create an API key, and make your first request"},
+		"account-billing":    {Name: "Account and Billing", Description: "Account security, API keys, top-ups, balance, and bills"},
+		"models-pricing":     {Name: "Models and Pricing", Description: "Browse models, choose the right model, and understand billing"},
+		"playground":         {Name: "Playground", Description: "Debug models in the browser and reuse request payloads"},
+		"api-usage":          {Name: "API Usage", Description: "Use OpenAI-compatible APIs through TokenHub"},
+		"client-integration": {Name: "Client Integrations", Description: "Configure TokenHub in common chat and developer clients"},
+		"help":               {Name: "Help", Description: "Troubleshoot authentication, balance, model, and response issues"},
+	},
+}
+
+func localizeDocCategories(cats []model.DocCategory, locale string) {
+	translations := localizedDocCategoryText[NormalizeLocale(locale)]
+	if len(translations) == 0 {
+		return
+	}
+	for i := range cats {
+		if text, ok := translations[cats[i].Slug]; ok {
+			cats[i].Name = text.Name
+			cats[i].Description = text.Description
+		}
+		localizeDocCategories(cats[i].Children, locale)
+	}
+}
+
+func (s *DocCategoryService) publishedArticlesByLocale(ctx context.Context, locale string) ([]model.DocArticle, error) {
+	var articles []model.DocArticle
+	err := s.db.WithContext(ctx).
+		Where("is_published = ? AND locale = ?", true, locale).
+		Order("sort_order ASC, id ASC").
+		Find(&articles).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(articles) > 0 || locale == "zh" {
+		return articles, nil
+	}
+	err = s.db.WithContext(ctx).
+		Where("is_published = ? AND locale = ?", true, "zh").
+		Order("sort_order ASC, id ASC").
+		Find(&articles).Error
+	return articles, err
 }
 
 // GetArticlesByCategorySlug 根据分类 slug 查询该分类下所有已发布文档
 func (s *DocCategoryService) GetArticlesByCategorySlug(ctx context.Context, slug string) ([]model.DocArticle, error) {
+	return s.GetArticlesByCategorySlugAndLocale(ctx, slug, "zh")
+}
+
+func (s *DocCategoryService) GetArticlesByCategorySlugAndLocale(ctx context.Context, slug, locale string) ([]model.DocArticle, error) {
 	if slug == "" {
 		return nil, fmt.Errorf("category slug is required")
 	}
+	locale = NormalizeLocale(locale)
 
 	// 先查找分类
 	var cat model.DocCategory
@@ -180,11 +265,20 @@ func (s *DocCategoryService) GetArticlesByCategorySlug(ctx context.Context, slug
 	// 查询这些分类下的已发布文档
 	var articles []model.DocArticle
 	err := s.db.WithContext(ctx).
-		Where("category_id IN ? AND is_published = ?", catIDs, true).
+		Where("category_id IN ? AND is_published = ? AND locale = ?", catIDs, true, locale).
 		Order("sort_order ASC, id ASC").
 		Find(&articles).Error
 	if err != nil {
 		return nil, fmt.Errorf("查询文档失败: %w", err)
+	}
+	if len(articles) == 0 && locale != "zh" {
+		err = s.db.WithContext(ctx).
+			Where("category_id IN ? AND is_published = ? AND locale = ?", catIDs, true, "zh").
+			Order("sort_order ASC, id ASC").
+			Find(&articles).Error
+		if err != nil {
+			return nil, fmt.Errorf("查询文档失败: %w", err)
+		}
 	}
 
 	return articles, nil

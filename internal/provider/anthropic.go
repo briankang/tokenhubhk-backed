@@ -59,26 +59,26 @@ func NewAnthropicProvider(cfg ProviderConfig) *AnthropicProvider {
 	}
 }
 
-func (p *AnthropicProvider) Name() string      { return "anthropic" }
+func (p *AnthropicProvider) Name() string        { return "anthropic" }
 func (p *AnthropicProvider) ModelList() []string { return anthropicModels }
 
 // Anthropic原生请求类型定义
 type anthropicRequest struct {
-	Model     string              `json:"model"`
-	Messages  []anthropicMessage  `json:"messages"`
+	Model    string             `json:"model"`
+	Messages []anthropicMessage `json:"messages"`
 	// System 支持两种格式：
 	//   - string（普通系统提示）
 	//   - []anthropicContentBlock（显式缓存时使用 content-block 格式）
-	System    interface{}         `json:"system,omitempty"`
-	MaxTokens int                 `json:"max_tokens"`
-	Stream    bool                `json:"stream"`
-	Stop      []string            `json:"stop_sequences,omitempty"`
-	Temp      *float64            `json:"temperature,omitempty"`
-	TopP      *float64            `json:"top_p,omitempty"`
+	System    interface{} `json:"system,omitempty"`
+	MaxTokens int         `json:"max_tokens"`
+	Stream    bool        `json:"stream"`
+	Stop      []string    `json:"stop_sequences,omitempty"`
+	Temp      *float64    `json:"temperature,omitempty"`
+	TopP      *float64    `json:"top_p,omitempty"`
 }
 
 type anthropicMessage struct {
-	Role    string      `json:"role"`
+	Role string `json:"role"`
 	// Content 支持两种格式：
 	//   - string（普通消息）
 	//   - []anthropicContentBlock（显式缓存时使用 content-block 格式）
@@ -87,7 +87,7 @@ type anthropicMessage struct {
 
 // anthropicContentBlock Anthropic 消息内容块（支持 cache_control）
 type anthropicContentBlock struct {
-	Type         string                 `json:"type"`                    // 通常为 "text"
+	Type         string                 `json:"type"` // 通常为 "text"
 	Text         string                 `json:"text"`
 	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
@@ -112,10 +112,16 @@ type anthropicContent struct {
 }
 
 type anthropicUsage struct {
-	InputTokens              int `json:"input_tokens"`
-	OutputTokens             int `json:"output_tokens"`
-	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`     // 缓存命中的输入Token（享受90%折扣）
-	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"` // 写入缓存的输入Token（收取125%溢价）
+	InputTokens              int                    `json:"input_tokens"`
+	OutputTokens             int                    `json:"output_tokens"`
+	CacheReadInputTokens     int                    `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens int                    `json:"cache_creation_input_tokens,omitempty"`
+	CacheCreation            anthropicCacheCreation `json:"cache_creation,omitempty"`
+}
+
+type anthropicCacheCreation struct {
+	Ephemeral5mInputTokens int `json:"ephemeral_5m_input_tokens,omitempty"`
+	Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens,omitempty"`
 }
 
 func (p *AnthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
@@ -124,7 +130,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 	}
 
 	aReq := p.convertRequest(req, false)
-	body, err := MarshalWithExtra(aReq, req.Extra)
+	body, err := MarshalWithExtra(aReq, sanitizeAnthropicExtra(req.Extra))
 	if err != nil {
 		return nil, fmt.Errorf("provider anthropic: marshal request: %w", err)
 	}
@@ -160,7 +166,7 @@ func (p *AnthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 	}
 
 	aReq := p.convertRequest(req, true)
-	body, err := MarshalWithExtra(aReq, req.Extra)
+	body, err := MarshalWithExtra(aReq, sanitizeAnthropicExtra(req.Extra))
 	if err != nil {
 		return nil, fmt.Errorf("provider anthropic: marshal request: %w", err)
 	}
@@ -196,15 +202,18 @@ func (p *AnthropicProvider) setHeaders(req *http.Request) {
 }
 
 func (p *AnthropicProvider) convertRequest(req *ChatRequest, stream bool) *anthropicRequest {
-	var systemText string
+	var systemParts []string
 	msgs := make([]anthropicMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
-		if m.Role == "system" {
-			systemText = TextContent(m.Content)
+		if m.Role == "system" || m.Role == "developer" {
+			if text := strings.TrimSpace(TextContent(m.Content)); text != "" {
+				systemParts = append(systemParts, text)
+			}
 			continue
 		}
 		msgs = append(msgs, anthropicMessage{Role: m.Role, Content: m.Content})
 	}
+	systemText := strings.Join(systemParts, "\n")
 
 	maxTokens := req.MaxTokens
 	if maxTokens <= 0 {
@@ -252,6 +261,41 @@ func (p *AnthropicProvider) convertRequest(req *ChatRequest, stream bool) *anthr
 	return aReq
 }
 
+func sanitizeAnthropicExtra(extra map[string]interface{}) map[string]interface{} {
+	if len(extra) == 0 {
+		return extra
+	}
+	blocked := map[string]bool{
+		"frequency_penalty":     true,
+		"presence_penalty":      true,
+		"response_format":       true,
+		"seed":                  true,
+		"logprobs":              true,
+		"top_logprobs":          true,
+		"logit_bias":            true,
+		"n":                     true,
+		"modalities":            true,
+		"audio":                 true,
+		"prediction":            true,
+		"service_tier":          true,
+		"store":                 true,
+		"user":                  true,
+		"reasoning_effort":      true,
+		"max_completion_tokens": true,
+	}
+	cleaned := make(map[string]interface{}, len(extra))
+	for k, v := range extra {
+		if blocked[k] {
+			continue
+		}
+		cleaned[k] = v
+	}
+	if len(cleaned) == 0 {
+		return nil
+	}
+	return cleaned
+}
+
 func (p *AnthropicProvider) convertResponse(aResp *anthropicResponse) *ChatResponse {
 	content := ""
 	for _, c := range aResp.Content {
@@ -270,11 +314,12 @@ func (p *AnthropicProvider) convertResponse(aResp *anthropicResponse) *ChatRespo
 			},
 		},
 		Usage: Usage{
-			PromptTokens:     aResp.Usage.InputTokens,
-			CompletionTokens: aResp.Usage.OutputTokens,
-			TotalTokens:      aResp.Usage.InputTokens + aResp.Usage.OutputTokens,
-			CacheReadTokens:  aResp.Usage.CacheReadInputTokens,
-			CacheWriteTokens: aResp.Usage.CacheCreationInputTokens,
+			PromptTokens:       aResp.Usage.InputTokens,
+			CompletionTokens:   aResp.Usage.OutputTokens,
+			TotalTokens:        aResp.Usage.InputTokens + aResp.Usage.OutputTokens,
+			CacheReadTokens:    aResp.Usage.CacheReadInputTokens,
+			CacheWriteTokens:   aResp.Usage.CacheCreationInputTokens,
+			CacheWrite1hTokens: aResp.Usage.CacheCreation.Ephemeral1hInputTokens,
 		},
 	}
 }
@@ -294,14 +339,15 @@ func mapAnthropicStopReason(reason string) string {
 
 // anthropicStreamReader handles Anthropic's SSE stream events.
 type anthropicStreamReader struct {
-	reader           *bufio.Reader
-	body             io.ReadCloser
-	model            string
-	msgID            string
+	reader *bufio.Reader
+	body   io.ReadCloser
+	model  string
+	msgID  string
 	// 缓存Token字段：从 message_start 事件中解析，汇总到最终 Usage
-	inputTokens      int
-	cacheReadTokens  int
-	cacheWriteTokens int
+	inputTokens        int
+	cacheReadTokens    int
+	cacheWriteTokens   int
+	cacheWrite1hTokens int
 }
 
 // Anthropic SSE事件类型定义
@@ -356,6 +402,7 @@ func (s *anthropicStreamReader) Read() (*StreamChunk, error) {
 			s.inputTokens = evt.Message.Usage.InputTokens
 			s.cacheReadTokens = evt.Message.Usage.CacheReadInputTokens
 			s.cacheWriteTokens = evt.Message.Usage.CacheCreationInputTokens
+			s.cacheWrite1hTokens = evt.Message.Usage.CacheCreation.Ephemeral1hInputTokens
 			continue
 
 		case "content_block_delta":
@@ -399,11 +446,12 @@ func (s *anthropicStreamReader) Read() (*StreamChunk, error) {
 					},
 				},
 				Usage: &Usage{
-					PromptTokens:     totalInput,
-					CompletionTokens: evt.Usage.OutputTokens,
-					TotalTokens:      totalInput + evt.Usage.OutputTokens,
-					CacheReadTokens:  s.cacheReadTokens,
-					CacheWriteTokens: s.cacheWriteTokens,
+					PromptTokens:       totalInput,
+					CompletionTokens:   evt.Usage.OutputTokens,
+					TotalTokens:        totalInput + evt.Usage.OutputTokens,
+					CacheReadTokens:    s.cacheReadTokens,
+					CacheWriteTokens:   s.cacheWriteTokens,
+					CacheWrite1hTokens: s.cacheWrite1hTokens,
 				},
 			}, nil
 

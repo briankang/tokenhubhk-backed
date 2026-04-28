@@ -504,28 +504,52 @@ func talkingDataModelDefs() []talkingDataModelDef {
 			CategoryCode: "talkingdata_doubao_video", ModelName: "doubao-seedance-2.0-720p", DisplayName: "Doubao Seedance 2.0 (720p)",
 			ModelType: model.ModelTypeVideoGeneration, PricingUnit: model.UnitPerMillionTokens,
 			Variant:      "720p",
-			InputCostRMB: 28, OutputCostRMB: 46,
-			Tags: "Doubao,豆包,TalkingData,VideoGen", Discount: 1.0,
+			InputCostRMB: 0, OutputCostRMB: 46,
+			PriceTiers: talkingDataSeedance20Tiers("480p/720p", 46, 28),
+			Tags:       "Doubao,豆包,TalkingData,VideoGen", Discount: 1.0,
 		},
 		{
 			CategoryCode: "talkingdata_doubao_video", ModelName: "doubao-seedance-2-0-fast-260128", DisplayName: "Doubao Seedance 2.0 Fast",
 			ModelType: model.ModelTypeVideoGeneration, PricingUnit: model.UnitPerMillionTokens,
 			Variant:      "720p",
-			InputCostRMB: 20, OutputCostRMB: 20,
-			Tags: "Doubao,TalkingData,VideoGen", Discount: 1.0,
+			InputCostRMB: 0, OutputCostRMB: 37,
+			PriceTiers: talkingDataSeedance20Tiers("", 37, 22),
+			Tags:       "Doubao,TalkingData,VideoGen", Discount: 1.0,
 		},
 		{
 			CategoryCode: "talkingdata_doubao_video", ModelName: "doubao-seedance-2.0-1080p", DisplayName: "Doubao Seedance 2.0 (1080p)",
 			ModelType: model.ModelTypeVideoGeneration, PricingUnit: model.UnitPerMillionTokens,
 			Variant:      "1080p",
-			InputCostRMB: 31, OutputCostRMB: 51,
-			Tags: "Doubao,豆包,TalkingData,VideoGen", Discount: 1.0,
+			InputCostRMB: 0, OutputCostRMB: 51,
+			PriceTiers: talkingDataSeedance20Tiers("1080p", 51, 31),
+			Tags:       "Doubao,豆包,TalkingData,VideoGen", Discount: 1.0,
 		},
 		{
 			CategoryCode: "talkingdata_doubao_video", ModelName: "doubao-seedance-1.5-pro", DisplayName: "Doubao Seedance 1.5 Pro",
 			ModelType: model.ModelTypeVideoGeneration, PricingUnit: model.UnitPerMillionTokens,
-			InputCostRMB: 8, OutputCostRMB: 16,
-			Tags: "Doubao,豆包,TalkingData,VideoGen", Discount: 0.9,
+			InputCostRMB: 0, OutputCostRMB: 16,
+			PriceTiers: talkingDataSeedance15Tiers(),
+			Tags:       "Doubao,豆包,TalkingData,VideoGen", Discount: 0.9,
 		},
+	}
+}
+
+func talkingDataSeedance15Tiers() []model.PriceTier {
+	return []model.PriceTier{
+		{Name: "在线推理 · 有声视频", InputMin: 0, InputMinExclusive: true, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 16},
+		{Name: "在线推理 · 无声视频", InputMin: 1, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 8},
+		{Name: "离线推理 · 有声视频", InputMin: 2, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 8},
+		{Name: "离线推理 · 无声视频", InputMin: 3, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: 4},
+	}
+}
+
+func talkingDataSeedance20Tiers(resolution string, noVideoPrice, withVideoPrice float64) []model.PriceTier {
+	prefix := "在线推理"
+	if resolution != "" {
+		prefix = resolution + " 在线推理"
+	}
+	return []model.PriceTier{
+		{Name: prefix + " · 输入不含视频", InputMin: 0, InputMinExclusive: true, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: noVideoPrice},
+		{Name: prefix + " · 输入包含视频", InputMin: 1, OutputMin: 0, OutputMinExclusive: true, InputPrice: 0, OutputPrice: withVideoPrice},
 	}
 }

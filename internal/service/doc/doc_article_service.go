@@ -71,6 +71,8 @@ func (s *DocArticleService) Update(ctx context.Context, id uint, updates map[str
 
 // GetBySlug 根据 slug 查询已发布的文档文章，预加载分类信息
 func (s *DocArticleService) GetBySlug(ctx context.Context, slug string) (*model.DocArticle, error) {
+	return s.GetBySlugLocale(ctx, slug, "zh")
+
 	if slug == "" {
 		return nil, fmt.Errorf("slug is required")
 	}
@@ -86,9 +88,44 @@ func (s *DocArticleService) GetBySlug(ctx context.Context, slug string) (*model.
 	return &article, nil
 }
 
+func (s *DocArticleService) GetBySlugLocale(ctx context.Context, slug, locale string) (*model.DocArticle, error) {
+	if slug == "" {
+		return nil, fmt.Errorf("slug is required")
+	}
+	locale = NormalizeLocale(locale)
+
+	var article model.DocArticle
+	err := s.db.WithContext(ctx).
+		Preload("Category").
+		Where("slug = ? AND locale = ? AND is_published = ?", slug, locale, true).
+		First(&article).Error
+	if err == nil {
+		return &article, nil
+	}
+	if locale != "zh" {
+		err = s.db.WithContext(ctx).
+			Preload("Category").
+			Where("slug = ? AND locale = ? AND is_published = ?", slug, "zh", true).
+			First(&article).Error
+		if err == nil {
+			return &article, nil
+		}
+	}
+	err = s.db.WithContext(ctx).
+		Preload("Category").
+		Where("slug = ? AND is_published = ?", slug, true).
+		First(&article).Error
+	if err != nil {
+		return nil, fmt.Errorf("doc article not found: %w", err)
+	}
+	return &article, nil
+}
+
 // Search 关键词搜索文档标题和内容（MySQL LIKE 模糊匹配）
 // 搜索范围：标题、内容、摘要、标签
 func (s *DocArticleService) Search(ctx context.Context, keyword string, page, pageSize int) ([]model.DocArticle, int64, error) {
+	return s.SearchLocale(ctx, keyword, "zh", page, pageSize)
+
 	if keyword == "" {
 		return nil, 0, fmt.Errorf("keyword is required")
 	}
@@ -120,6 +157,44 @@ func (s *DocArticleService) Search(ctx context.Context, keyword string, page, pa
 		return nil, 0, fmt.Errorf("搜索文档失败: %w", err)
 	}
 
+	return articles, total, nil
+}
+
+func (s *DocArticleService) SearchLocale(ctx context.Context, keyword, locale string, page, pageSize int) ([]model.DocArticle, int64, error) {
+	if keyword == "" {
+		return nil, 0, fmt.Errorf("keyword is required")
+	}
+	locale = NormalizeLocale(locale)
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
+
+	like := fmt.Sprintf("%%%s%%", keyword)
+	query := s.db.WithContext(ctx).Model(&model.DocArticle{}).
+		Where("is_published = ? AND locale = ?", true, locale).
+		Where("title LIKE ? OR content LIKE ? OR summary LIKE ? OR tags LIKE ?", like, like, like, like)
+
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, fmt.Errorf("search count failed: %w", err)
+	}
+	if total == 0 && locale != "zh" {
+		return s.SearchLocale(ctx, keyword, "zh", page, pageSize)
+	}
+
+	var articles []model.DocArticle
+	err := query.
+		Preload("Category").
+		Order("sort_order ASC, id ASC").
+		Offset((page - 1) * pageSize).
+		Limit(pageSize).
+		Find(&articles).Error
+	if err != nil {
+		return nil, 0, fmt.Errorf("search articles failed: %w", err)
+	}
 	return articles, total, nil
 }
 

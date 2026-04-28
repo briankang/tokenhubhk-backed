@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -18,11 +19,12 @@ import (
 	"tokenhub-server/internal/service/balance"
 	"tokenhub-server/internal/service/guard"
 	"tokenhub-server/internal/service/referral"
+	smsauth "tokenhub-server/internal/service/sms"
 )
 
 const (
 	bcryptCost          = 12
-	accessTokenExpiry   = 24 * time.Hour
+	accessTokenExpiry   = 30 * 24 * time.Hour
 	refreshTokenExpiry  = 30 * 24 * time.Hour // 刷新令牌有效期 30 天
 	redisTokenKeyPrefix = "token:user:"
 )
@@ -53,7 +55,7 @@ type RegisterRequest struct {
 
 // LoginRequest 用户登录请求参数
 type LoginRequest struct {
-	Email    string `json:"email" binding:"required,email"`
+	Email    string `json:"email" binding:"required"`
 	Password string `json:"password" binding:"required"`
 }
 
@@ -89,6 +91,7 @@ type AuthService struct {
 	balanceSvc  *balance.BalanceService
 	referralSvc *referral.ReferralService
 	guardSvc    *guard.Service
+	smsSvc      *smsauth.Service
 }
 
 // NewAuthService 创建认证服务实例，db 不能为 nil 否则 panic
@@ -104,6 +107,7 @@ func NewAuthService(db *gorm.DB, redis *goredis.Client, jwtCfg config.JWTConfig)
 		balanceSvc:  balance.NewBalanceService(db, redis),
 		referralSvc: referral.NewReferralService(db),
 		guardSvc:    guard.NewService(db, redis),
+		smsSvc:      smsauth.NewService(db, redis),
 	}
 }
 
@@ -223,16 +227,31 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest) (*mode
 	}
 
 	// 根据邀请码解析租户
+	// 优先级：白标租户域名（tenants.domain）→ 用户邀请码（referral_links / users.referral_code）→ 都不命中报错
+	// 后段 ProcessReferralOnRegister 会将 InviteCode 当 referral_code 兜底处理，所以此处只需正确解析 tenant
 	var tenantID uint
 	if req.InviteCode != "" {
 		var tenant model.Tenant
-		if err := s.db.WithContext(ctx).Where("domain = ? AND is_active = ?", req.InviteCode, true).First(&tenant).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
+		err := s.db.WithContext(ctx).Where("domain = ? AND is_active = ?", req.InviteCode, true).First(&tenant).Error
+		if err == nil {
+			tenantID = tenant.ID
+		} else if errors.Is(err, gorm.ErrRecordNotFound) {
+			// 不是白标域名，尝试匹配用户邀请码（referral_links / users.referral_code）
+			if !s.isValidInviteOrReferralCode(ctx, req.InviteCode) {
 				return nil, fmt.Errorf("invalid invite code")
 			}
+			// 合法用户邀请码 → 落到默认租户，归因由后段 ProcessReferralOnRegister 建立
+			var defaultTenant model.Tenant
+			if err := s.db.WithContext(ctx).Where("parent_id IS NULL AND level = 1").First(&defaultTenant).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil, fmt.Errorf("no default tenant available")
+				}
+				return nil, fmt.Errorf("failed to find default tenant: %w", err)
+			}
+			tenantID = defaultTenant.ID
+		} else {
 			return nil, fmt.Errorf("failed to resolve invite code: %w", err)
 		}
-		tenantID = tenant.ID
 	} else {
 		// 默认租户：查找顶级默认租户
 		var defaultTenant model.Tenant
@@ -253,13 +272,14 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest) (*mode
 	}
 
 	user := &model.User{
-		TenantID:     tenantID,
-		Email:        req.Email,
-		PasswordHash: string(hash),
-		Name:         req.Name,
-		IsActive:     true,
-		Language:     "en",
-		CountryCode:  countryCode,
+		TenantID:       tenantID,
+		Email:          req.Email,
+		PasswordHash:   string(hash),
+		Name:           req.Name,
+		IsActive:       true,
+		Language:       "en",
+		CountryCode:    countryCode,
+		RegisterSource: "email",
 	}
 
 	if err := s.db.WithContext(ctx).Create(user).Error; err != nil {
@@ -385,8 +405,11 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest) (*TokenPair,
 		return nil, fmt.Errorf("login request is nil")
 	}
 
+	identifier := strings.ToLower(strings.TrimSpace(req.Email))
 	var user model.User
-	if err := s.db.WithContext(ctx).Where("email = ?", req.Email).First(&user).Error; err != nil {
+	if err := s.db.WithContext(ctx).
+		Where("email = ? OR username = ?", identifier, identifier).
+		First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, fmt.Errorf("invalid credentials")
 		}

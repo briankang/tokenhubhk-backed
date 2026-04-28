@@ -45,9 +45,11 @@ type openAIModelList struct {
 func (h *ModelsHandler) ListModels(c *gin.Context) {
 	// 从数据库查询所有已激活的 AI 模型，并预加载供应商信息
 	var models []model.AIModel
-	if err := h.db.Where("is_active = ?", true).
+	if err := h.db.Joins("JOIN suppliers ON suppliers.id = ai_models.supplier_id").
+		Where("ai_models.is_active = ? AND ai_models.status = ?", true, "online").
+		Where("suppliers.status = ? AND suppliers.is_active = ?", "active", true).
 		Preload("Supplier").
-		Order("model_name ASC").
+		Order("ai_models.model_name ASC").
 		Find(&models).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": gin.H{
@@ -60,17 +62,36 @@ func (h *ModelsHandler) ListModels(c *gin.Context) {
 
 	// 格式化为 OpenAI 兼容的模型列表
 	data := make([]openAIModel, 0, len(models))
+	seen := make(map[string]bool, len(models))
 	for _, m := range models {
 		ownedBy := "tokenhub"
 		if m.Supplier.Code != "" {
 			ownedBy = m.Supplier.Code
 		}
+		seen[m.ModelName] = true
 		data = append(data, openAIModel{
 			ID:      m.ModelName,
 			Object:  "model",
 			Created: m.CreatedAt.Unix(),
 			OwnedBy: ownedBy,
 		})
+	}
+	var aliases []model.ModelAlias
+	if err := h.db.Where("is_active = ? AND is_public = ?", true, true).
+		Order("alias_name ASC").
+		Find(&aliases).Error; err == nil {
+		for _, alias := range aliases {
+			if alias.AliasName == "" || seen[alias.AliasName] {
+				continue
+			}
+			seen[alias.AliasName] = true
+			data = append(data, openAIModel{
+				ID:      alias.AliasName,
+				Object:  "model",
+				Created: alias.CreatedAt.Unix(),
+				OwnedBy: "tokenhub-alias",
+			})
+		}
 	}
 
 	c.JSON(http.StatusOK, openAIModelList{

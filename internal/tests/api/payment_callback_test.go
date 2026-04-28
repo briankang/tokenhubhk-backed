@@ -110,7 +110,7 @@ func TestAdminPaymentRefund_NonExistentOrder(t *testing.T) {
 		"reason": "test refund",
 	}
 
-	resp, status, err := doPost(baseURL+"/api/v1/admin/payment/refund/non-existent-order", body, adminToken)
+	resp, status, err := doPost(baseURL+"/api/v1/admin/payment/orders/999999/refund", body, adminToken)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestAdminPaymentRefund_UserForbidden(t *testing.T) {
 		"reason": "test refund",
 	}
 
-	_, status, err := doPost(baseURL+"/api/v1/admin/payment/refund/some-order", body, userToken)
+	_, status, err := doPost(baseURL+"/api/v1/admin/payment/orders/1/refund", body, userToken)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}

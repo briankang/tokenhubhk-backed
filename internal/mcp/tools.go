@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 
 	"tokenhub-server/internal/model"
+	"tokenhub-server/internal/pkg/credits"
 	"tokenhub-server/internal/service/apikey"
 	balancesvc "tokenhub-server/internal/service/balance"
 	"tokenhub-server/internal/service/openapi"
@@ -67,11 +68,11 @@ func registerChatTools(server *MCPServer, db *gorm.DB) {
 			result := make([]map[string]interface{}, 0, len(models))
 			for _, m := range models {
 				item := map[string]interface{}{
-					"model_name":    m.ModelName,
-					"display_name":  m.DisplayName,
-					"max_tokens":    m.MaxTokens,
+					"model_name":     m.ModelName,
+					"display_name":   m.DisplayName,
+					"max_tokens":     m.MaxTokens,
 					"context_window": m.ContextWindow,
-					"is_active":     m.IsActive,
+					"is_active":      m.IsActive,
 				}
 				if m.Supplier.ID > 0 {
 					item["supplier"] = m.Supplier.Name
@@ -81,14 +82,15 @@ func registerChatTools(server *MCPServer, db *gorm.DB) {
 				}
 				// 优先使用 ModelPricing 表的定价
 				if p, ok := pricingMap[m.ID]; ok {
-					item["input_price"] = p.InputPricePerToken
-					item["output_price"] = p.OutputPricePerToken
-					item["currency"] = p.Currency
+					item["input_price"] = credits.CreditsToRMB(p.InputPricePerToken)
+					item["output_price"] = credits.CreditsToRMB(p.OutputPricePerToken)
+					item["currency"] = "CNY"
 				} else {
-					item["input_price"] = m.InputPricePerToken
-					item["output_price"] = m.OutputPricePerToken
-					item["currency"] = m.Currency
+					item["input_price"] = credits.CreditsToRMB(m.InputPricePerToken)
+					item["output_price"] = credits.CreditsToRMB(m.OutputPricePerToken)
+					item["currency"] = "CNY"
 				}
+				item["pricing_unit"] = m.PricingUnit
 				result = append(result, item)
 			}
 			return map[string]interface{}{
@@ -126,6 +128,14 @@ func registerChatTools(server *MCPServer, db *gorm.DB) {
 				return nil, fmt.Errorf("未找到模型: %s", modelID)
 			}
 
+			var pricing model.ModelPricing
+			inputPrice := credits.CreditsToRMB(m.InputPricePerToken)
+			outputPrice := credits.CreditsToRMB(m.OutputPricePerToken)
+			if err := db.Where("model_id = ?", m.ID).First(&pricing).Error; err == nil {
+				inputPrice = credits.CreditsToRMB(pricing.InputPricePerToken)
+				outputPrice = credits.CreditsToRMB(pricing.OutputPricePerToken)
+			}
+
 			result := map[string]interface{}{
 				"id":             m.ID,
 				"model_name":     m.ModelName,
@@ -134,9 +144,10 @@ func registerChatTools(server *MCPServer, db *gorm.DB) {
 				"max_tokens":     m.MaxTokens,
 				"context_window": m.ContextWindow,
 				"is_active":      m.IsActive,
-				"input_price":    m.InputPricePerToken,
-				"output_price":   m.OutputPricePerToken,
-				"currency":       m.Currency,
+				"input_price":    inputPrice,
+				"output_price":   outputPrice,
+				"currency":       "CNY",
+				"pricing_unit":   m.PricingUnit,
 			}
 			if m.Supplier.ID > 0 {
 				result["supplier"] = m.Supplier.Name
@@ -187,7 +198,7 @@ func registerChatTools(server *MCPServer, db *gorm.DB) {
 			modelName, _ := params["model"].(string)
 			messages, _ := params["messages"].([]interface{})
 			return map[string]interface{}{
-				"message": fmt.Sprintf("请使用 TokenHub 的 OpenAI 兼容 API 端点 /v1/chat/completions 进行对话。模型: %s, 消息数: %d", modelName, len(messages)),
+				"message":  fmt.Sprintf("请使用 TokenHub 的 OpenAI 兼容 API 端点 /v1/chat/completions 进行对话。模型: %s, 消息数: %d", modelName, len(messages)),
 				"endpoint": "/v1/chat/completions",
 				"method":   "POST",
 				"note":     "MCP Tools 更适合查询信息和管理操作，实际对话请使用 REST API",

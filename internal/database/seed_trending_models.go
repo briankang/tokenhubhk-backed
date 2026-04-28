@@ -4,9 +4,8 @@ import (
 	"tokenhub-server/internal/model"
 )
 
-// RunSeedTrendingModels 首次启动写入热门模型参考数据，表非空则跳过
-// 数据来源：OpenRouter 商业调用量排名、各供应商官方发布会、新华网/新浪财经/IT之家等权威媒体
-// 关注点：2025H2 至 2026 年发布的最新商业化模型
+// RunSeedTrendingModels 棣栨鍚姩鍐欏叆鐑棬妯″瀷鍙傝€冩暟鎹紝琛ㄩ潪绌哄垯璺宠繃
+// 鏁版嵁鏉ユ簮锛歄penRouter 鍟嗕笟璋冪敤閲忔帓鍚嶃€佸悇渚涘簲鍟嗗畼鏂瑰彂甯冧細銆佹柊鍗庣綉/鏂版氮璐㈢粡/IT涔嬪绛夋潈濞佸獟浣?// 鍏虫敞鐐癸細2025H2 鑷?2026 骞村彂甯冪殑鏈€鏂板晢涓氬寲妯″瀷
 func RunSeedTrendingModels() error {
 	return seedTrendingModels()
 }
@@ -22,252 +21,243 @@ func seedTrendingModels() error {
 
 	models := []model.TrendingModel{
 
-		// ════════════════════════════════════════════════════════════
-		// DeepSeek（深度求索）
-		// ════════════════════════════════════════════════════════════
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		// DeepSeek锛堟繁搴︽眰绱級
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 		{ModelName: "deepseek-v3.2", DisplayName: "DeepSeek V3.2", SupplierName: "DeepSeek", LaunchYearMonth: "2025-09", PopularityStars: 5, ModelType: "LLM",
-			Description: "稀疏注意力架构，推理效率大幅提升，OpenRouter 商业调用量持续前五",
+			Description: "绋€鐤忔敞鎰忓姏鏋舵瀯锛屾帹鐞嗘晥鐜囧ぇ骞呮彁鍗囷紝OpenRouter 鍟嗕笟璋冪敤閲忔寔缁墠浜?",
 			SourceURL:   "https://openrouter.ai/deepseek/deepseek-v3.2"},
 		{ModelName: "deepseek-v3.1-terminus", DisplayName: "DeepSeek V3.1 Terminus", SupplierName: "DeepSeek", LaunchYearMonth: "2025-09", PopularityStars: 4, ModelType: "LLM",
-			Description: "V3.1 终极版，164K 上下文，编程与推理能力持续优化",
+			Description: "V3.1 缁堟瀬鐗堬紝164K 涓婁笅鏂囷紝缂栫▼涓庢帹鐞嗚兘鍔涙寔缁紭鍖?",
 			SourceURL:   "https://api-docs.deepseek.com/quick_start/pricing"},
 		{ModelName: "deepseek-r1-0528", DisplayName: "DeepSeek R1-0528", SupplierName: "DeepSeek", LaunchYearMonth: "2025-05", PopularityStars: 5, ModelType: "Reasoning",
-			Description: "R1 重大更新，幻觉大幅降低，编程能力接近 Claude 3.5 Sonnet",
+			Description: "R1 閲嶅ぇ鏇存柊锛屽够瑙夊ぇ骞呴檷浣庯紝缂栫▼鑳藉姏鎺ヨ繎 Claude 3.5 Sonnet",
 			SourceURL:   "https://api-docs.deepseek.com/news/news0528"},
-		{ModelName: "deepseek-chat", DisplayName: "DeepSeek V3（对话）", SupplierName: "DeepSeek", LaunchYearMonth: "2024-12", PopularityStars: 5, ModelType: "LLM",
-			Description: "官方 API 入口，底层自动升级至最新版本，全球商业调用量领先",
+		{ModelName: "deepseek-chat", DisplayName: "DeepSeek V3锛堝璇濓級", SupplierName: "DeepSeek", LaunchYearMonth: "2024-12", PopularityStars: 5, ModelType: "LLM",
+			Description: "瀹樻柟 API 鍏ュ彛锛屽簳灞傝嚜鍔ㄥ崌绾ц嚦鏈€鏂扮増鏈紝鍏ㄧ悆鍟嗕笟璋冪敤閲忛鍏?",
 			SourceURL:   "https://api-docs.deepseek.com/quick_start/pricing"},
-		{ModelName: "deepseek-reasoner", DisplayName: "DeepSeek R1（推理）", SupplierName: "DeepSeek", LaunchYearMonth: "2025-01", PopularityStars: 5, ModelType: "Reasoning",
-			Description: "官方推理 API 入口，深度思考引发全球 AI 成本革命",
+		{ModelName: "deepseek-reasoner", DisplayName: "DeepSeek R1锛堟帹鐞嗭級", SupplierName: "DeepSeek", LaunchYearMonth: "2025-01", PopularityStars: 5, ModelType: "Reasoning",
+			Description: "瀹樻柟鎺ㄧ悊 API 鍏ュ彛锛屾繁搴︽€濊€冨紩鍙戝叏鐞?AI 鎴愭湰闈╁懡",
 			SourceURL:   "https://api-docs.deepseek.com/news/news0120"},
 
-		// ════════════════════════════════════════════════════════════
-		// 阿里云（通义千问 Qwen）
-		// ════════════════════════════════════════════════════════════
-		{ModelName: "qwen-3.6-plus", DisplayName: "通义千问 Qwen 3.6 Plus", SupplierName: "阿里云", LaunchYearMonth: "2026-04", PopularityStars: 5, ModelType: "LLM",
-			Description: "百万 Token 上下文，编程能力超 Claude Opus 4.5，72B/18B 激活 MoE，OpenRouter 日榜第一",
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		// 闃块噷浜戯紙閫氫箟鍗冮棶 Qwen锛?		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		{ModelName: "qwen-3.6-plus", DisplayName: "閫氫箟鍗冮棶 Qwen 3.6 Plus", SupplierName: "闃块噷浜?", LaunchYearMonth: "2026-04", PopularityStars: 5, ModelType: "LLM",
+			Description: "鐧句竾 Token 涓婁笅鏂囷紝缂栫▼鑳藉姏瓒?Claude Opus 4.5锛?2B/18B 婵€娲?MoE锛孫penRouter 鏃ユ绗竴",
 			SourceURL:   "https://finance.sina.com.cn/jjxw/2026-04-02/doc-inhtavkf9494501.shtml"},
-		{ModelName: "qwen-3.6-flash", DisplayName: "通义千问 Qwen 3.6 Flash", SupplierName: "阿里云", LaunchYearMonth: "2026-04", PopularityStars: 4, ModelType: "LLM",
-			Description: "Qwen 3.6 极速版，超快推理，性价比最优，适合高并发商用",
+		{ModelName: "qwen-3.6-flash", DisplayName: "閫氫箟鍗冮棶 Qwen 3.6 Flash", SupplierName: "闃块噷浜?", LaunchYearMonth: "2026-04", PopularityStars: 4, ModelType: "LLM",
+			Description: "Qwen 3.6 鏋侀€熺増锛岃秴蹇帹鐞嗭紝鎬т环姣旀渶浼橈紝閫傚悎楂樺苟鍙戝晢鐢?",
 			SourceURL:   "https://help.aliyun.com/zh/model-studio/getting-started/models"},
-		{ModelName: "qwen3-max", DisplayName: "通义千问 Qwen3-Max", SupplierName: "阿里云", LaunchYearMonth: "2025-04", PopularityStars: 5, ModelType: "Reasoning",
-			Description: "通义千问 3 代商业旗舰，混合推理模式，全球多项基准 SOTA",
+		{ModelName: "qwen3-max", DisplayName: "閫氫箟鍗冮棶 Qwen3-Max", SupplierName: "闃块噷浜?", LaunchYearMonth: "2025-04", PopularityStars: 5, ModelType: "Reasoning",
+			Description: "閫氫箟鍗冮棶 3 浠ｅ晢涓氭棗鑸帮紝娣峰悎鎺ㄧ悊妯″紡锛屽叏鐞冨椤瑰熀鍑?SOTA",
 			SourceURL:   "https://qwenlm.github.io/blog/qwen3/"},
-		{ModelName: "qwen3-235b-a22b", DisplayName: "Qwen3-235B-A22B", SupplierName: "阿里云", LaunchYearMonth: "2025-04", PopularityStars: 5, ModelType: "Reasoning",
-			Description: "Qwen3 最大 MoE 开源旗舰，235B/22B 激活，支持混合思考/非思考双模式",
+		{ModelName: "qwen3-235b-a22b", DisplayName: "Qwen3-235B-A22B", SupplierName: "闃块噷浜?", LaunchYearMonth: "2025-04", PopularityStars: 5, ModelType: "Reasoning",
+			Description: "Qwen3 鏈€澶?MoE 寮€婧愭棗鑸帮紝235B/22B 婵€娲伙紝鏀寔娣峰悎鎬濊€?闈炴€濊€冨弻妯″紡",
 			SourceURL:   "https://qwenlm.github.io/blog/qwen3/"},
-		{ModelName: "qwen3-plus", DisplayName: "通义千问 Qwen3-Plus", SupplierName: "阿里云", LaunchYearMonth: "2025-04", PopularityStars: 4, ModelType: "Reasoning",
-			Description: "Qwen3 商用均衡版，性能与成本最佳平衡，企业级部署首选",
+		{ModelName: "qwen3-plus", DisplayName: "閫氫箟鍗冮棶 Qwen3-Plus", SupplierName: "闃块噷浜?", LaunchYearMonth: "2025-04", PopularityStars: 4, ModelType: "Reasoning",
+			Description: "Qwen3 鍟嗙敤鍧囪　鐗堬紝鎬ц兘涓庢垚鏈渶浣冲钩琛★紝浼佷笟绾ч儴缃查閫?",
 			SourceURL:   "https://help.aliyun.com/zh/model-studio/getting-started/models"},
-		{ModelName: "qwq-plus", DisplayName: "QwQ-Plus", SupplierName: "阿里云", LaunchYearMonth: "2025-03", PopularityStars: 4, ModelType: "Reasoning",
-			Description: "通义千问推理增强版，数学/代码/科学推理商业化旗舰",
+		{ModelName: "qwq-plus", DisplayName: "QwQ-Plus", SupplierName: "闃块噷浜?", LaunchYearMonth: "2025-03", PopularityStars: 4, ModelType: "Reasoning",
+			Description: "閫氫箟鍗冮棶鎺ㄧ悊澧炲己鐗堬紝鏁板/浠ｇ爜/绉戝鎺ㄧ悊鍟嗕笟鍖栨棗鑸?",
 			SourceURL:   "https://help.aliyun.com/zh/model-studio/getting-started/models"},
-		{ModelName: "qvq-max", DisplayName: "QvQ-Max", SupplierName: "阿里云", LaunchYearMonth: "2025-03", PopularityStars: 4, ModelType: "VLM",
-			Description: "视觉推理旗舰，图像/视频+深度思考，跨模态复杂推理能力",
+		{ModelName: "qvq-max", DisplayName: "QvQ-Max", SupplierName: "闃块噷浜?", LaunchYearMonth: "2025-03", PopularityStars: 4, ModelType: "VLM",
+			Description: "瑙嗚鎺ㄧ悊鏃楄埌锛屽浘鍍?瑙嗛+娣卞害鎬濊€冿紝璺ㄦā鎬佸鏉傛帹鐞嗚兘鍔?",
 			SourceURL:   "https://help.aliyun.com/zh/model-studio/getting-started/models"},
-		{ModelName: "qwen2.5-vl-72b-instruct", DisplayName: "Qwen2.5-VL-72B", SupplierName: "阿里云", LaunchYearMonth: "2025-01", PopularityStars: 4, ModelType: "VLM",
-			Description: "视觉理解开源旗舰，文档/图表/视频深度理解，支持任意分辨率",
+		{ModelName: "qwen2.5-vl-72b-instruct", DisplayName: "Qwen2.5-VL-72B", SupplierName: "闃块噷浜?", LaunchYearMonth: "2025-01", PopularityStars: 4, ModelType: "VLM",
+			Description: "瑙嗚鐞嗚В寮€婧愭棗鑸帮紝鏂囨。/鍥捐〃/瑙嗛娣卞害鐞嗚В锛屾敮鎸佷换鎰忓垎杈ㄧ巼",
 			SourceURL:   "https://qwenlm.github.io/blog/qwen2.5-vl/"},
-		{ModelName: "qwen-long", DisplayName: "Qwen-Long（千万字长文）", SupplierName: "阿里云", LaunchYearMonth: "2024-09", PopularityStars: 3, ModelType: "LLM",
-			Description: "超长上下文专用模型，支持 1000 万 Token，长文档处理首选",
+		{ModelName: "qwen-long", DisplayName: "Qwen-Long锛堝崈涓囧瓧闀挎枃锛?", SupplierName: "闃块噷浜?", LaunchYearMonth: "2024-09", PopularityStars: 3, ModelType: "LLM",
+			Description: "瓒呴暱涓婁笅鏂囦笓鐢ㄦā鍨嬶紝鏀寔 1000 涓?Token锛岄暱鏂囨。澶勭悊棣栭€?",
 			SourceURL:   "https://help.aliyun.com/zh/model-studio/getting-started/models"},
 
-		// ════════════════════════════════════════════════════════════
-		// 字节跳动 / 火山引擎（豆包 Doubao + Seedance + Seedream）
-		// ════════════════════════════════════════════════════════════
-		{ModelName: "doubao-seed-2.0-pro", DisplayName: "豆包 Seed 2.0 Pro", SupplierName: "火山引擎", LaunchYearMonth: "2026-02", PopularityStars: 5, ModelType: "Reasoning",
-			Description: "豆包最强商业旗舰，MoE 架构推理对标 GPT-5.2 / Gemini 3 Pro，OpenRouter 前五",
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		// 瀛楄妭璺冲姩 / 鐏北寮曟搸锛堣眴鍖?Doubao + Seedance + Seedream锛?		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		{ModelName: "doubao-seed-2.0-pro", DisplayName: "璞嗗寘 Seed 2.0 Pro", SupplierName: "鐏北寮曟搸", LaunchYearMonth: "2026-02", PopularityStars: 5, ModelType: "Reasoning",
+			Description: "璞嗗寘鏈€寮哄晢涓氭棗鑸帮紝MoE 鏋舵瀯鎺ㄧ悊瀵规爣 GPT-5.2 / Gemini 3 Pro锛孫penRouter 鍓嶄簲",
 			SourceURL:   "https://www.guancha.cn/economy/2026_02_14_807208.shtml"},
-		{ModelName: "doubao-seed-2.0-lite", DisplayName: "豆包 Seed 2.0 Lite", SupplierName: "火山引擎", LaunchYearMonth: "2026-02", PopularityStars: 4, ModelType: "LLM",
-			Description: "Seed 2.0 性价比版本，输入仅 0.6 元/百万 Token，大规模商用优选",
+		{ModelName: "doubao-seed-2.0-lite", DisplayName: "璞嗗寘 Seed 2.0 Lite", SupplierName: "鐏北寮曟搸", LaunchYearMonth: "2026-02", PopularityStars: 4, ModelType: "LLM",
+			Description: "Seed 2.0 鎬т环姣旂増鏈紝杈撳叆浠?0.6 鍏?鐧句竾 Token锛屽ぇ瑙勬ā鍟嗙敤浼橀€?",
 			SourceURL:   "http://www.news.cn/tech/20260211/1ed7ca6ab28143928fb62d2a65b88228/c.html"},
-		{ModelName: "doubao-seed-2.0-mini", DisplayName: "豆包 Seed 2.0 Mini", SupplierName: "火山引擎", LaunchYearMonth: "2026-02", PopularityStars: 3, ModelType: "LLM",
-			Description: "Seed 2.0 超轻量版，极速响应，高并发对话场景首选",
+		{ModelName: "doubao-seed-2.0-mini", DisplayName: "璞嗗寘 Seed 2.0 Mini", SupplierName: "鐏北寮曟搸", LaunchYearMonth: "2026-02", PopularityStars: 3, ModelType: "LLM",
+			Description: "Seed 2.0 瓒呰交閲忕増锛屾瀬閫熷搷搴旓紝楂樺苟鍙戝璇濆満鏅閫?",
 			SourceURL:   "http://www.news.cn/tech/20260211/1ed7ca6ab28143928fb62d2a65b88228/c.html"},
-		{ModelName: "doubao-seed-2.0-code", DisplayName: "豆包 Seed 2.0 Code", SupplierName: "火山引擎", LaunchYearMonth: "2026-02", PopularityStars: 4, ModelType: "LLM",
-			Description: "Seed 2.0 代码专项版，复杂工程代码生成与调试能力突出",
+		{ModelName: "doubao-seed-2.0-code", DisplayName: "璞嗗寘 Seed 2.0 Code", SupplierName: "鐏北寮曟搸", LaunchYearMonth: "2026-02", PopularityStars: 4, ModelType: "LLM",
+			Description: "Seed 2.0 浠ｇ爜涓撻」鐗堬紝澶嶆潅宸ョ▼浠ｇ爜鐢熸垚涓庤皟璇曡兘鍔涚獊鍑?",
 			SourceURL:   "https://news.qq.com/rain/a/20260215A04N5J00"},
-		{ModelName: "seedance-2.0", DisplayName: "Seedance 2.0（视频生成）", SupplierName: "火山引擎", LaunchYearMonth: "2026-02", PopularityStars: 5, ModelType: "VideoGeneration",
-			Description: "电影级多模态视频生成，60 秒 2K 视频，DB-DiT 架构音画同步，Elo 1269 全球第一",
+		{ModelName: "seedance-2.0", DisplayName: "Seedance 2.0锛堣棰戠敓鎴愶級", SupplierName: "鐏北寮曟搸", LaunchYearMonth: "2026-02", PopularityStars: 5, ModelType: "VideoGeneration",
+			Description: "鐢靛奖绾у妯℃€佽棰戠敓鎴愶紝60 绉?2K 瑙嗛锛孌B-DiT 鏋舵瀯闊崇敾鍚屾锛孍lo 1269 鍏ㄧ悆绗竴",
 			SourceURL:   "https://finance.sina.com.cn/china/2026-02-12/doc-inhmpqkp4075366.shtml"},
-		{ModelName: "seedream-5.0-lite", DisplayName: "Seedream 5.0 Lite（图像生成）", SupplierName: "火山引擎", LaunchYearMonth: "2026-02", PopularityStars: 5, ModelType: "ImageGeneration",
-			Description: "智能推理图像生成，实时搜索+精确编辑，多模态融合，成本较 5.0 降低 22%",
+		{ModelName: "seedream-5.0-lite", DisplayName: "Seedream 5.0 Lite锛堝浘鍍忕敓鎴愶級", SupplierName: "鐏北寮曟搸", LaunchYearMonth: "2026-02", PopularityStars: 5, ModelType: "ImageGeneration",
+			Description: "鏅鸿兘鎺ㄧ悊鍥惧儚鐢熸垚锛屽疄鏃舵悳绱?绮剧‘缂栬緫锛屽妯℃€佽瀺鍚堬紝鎴愭湰杈?5.0 闄嶄綆 22%",
 			SourceURL:   "https://finance.sina.com.cn/roll/2026-02-12/doc-inhmpqkh3100490.shtml"},
-		{ModelName: "seedream-4.0", DisplayName: "Seedream 4.0（图像生成）", SupplierName: "火山引擎", LaunchYearMonth: "2025-09", PopularityStars: 5, ModelType: "ImageGeneration",
-			Description: "4K 超高清图像生成，推理速度提升 10 倍，Artificial Analysis 文生图全球第一",
+		{ModelName: "seedream-4.0", DisplayName: "Seedream 4.0锛堝浘鍍忕敓鎴愶級", SupplierName: "鐏北寮曟搸", LaunchYearMonth: "2025-09", PopularityStars: 5, ModelType: "ImageGeneration",
+			Description: "4K 瓒呴珮娓呭浘鍍忕敓鎴愶紝鎺ㄧ悊閫熷害鎻愬崌 10 鍊嶏紝Artificial Analysis 鏂囩敓鍥惧叏鐞冪涓€",
 			SourceURL:   "https://developer.volcengine.com/articles/7553203414411247643"},
-		{ModelName: "doubao-1-5-thinking-pro-250415", DisplayName: "豆包 1.5 Thinking Pro", SupplierName: "火山引擎", LaunchYearMonth: "2025-04", PopularityStars: 5, ModelType: "Reasoning",
-			Description: "豆包深度思考旗舰，数学竞赛/代码推理超越国内主流推理模型",
+		{ModelName: "doubao-1-5-thinking-pro-250415", DisplayName: "璞嗗寘 1.5 Thinking Pro", SupplierName: "鐏北寮曟搸", LaunchYearMonth: "2025-04", PopularityStars: 5, ModelType: "Reasoning",
+			Description: "璞嗗寘娣卞害鎬濊€冩棗鑸帮紝鏁板绔炶禌/浠ｇ爜鎺ㄧ悊瓒呰秺鍥藉唴涓绘祦鎺ㄧ悊妯″瀷",
 			SourceURL:   "https://www.volcengine.com/docs/82379/1801935"},
-		{ModelName: "doubao-seed-1-5-vl-250428", DisplayName: "Seed1.5-VL（视觉推理）", SupplierName: "火山引擎", LaunchYearMonth: "2025-04", PopularityStars: 5, ModelType: "VLM",
-			Description: "字节 Seed 视觉推理旗舰，OpenCompass 多模态榜单 SOTA",
+		{ModelName: "doubao-seed-1-5-vl-250428", DisplayName: "Seed1.5-VL锛堣瑙夋帹鐞嗭級", SupplierName: "鐏北寮曟搸", LaunchYearMonth: "2025-04", PopularityStars: 5, ModelType: "VLM",
+			Description: "瀛楄妭 Seed 瑙嗚鎺ㄧ悊鏃楄埌锛孫penCompass 澶氭ā鎬佹鍗?SOTA",
 			SourceURL:   "https://www.volcengine.com/docs/82379/1801935"},
-		{ModelName: "doubao-1-5-pro-256k-250115", DisplayName: "豆包 1.5 Pro 256K", SupplierName: "火山引擎", LaunchYearMonth: "2025-01", PopularityStars: 4, ModelType: "LLM",
-			Description: "豆包 1.5 超长上下文版，256K，长文档/代码库分析首选",
+		{ModelName: "doubao-1-5-pro-256k-250115", DisplayName: "璞嗗寘 1.5 Pro 256K", SupplierName: "鐏北寮曟搸", LaunchYearMonth: "2025-01", PopularityStars: 4, ModelType: "LLM",
+			Description: "璞嗗寘 1.5 瓒呴暱涓婁笅鏂囩増锛?56K锛岄暱鏂囨。/浠ｇ爜搴撳垎鏋愰閫?",
 			SourceURL:   "https://www.volcengine.com/docs/82379/1330310"},
 
-		// ════════════════════════════════════════════════════════════
-		// 腾讯混元（Hunyuan）
-		// ════════════════════════════════════════════════════════════
-		{ModelName: "hunyuan-hy-2.0-think", DisplayName: "混元 HY 2.0 Think", SupplierName: "腾讯", LaunchYearMonth: "2025-12", PopularityStars: 5, ModelType: "Reasoning",
-			Description: "腾讯混元商业推理旗舰，406B/32B 激活 MoE，256K 上下文，国内推理第一梯队",
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		// 鑵捐娣峰厓锛圚unyuan锛?		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		{ModelName: "hunyuan-hy-2.0-think", DisplayName: "娣峰厓 HY 2.0 Think", SupplierName: "鑵捐", LaunchYearMonth: "2025-12", PopularityStars: 5, ModelType: "Reasoning",
+			Description: "鑵捐娣峰厓鍟嗕笟鎺ㄧ悊鏃楄埌锛?06B/32B 婵€娲?MoE锛?56K 涓婁笅鏂囷紝鍥藉唴鎺ㄧ悊绗竴姊槦",
 			SourceURL:   "https://www.ithome.com/0/902/856.htm"},
-		{ModelName: "hunyuan-hy-2.0-instruct", DisplayName: "混元 HY 2.0 Instruct", SupplierName: "腾讯", LaunchYearMonth: "2025-12", PopularityStars: 5, ModelType: "LLM",
-			Description: "混元 HY 2.0 指令跟随版，文本创作优势突出，256K 上下文",
+		{ModelName: "hunyuan-hy-2.0-instruct", DisplayName: "娣峰厓 HY 2.0 Instruct", SupplierName: "鑵捐", LaunchYearMonth: "2025-12", PopularityStars: 5, ModelType: "LLM",
+			Description: "娣峰厓 HY 2.0 鎸囦护璺熼殢鐗堬紝鏂囨湰鍒涗綔浼樺娍绐佸嚭锛?56K 涓婁笅鏂?",
 			SourceURL:   "https://news.qq.com/rain/a/20251206A02VMU00"},
-		{ModelName: "hunyuan-turbos-20250416", DisplayName: "混元 Turbo S", SupplierName: "腾讯", LaunchYearMonth: "2025-04", PopularityStars: 4, ModelType: "LLM",
-			Description: "混元极速版，低延迟高并发，商业化场景首选",
+		{ModelName: "hunyuan-turbos-20250416", DisplayName: "娣峰厓 Turbo S", SupplierName: "鑵捐", LaunchYearMonth: "2025-04", PopularityStars: 4, ModelType: "LLM",
+			Description: "娣峰厓鏋侀€熺増锛屼綆寤惰繜楂樺苟鍙戯紝鍟嗕笟鍖栧満鏅閫?",
 			SourceURL:   "https://cloud.tencent.com/document/product/1729/104753"},
-		{ModelName: "hunyuan-t1-20250321", DisplayName: "混元 T1", SupplierName: "腾讯", LaunchYearMonth: "2025-03", PopularityStars: 4, ModelType: "Reasoning",
-			Description: "腾讯首款推理模型，慢思考机制，数学/逻辑/代码能力显著提升",
+		{ModelName: "hunyuan-t1-20250321", DisplayName: "娣峰厓 T1", SupplierName: "鑵捐", LaunchYearMonth: "2025-03", PopularityStars: 4, ModelType: "Reasoning",
+			Description: "鑵捐棣栨鎺ㄧ悊妯″瀷锛屾參鎬濊€冩満鍒讹紝鏁板/閫昏緫/浠ｇ爜鑳藉姏鏄捐憲鎻愬崌",
 			SourceURL:   "https://cloud.tencent.com/document/product/1729/104753"},
-		{ModelName: "hunyuan-vision-1.5", DisplayName: "混元 Vision 1.5", SupplierName: "腾讯", LaunchYearMonth: "2025-06", PopularityStars: 4, ModelType: "VLM",
-			Description: "腾讯多模态升级版，图文视频理解能力大幅提升",
+		{ModelName: "hunyuan-vision-1.5", DisplayName: "娣峰厓 Vision 1.5", SupplierName: "鑵捐", LaunchYearMonth: "2025-06", PopularityStars: 4, ModelType: "VLM",
+			Description: "鑵捐澶氭ā鎬佸崌绾х増锛屽浘鏂囪棰戠悊瑙ｈ兘鍔涘ぇ骞呮彁鍗?",
 			SourceURL:   "https://cloud.tencent.com/document/product/1729/97731"},
-		{ModelName: "hunyuan-large", DisplayName: "混元 Large（开源）", SupplierName: "腾讯", LaunchYearMonth: "2024-11", PopularityStars: 4, ModelType: "LLM",
-			Description: "腾讯开源旗舰，389B/52B 激活 MoE，中文理解与长文本推理领先",
+		{ModelName: "hunyuan-large", DisplayName: "娣峰厓 Large锛堝紑婧愶級", SupplierName: "鑵捐", LaunchYearMonth: "2024-11", PopularityStars: 4, ModelType: "LLM",
+			Description: "鑵捐寮€婧愭棗鑸帮紝389B/52B 婵€娲?MoE锛屼腑鏂囩悊瑙ｄ笌闀挎枃鏈帹鐞嗛鍏?",
 			SourceURL:   "https://cloud.tencent.com/document/product/1729/97731"},
 
-		// ════════════════════════════════════════════════════════════
-		// 百度（文心 ERNIE）
-		// ════════════════════════════════════════════════════════════
-		{ModelName: "ernie-5.0-thinking-latest", DisplayName: "文心 ERNIE 5.0 Thinking", SupplierName: "百度", LaunchYearMonth: "2026-01", PopularityStars: 5, ModelType: "Reasoning",
-			Description: "文心 5.0 推理版，2.4 万亿参数，原生全模态，LMArena 国内第一",
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		// 鐧惧害锛堟枃蹇?ERNIE锛?		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		{ModelName: "ernie-5.0-thinking-latest", DisplayName: "鏂囧績 ERNIE 5.0 Thinking", SupplierName: "鐧惧害", LaunchYearMonth: "2026-01", PopularityStars: 5, ModelType: "Reasoning",
+			Description: "鏂囧績 5.0 鎺ㄧ悊鐗堬紝2.4 涓囦嚎鍙傛暟锛屽師鐢熷叏妯℃€侊紝LMArena 鍥藉唴绗竴",
 			SourceURL:   "https://technews.tw/2026/01/22/ernie-5/"},
-		{ModelName: "ernie-5.0", DisplayName: "文心 ERNIE 5.0", SupplierName: "百度", LaunchYearMonth: "2026-01", PopularityStars: 5, ModelType: "VLM",
-			Description: "百度文心第五代旗舰，原生全模态（文本/图像/音频/视频），103 种语言",
+		{ModelName: "ernie-5.0", DisplayName: "鏂囧績 ERNIE 5.0", SupplierName: "鐧惧害", LaunchYearMonth: "2026-01", PopularityStars: 5, ModelType: "VLM",
+			Description: "鐧惧害鏂囧績绗簲浠ｆ棗鑸帮紝鍘熺敓鍏ㄦā鎬侊紙鏂囨湰/鍥惧儚/闊抽/瑙嗛锛夛紝103 绉嶈瑷€",
 			SourceURL:   "https://technews.tw/2026/01/22/ernie-5/"},
-		{ModelName: "ernie-4.5-turbo-128k", DisplayName: "文心 ERNIE 4.5 Turbo", SupplierName: "百度", LaunchYearMonth: "2025-04", PopularityStars: 4, ModelType: "LLM",
-			Description: "文心 4.5 极速版，定价降至前代 20%，128K 上下文商业化落地",
+		{ModelName: "ernie-4.5-turbo-128k", DisplayName: "鏂囧績 ERNIE 4.5 Turbo", SupplierName: "鐧惧害", LaunchYearMonth: "2025-04", PopularityStars: 4, ModelType: "LLM",
+			Description: "鏂囧績 4.5 鏋侀€熺増锛屽畾浠烽檷鑷冲墠浠?20%锛?28K 涓婁笅鏂囧晢涓氬寲钀藉湴",
 			SourceURL:   "https://cloud.baidu.com/doc/WENXINWORKSHOP/s/Nlks5zkzu"},
-		{ModelName: "ernie-x1-turbo-32k", DisplayName: "文心 ERNIE X1 Turbo", SupplierName: "百度", LaunchYearMonth: "2025-04", PopularityStars: 4, ModelType: "Reasoning",
-			Description: "文心 X1 极速推理版，工具调用+深度搜索，成本大幅降低",
+		{ModelName: "ernie-x1-turbo-32k", DisplayName: "鏂囧績 ERNIE X1 Turbo", SupplierName: "鐧惧害", LaunchYearMonth: "2025-04", PopularityStars: 4, ModelType: "Reasoning",
+			Description: "鏂囧績 X1 鏋侀€熸帹鐞嗙増锛屽伐鍏疯皟鐢?娣卞害鎼滅储锛屾垚鏈ぇ骞呴檷浣?",
 			SourceURL:   "https://cloud.baidu.com/doc/WENXINWORKSHOP/s/Nlks5zkzu"},
-		{ModelName: "ernie-4.5-8k", DisplayName: "文心 ERNIE 4.5", SupplierName: "百度", LaunchYearMonth: "2025-03", PopularityStars: 4, ModelType: "VLM",
-			Description: "文心 4.5 原生多模态旗舰，图文理解全面升级，支持多图输入",
+		{ModelName: "ernie-4.5-8k", DisplayName: "鏂囧績 ERNIE 4.5", SupplierName: "鐧惧害", LaunchYearMonth: "2025-03", PopularityStars: 4, ModelType: "VLM",
+			Description: "鏂囧績 4.5 鍘熺敓澶氭ā鎬佹棗鑸帮紝鍥炬枃鐞嗚В鍏ㄩ潰鍗囩骇锛屾敮鎸佸鍥捐緭鍏?",
 			SourceURL:   "https://cloud.baidu.com/doc/WENXINWORKSHOP/s/Nlks5zkzu"},
-		{ModelName: "ernie-x1-32k", DisplayName: "文心 ERNIE X1", SupplierName: "百度", LaunchYearMonth: "2025-03", PopularityStars: 4, ModelType: "Reasoning",
-			Description: "百度首款推理模型，工具调用与深度搜索，多模态推理",
+		{ModelName: "ernie-x1-32k", DisplayName: "鏂囧績 ERNIE X1", SupplierName: "鐧惧害", LaunchYearMonth: "2025-03", PopularityStars: 4, ModelType: "Reasoning",
+			Description: "鐧惧害棣栨鎺ㄧ悊妯″瀷锛屽伐鍏疯皟鐢ㄤ笌娣卞害鎼滅储锛屽妯℃€佹帹鐞?",
 			SourceURL:   "https://cloud.baidu.com/doc/WENXINWORKSHOP/s/Nlks5zkzu"},
 
-		// ════════════════════════════════════════════════════════════
-		// Moonshot AI（Kimi）
-		// ════════════════════════════════════════════════════════════
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		// Moonshot AI锛圞imi锛?		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 		{ModelName: "kimi-k2.5", DisplayName: "Kimi K2.5", SupplierName: "Moonshot", LaunchYearMonth: "2026-01", PopularityStars: 5, ModelType: "VLM",
-			Description: "原生多模态，1T MoE，256K 上下文，Agent Swarm 集群智能，OpenRouter 2月第二（4.02万亿Token）",
+			Description: "鍘熺敓澶氭ā鎬侊紝1T MoE锛?56K 涓婁笅鏂囷紝Agent Swarm 闆嗙兢鏅鸿兘锛孫penRouter 2鏈堢浜岋紙4.02涓囦嚎Token锛?",
 			SourceURL:   "https://www.infoq.cn/article/kadDBSqBrtFfUbipxQSs"},
 		{ModelName: "kimi-k2-thinking", DisplayName: "Kimi K2 Thinking", SupplierName: "Moonshot", LaunchYearMonth: "2025-11", PopularityStars: 5, ModelType: "Reasoning",
-			Description: "Kimi K2 深度思考版，1T 参数 MoE，复杂推理与 Agent 能力",
-			SourceURL:   "https://platform.moonshot.cn/docs/intro"},
+			Description: "Kimi K2 娣卞害鎬濊€冪増锛?T 鍙傛暟 MoE锛屽鏉傛帹鐞嗕笌 Agent 鑳藉姏",
+			SourceURL:   "https://platform.moonshot.cn/docs/introduction"},
 		{ModelName: "kimi-k2-0711-preview", DisplayName: "Kimi K2", SupplierName: "Moonshot", LaunchYearMonth: "2025-07", PopularityStars: 5, ModelType: "LLM",
-			Description: "1 万亿参数 MoE 开源旗舰，Tool Use 全球第一，Agentic 能力突出",
-			SourceURL:   "https://platform.moonshot.cn/docs/intro"},
+			Description: "1 涓囦嚎鍙傛暟 MoE 寮€婧愭棗鑸帮紝Tool Use 鍏ㄧ悆绗竴锛孉gentic 鑳藉姏绐佸嚭",
+			SourceURL:   "https://platform.moonshot.cn/docs/introduction"},
 		{ModelName: "kimi-k1.5", DisplayName: "Kimi K1.5", SupplierName: "Moonshot", LaunchYearMonth: "2025-01", PopularityStars: 4, ModelType: "Reasoning",
-			Description: "Kimi 推理模型，长链思考，多模态支持，MATH-500 发布时全球第二",
-			SourceURL:   "https://platform.moonshot.cn/docs/intro"},
+			Description: "Kimi 鎺ㄧ悊妯″瀷锛岄暱閾炬€濊€冿紝澶氭ā鎬佹敮鎸侊紝MATH-500 鍙戝竷鏃跺叏鐞冪浜?",
+			SourceURL:   "https://platform.moonshot.cn/docs/introduction"},
 		{ModelName: "moonshot-v1-128k", DisplayName: "Moonshot V1 128K", SupplierName: "Moonshot", LaunchYearMonth: "2024-03", PopularityStars: 4, ModelType: "LLM",
-			Description: "Kimi 经典长文本旗舰，128K 上下文，国内最早商业化长上下文模型",
-			SourceURL:   "https://platform.moonshot.cn/docs/intro"},
+			Description: "Kimi 缁忓吀闀挎枃鏈棗鑸帮紝128K 涓婁笅鏂囷紝鍥藉唴鏈€鏃╁晢涓氬寲闀夸笂涓嬫枃妯″瀷",
+			SourceURL:   "https://platform.moonshot.cn/docs/introduction"},
 
-		// ════════════════════════════════════════════════════════════
-		// 智谱（GLM）
-		// ════════════════════════════════════════════════════════════
-		{ModelName: "glm-5", DisplayName: "GLM-5", SupplierName: "智谱", LaunchYearMonth: "2026-02", PopularityStars: 5, ModelType: "LLM",
-			Description: "智谱第五代开源旗舰，编程对标 Claude Opus 4.5，OpenRouter 2月前五，开源第一",
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		// 鏅鸿氨锛圙LM锛?		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		{ModelName: "glm-5", DisplayName: "GLM-5", SupplierName: "鏅鸿氨", LaunchYearMonth: "2026-02", PopularityStars: 5, ModelType: "LLM",
+			Description: "鏅鸿氨绗簲浠ｅ紑婧愭棗鑸帮紝缂栫▼瀵规爣 Claude Opus 4.5锛孫penRouter 2鏈堝墠浜旓紝寮€婧愮涓€",
 			SourceURL:   "https://36kr.com/p/3679611307617928"},
-		{ModelName: "glm-5-plus", DisplayName: "GLM-5 Plus", SupplierName: "智谱", LaunchYearMonth: "2026-02", PopularityStars: 4, ModelType: "LLM",
-			Description: "GLM-5 轻量商业版，纯文本，价格较 GLM-5 降低近 50%",
+		{ModelName: "glm-5-plus", DisplayName: "GLM-5 Plus", SupplierName: "鏅鸿氨", LaunchYearMonth: "2026-02", PopularityStars: 4, ModelType: "LLM",
+			Description: "GLM-5 杞婚噺鍟嗕笟鐗堬紝绾枃鏈紝浠锋牸杈?GLM-5 闄嶄綆杩?50%",
 			SourceURL:   "https://docs.bigmodel.cn/cn/guide/start/model-overview"},
-		{ModelName: "glm-4.6", DisplayName: "GLM-4.6", SupplierName: "智谱", LaunchYearMonth: "2025-09", PopularityStars: 4, ModelType: "LLM",
-			Description: "GLM 开源版，代码生成 SOTA，视觉推理能力强，200K 上下文",
+		{ModelName: "glm-4.6", DisplayName: "GLM-4.6", SupplierName: "鏅鸿氨", LaunchYearMonth: "2025-09", PopularityStars: 4, ModelType: "LLM",
+			Description: "GLM 寮€婧愮増锛屼唬鐮佺敓鎴?SOTA锛岃瑙夋帹鐞嗚兘鍔涘己锛?00K 涓婁笅鏂?",
 			SourceURL:   "https://docs.bigmodel.cn/cn/guide/start/model-overview"},
-		{ModelName: "glm-4.5", DisplayName: "GLM-4.5", SupplierName: "智谱", LaunchYearMonth: "2025-07", PopularityStars: 4, ModelType: "LLM",
-			Description: "Agent 基座模型，推理/编码/工具调用全面融合",
+		{ModelName: "glm-4.5", DisplayName: "GLM-4.5", SupplierName: "鏅鸿氨", LaunchYearMonth: "2025-07", PopularityStars: 4, ModelType: "LLM",
+			Description: "Agent 鍩哄骇妯″瀷锛屾帹鐞?缂栫爜/宸ュ叿璋冪敤鍏ㄩ潰铻嶅悎",
 			SourceURL:   "https://docs.bigmodel.cn/cn/guide/start/model-overview"},
-		{ModelName: "glm-z1-plus", DisplayName: "GLM-Z1 Plus", SupplierName: "智谱", LaunchYearMonth: "2025-04", PopularityStars: 4, ModelType: "Reasoning",
-			Description: "智谱推理旗舰，联网搜索+深度思考，商业级复杂任务处理",
+		{ModelName: "glm-z1-plus", DisplayName: "GLM-Z1 Plus", SupplierName: "鏅鸿氨", LaunchYearMonth: "2025-04", PopularityStars: 4, ModelType: "Reasoning",
+			Description: "鏅鸿氨鎺ㄧ悊鏃楄埌锛岃仈缃戞悳绱?娣卞害鎬濊€冿紝鍟嗕笟绾у鏉備换鍔″鐞?",
 			SourceURL:   "https://open.bigmodel.cn/dev/api"},
-		{ModelName: "glm-4-plus", DisplayName: "GLM-4 Plus", SupplierName: "智谱", LaunchYearMonth: "2024-09", PopularityStars: 3, ModelType: "LLM",
-			Description: "智谱稳定商业旗舰，128K 上下文，函数调用能力优秀",
+		{ModelName: "glm-4-plus", DisplayName: "GLM-4 Plus", SupplierName: "鏅鸿氨", LaunchYearMonth: "2024-09", PopularityStars: 3, ModelType: "LLM",
+			Description: "鏅鸿氨绋冲畾鍟嗕笟鏃楄埌锛?28K 涓婁笅鏂囷紝鍑芥暟璋冪敤鑳藉姏浼樼",
 			SourceURL:   "https://open.bigmodel.cn/pricing"},
-		{ModelName: "glm-4-flash", DisplayName: "GLM-4 Flash（免费）", SupplierName: "智谱", LaunchYearMonth: "2024-09", PopularityStars: 4, ModelType: "LLM",
-			Description: "智谱免费极速模型，128K 上下文，高并发场景首选",
+		{ModelName: "glm-4-flash", DisplayName: "GLM-4 Flash锛堝厤璐癸級", SupplierName: "鏅鸿氨", LaunchYearMonth: "2024-09", PopularityStars: 4, ModelType: "LLM",
+			Description: "鏅鸿氨鍏嶈垂鏋侀€熸ā鍨嬶紝128K 涓婁笅鏂囷紝楂樺苟鍙戝満鏅閫?",
 			SourceURL:   "https://open.bigmodel.cn/pricing"},
-		{ModelName: "glm-image", DisplayName: "GLM Image（图像生成）", SupplierName: "智谱", LaunchYearMonth: "2025-08", PopularityStars: 4, ModelType: "ImageGeneration",
-			Description: "智谱图像生成，文本渲染开源 SOTA，中文海报设计强",
+		{ModelName: "glm-image", DisplayName: "GLM Image锛堝浘鍍忕敓鎴愶級", SupplierName: "鏅鸿氨", LaunchYearMonth: "2025-08", PopularityStars: 4, ModelType: "ImageGeneration",
+			Description: "鏅鸿氨鍥惧儚鐢熸垚锛屾枃鏈覆鏌撳紑婧?SOTA锛屼腑鏂囨捣鎶ヨ璁″己",
 			SourceURL:   "https://docs.bigmodel.cn/cn/guide/start/model-overview"},
-		{ModelName: "cogvideox-3", DisplayName: "CogVideoX-3（视频生成）", SupplierName: "智谱", LaunchYearMonth: "2025-06", PopularityStars: 4, ModelType: "VideoGeneration",
-			Description: "多分辨率视频生成，支持图生视频/文生视频/视频延展",
+		{ModelName: "cogvideox-3", DisplayName: "CogVideoX-3锛堣棰戠敓鎴愶級", SupplierName: "鏅鸿氨", LaunchYearMonth: "2025-06", PopularityStars: 4, ModelType: "VideoGeneration",
+			Description: "澶氬垎杈ㄧ巼瑙嗛鐢熸垚锛屾敮鎸佸浘鐢熻棰?鏂囩敓瑙嗛/瑙嗛寤跺睍",
 			SourceURL:   "https://docs.bigmodel.cn/cn/guide/start/model-overview"},
 
-		// ════════════════════════════════════════════════════════════
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 		// MiniMax
-		// ════════════════════════════════════════════════════════════
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 		{ModelName: "minimax-music-2.6", DisplayName: "MiniMax Music 2.6", SupplierName: "MiniMax", LaunchYearMonth: "2026-04", PopularityStars: 4, ModelType: "MusicGeneration",
-			Description: "AI 音乐生成旗舰，人声乐器控制，歌词优化，全球 Beta 发布",
+			Description: "AI 闊充箰鐢熸垚鏃楄埌锛屼汉澹颁箰鍣ㄦ帶鍒讹紝姝岃瘝浼樺寲锛屽叏鐞?Beta 鍙戝竷",
 			SourceURL:   "https://www.minimaxi.com/news/music-26"},
 		{ModelName: "minimax-m2.7", DisplayName: "MiniMax M2.7", SupplierName: "MiniMax", LaunchYearMonth: "2026-03", PopularityStars: 5, ModelType: "LLM",
-			Description: "递归自改进，SWE-Pro 56.22%，ELO 1495 开源最高，100TPS 高速版",
+			Description: "閫掑綊鑷敼杩涳紝SWE-Pro 56.22%锛孍LO 1495 寮€婧愭渶楂橈紝100TPS 楂橀€熺増",
 			SourceURL:   "https://www.minimaxi.com/news/minimax-m27-en"},
 		{ModelName: "minimax-m2.5", DisplayName: "MiniMax M2.5", SupplierName: "MiniMax", LaunchYearMonth: "2026-02", PopularityStars: 5, ModelType: "LLM",
-			Description: "OpenRouter 2月调用量第一（4.55万亿Token），月收入破1.5亿美元",
+			Description: "OpenRouter 2鏈堣皟鐢ㄩ噺绗竴锛?.55涓囦嚎Token锛夛紝鏈堟敹鍏ョ牬1.5浜跨編鍏?",
 			SourceURL:   "https://www.pingwest.com/a/311573"},
 		{ModelName: "minimax-m2", DisplayName: "MiniMax M2", SupplierName: "MiniMax", LaunchYearMonth: "2025-10", PopularityStars: 4, ModelType: "LLM",
-			Description: "自我迭代模型第二代，编程与 Agent 能力持续进化",
+			Description: "鑷垜杩唬妯″瀷绗簩浠ｏ紝缂栫▼涓?Agent 鑳藉姏鎸佺画杩涘寲",
 			SourceURL:   "https://platform.minimaxi.com/document/models"},
 		{ModelName: "minimax-m1", DisplayName: "MiniMax M1", SupplierName: "MiniMax", LaunchYearMonth: "2025-05", PopularityStars: 5, ModelType: "Reasoning",
-			Description: "首批百万 Token 上下文开源推理模型，80K 思维链，强化学习训练",
+			Description: "棣栨壒鐧句竾 Token 涓婁笅鏂囧紑婧愭帹鐞嗘ā鍨嬶紝80K 鎬濈淮閾撅紝寮哄寲瀛︿範璁粌",
 			SourceURL:   "https://platform.minimaxi.com/document/models"},
-		{ModelName: "minimax-hailuo-2.3", DisplayName: "海螺 Hailuo 2.3（视频）", SupplierName: "MiniMax", LaunchYearMonth: "2025-10", PopularityStars: 4, ModelType: "VideoGeneration",
-			Description: "海螺视频生成旗舰，物理运动精准，720P 高清输出",
+		{ModelName: "minimax-hailuo-2.3", DisplayName: "娴疯灪 Hailuo 2.3锛堣棰戯級", SupplierName: "MiniMax", LaunchYearMonth: "2025-10", PopularityStars: 4, ModelType: "VideoGeneration",
+			Description: "娴疯灪瑙嗛鐢熸垚鏃楄埌锛岀墿鐞嗚繍鍔ㄧ簿鍑嗭紝720P 楂樻竻杈撳嚭",
 			SourceURL:   "https://platform.minimaxi.com/document/models"},
 		{ModelName: "minimax-speech-2.6", DisplayName: "MiniMax Speech 2.6", SupplierName: "MiniMax", LaunchYearMonth: "2025-10", PopularityStars: 3, ModelType: "TTS",
-			Description: "高保真语音合成，情感与音色控制精准，支持多语言",
+			Description: "楂樹繚鐪熻闊冲悎鎴愶紝鎯呮劅涓庨煶鑹叉帶鍒剁簿鍑嗭紝鏀寔澶氳瑷€",
 			SourceURL:   "https://platform.minimaxi.com/document/models"},
 
-		// ════════════════════════════════════════════════════════════
-		// 讯飞星火（Spark）
-		// ════════════════════════════════════════════════════════════
-		{ModelName: "spark-x1.5", DisplayName: "星火 X1.5", SupplierName: "讯飞", LaunchYearMonth: "2025-11", PopularityStars: 5, ModelType: "Reasoning",
-			Description: "293B/30B 激活 MoE 推理模型，推理效率提升 100%，支持 130+ 语言",
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		// 璁鏄熺伀锛圫park锛?		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		{ModelName: "spark-x1.5", DisplayName: "鏄熺伀 X1.5", SupplierName: "璁", LaunchYearMonth: "2025-11", PopularityStars: 5, ModelType: "Reasoning",
+			Description: "293B/30B 婵€娲?MoE 鎺ㄧ悊妯″瀷锛屾帹鐞嗘晥鐜囨彁鍗?100%锛屾敮鎸?130+ 璇█",
 			SourceURL:   "https://finance.sina.com.cn/jjxw/2025-11-11/doc-infwzezw1996297.shtml"},
-		{ModelName: "spark4-ultra", DisplayName: "星火 4.0 Ultra", SupplierName: "讯飞", LaunchYearMonth: "2024-08", PopularityStars: 4, ModelType: "LLM",
-			Description: "讯飞商业旗舰，对标 GPT-4 Turbo，生成速度提升 70%",
+		{ModelName: "spark4-ultra", DisplayName: "鏄熺伀 4.0 Ultra", SupplierName: "璁", LaunchYearMonth: "2024-08", PopularityStars: 4, ModelType: "LLM",
+			Description: "璁鍟嗕笟鏃楄埌锛屽鏍?GPT-4 Turbo锛岀敓鎴愰€熷害鎻愬崌 70%",
 			SourceURL:   "https://xinghuo.xfyun.cn/sparkapi"},
-		{ModelName: "spark-max", DisplayName: "星火 Max", SupplierName: "讯飞", LaunchYearMonth: "2024-06", PopularityStars: 3, ModelType: "LLM",
-			Description: "讯飞专业版，复杂推理与行业知识问答，企业级文档理解",
+		{ModelName: "spark-max", DisplayName: "鏄熺伀 Max", SupplierName: "璁", LaunchYearMonth: "2024-06", PopularityStars: 3, ModelType: "LLM",
+			Description: "璁涓撲笟鐗堬紝澶嶆潅鎺ㄧ悊涓庤涓氱煡璇嗛棶绛旓紝浼佷笟绾ф枃妗ｇ悊瑙?",
 			SourceURL:   "https://xinghuo.xfyun.cn/sparkapi"},
 
-		// ════════════════════════════════════════════════════════════
-		// 阶跃星辰（StepFun）
-		// ════════════════════════════════════════════════════════════
-		{ModelName: "step-3.5-flash", DisplayName: "Step 3.5 Flash", SupplierName: "阶跃星辰", LaunchYearMonth: "2026-02", PopularityStars: 5, ModelType: "LLM",
-			Description: "1960B/110B 激活 MoE，实时 Agent 工程优化，350 tokens/s，OpenRouter Trending 第一",
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		// 闃惰穬鏄熻景锛圫tepFun锛?		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		{ModelName: "step-3.5-flash", DisplayName: "Step 3.5 Flash", SupplierName: "闃惰穬鏄熻景", LaunchYearMonth: "2026-02", PopularityStars: 5, ModelType: "LLM",
+			Description: "1960B/110B 婵€娲?MoE锛屽疄鏃?Agent 宸ョ▼浼樺寲锛?50 tokens/s锛孫penRouter Trending 绗竴",
 			SourceURL:   "https://www.qbitai.com/2026/02/375351.html"},
-		{ModelName: "step-3", DisplayName: "Step-3", SupplierName: "阶跃星辰", LaunchYearMonth: "2025-07", PopularityStars: 4, ModelType: "LLM",
-			Description: "开源旗舰，国产芯推理效率达 DeepSeek R1 的 3 倍，多模态支持",
+		{ModelName: "step-3", DisplayName: "Step-3", SupplierName: "闃惰穬鏄熻景", LaunchYearMonth: "2025-07", PopularityStars: 4, ModelType: "LLM",
+			Description: "寮€婧愭棗鑸帮紝鍥戒骇鑺帹鐞嗘晥鐜囪揪 DeepSeek R1 鐨?3 鍊嶏紝澶氭ā鎬佹敮鎸?",
 			SourceURL:   "https://www.infoq.cn/article/9ishp2ykyqs7auwsd9if"},
-		{ModelName: "step-2-16k", DisplayName: "Step-2", SupplierName: "阶跃星辰", LaunchYearMonth: "2024-07", PopularityStars: 4, ModelType: "LLM",
-			Description: "万亿参数 MoE，C-Eval/CMMLU 国内权威榜单第一名",
+		{ModelName: "step-2-16k", DisplayName: "Step-2", SupplierName: "闃惰穬鏄熻景", LaunchYearMonth: "2024-07", PopularityStars: 4, ModelType: "LLM",
+			Description: "涓囦嚎鍙傛暟 MoE锛孋-Eval/CMMLU 鍥藉唴鏉冨▉姒滃崟绗竴鍚?",
 			SourceURL:   "https://platform.stepfun.com/docs/llm/text"},
-		{ModelName: "step-2-mini", DisplayName: "Step-2 Mini", SupplierName: "阶跃星辰", LaunchYearMonth: "2024-12", PopularityStars: 3, ModelType: "LLM",
-			Description: "Step-2 轻量版，MFA 注意力，低成本快速推理",
+		{ModelName: "step-2-mini", DisplayName: "Step-2 Mini", SupplierName: "闃惰穬鏄熻景", LaunchYearMonth: "2024-12", PopularityStars: 3, ModelType: "LLM",
+			Description: "Step-2 杞婚噺鐗堬紝MFA 娉ㄦ剰鍔涳紝浣庢垚鏈揩閫熸帹鐞?",
 			SourceURL:   "https://platform.stepfun.com/docs/llm/text"},
-		{ModelName: "step-1v-8k", DisplayName: "Step-1V", SupplierName: "阶跃星辰", LaunchYearMonth: "2024-04", PopularityStars: 3, ModelType: "VLM",
-			Description: "阶跃星辰多模态模型，图文理解，复杂图像分析与问答",
+		{ModelName: "step-1v-8k", DisplayName: "Step-1V", SupplierName: "闃惰穬鏄熻景", LaunchYearMonth: "2024-04", PopularityStars: 3, ModelType: "VLM",
+			Description: "闃惰穬鏄熻景澶氭ā鎬佹ā鍨嬶紝鍥炬枃鐞嗚В锛屽鏉傚浘鍍忓垎鏋愪笌闂瓟",
 			SourceURL:   "https://platform.stepfun.com/docs/llm/text"},
 
-		// ════════════════════════════════════════════════════════════
-		// 零一万物（Yi / 01.AI）
-		// ════════════════════════════════════════════════════════════
-		{ModelName: "yi-lightning", DisplayName: "Yi-Lightning", SupplierName: "零一万物", LaunchYearMonth: "2024-09", PopularityStars: 4, ModelType: "LLM",
-			Description: "零一万物极速旗舰，国内首次超越 GPT-4o，推理速度提升 50%",
+		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		// 闆朵竴涓囩墿锛圷i / 01.AI锛?		// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+		{ModelName: "yi-lightning", DisplayName: "Yi-Lightning", SupplierName: "闆朵竴涓囩墿", LaunchYearMonth: "2024-09", PopularityStars: 4, ModelType: "LLM",
+			Description: "闆朵竴涓囩墿鏋侀€熸棗鑸帮紝鍥藉唴棣栨瓒呰秺 GPT-4o锛屾帹鐞嗛€熷害鎻愬崌 50%",
 			SourceURL:   "https://platform.lingyiwanwu.com/docs"},
-		{ModelName: "yi-vision", DisplayName: "Yi-Vision", SupplierName: "零一万物", LaunchYearMonth: "2024-07", PopularityStars: 3, ModelType: "VLM",
-			Description: "零一万物视觉模型，图像理解与视觉问答，中文场景优化",
+		{ModelName: "yi-vision", DisplayName: "Yi-Vision", SupplierName: "闆朵竴涓囩墿", LaunchYearMonth: "2024-07", PopularityStars: 3, ModelType: "VLM",
+			Description: "闆朵竴涓囩墿瑙嗚妯″瀷锛屽浘鍍忕悊瑙ｄ笌瑙嗚闂瓟锛屼腑鏂囧満鏅紭鍖?",
 			SourceURL:   "https://platform.lingyiwanwu.com/docs"},
-		{ModelName: "yi-large", DisplayName: "Yi-Large", SupplierName: "零一万物", LaunchYearMonth: "2024-05", PopularityStars: 3, ModelType: "LLM",
-			Description: "零一万物大规模商业模型，200K 上下文，中英双语能力均衡",
+		{ModelName: "yi-large", DisplayName: "Yi-Large", SupplierName: "闆朵竴涓囩墿", LaunchYearMonth: "2024-05", PopularityStars: 3, ModelType: "LLM",
+			Description: "闆朵竴涓囩墿澶ц妯″晢涓氭ā鍨嬶紝200K 涓婁笅鏂囷紝涓嫳鍙岃鑳藉姏鍧囪　",
 			SourceURL:   "https://platform.lingyiwanwu.com/docs"},
 	}
 

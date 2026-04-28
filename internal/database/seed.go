@@ -500,7 +500,9 @@ func seedAdminUser(tx *gorm.DB) error {
 
 	var existing model.User
 	if err := tx.Where("email = ?", adminEmail).First(&existing).Error; err == nil {
-		return ensureDefaultAdminPasswordHash(tx, &existing, adminPass)
+		// 严格幂等: admin 已存在则不做任何修改 (含密码 hash)
+		// 修改 admin 密码请走 cmd/hashpwd + 直写 DB 的方式 (见 CLAUDE.md 紧急重置命令)
+		return nil
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return fmt.Errorf("check admin: %w", err)
 	}
@@ -541,27 +543,12 @@ func seedAdminUser(tx *gorm.DB) error {
 	return nil
 }
 
+// clientPasswordHash 计算前端登录时发送的双层哈希算法的内层 SHA256(password + lowerEmail)。
+// 用于 seed 时为 admin 写入正确格式的初始 password_hash。
+// 详见 CLAUDE.md 顶部《管理员账号固定公约》。
 func clientPasswordHash(email, password string) string {
 	sum := sha256.Sum256([]byte(password + strings.ToLower(strings.TrimSpace(email))))
 	return fmt.Sprintf("%x", sum)
-}
-
-func ensureDefaultAdminPasswordHash(db *gorm.DB, user *model.User, defaultPassword string) error {
-	clientHash := clientPasswordHash(user.Email, defaultPassword)
-	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(clientHash)) == nil {
-		return nil
-	}
-	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(defaultPassword)) != nil {
-		return nil
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(clientHash), 12)
-	if err != nil {
-		return fmt.Errorf("hash default admin client password: %w", err)
-	}
-	if err := db.Model(&model.User{}).Where("id = ?", user.ID).Update("password_hash", string(hash)).Error; err != nil {
-		return fmt.Errorf("migrate default admin password hash: %w", err)
-	}
-	return nil
 }
 
 // ---------- payment config ----------

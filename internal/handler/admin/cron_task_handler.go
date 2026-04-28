@@ -2,10 +2,12 @@ package admin
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
 	"tokenhub-server/internal/cron"
+	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 )
 
@@ -22,6 +24,8 @@ func NewCronTaskHandler(scheduler *cron.Scheduler) *CronTaskHandler {
 // Register 注册路由
 func (h *CronTaskHandler) Register(rg *gin.RouterGroup) {
 	rg.GET("/cron-tasks", h.ListTasks)
+	rg.GET("/cron-task-runs", h.ListRuns)
+	rg.GET("/cron-tasks/:name/runs", h.ListRuns)
 	rg.PUT("/cron-tasks/:name/toggle", h.ToggleTask)
 	rg.PUT("/cron-tasks/batch-toggle", h.BatchToggle)
 }
@@ -29,8 +33,39 @@ func (h *CronTaskHandler) Register(rg *gin.RouterGroup) {
 // ListTasks 获取所有定时任务列表
 // GET /api/v1/admin/cron-tasks
 func (h *CronTaskHandler) ListTasks(c *gin.Context) {
-	tasks := h.scheduler.GetTasks()
-	response.Success(c, tasks)
+	pageRaw := c.Query("page")
+	pageSizeRaw := c.Query("page_size")
+	search := c.Query("search")
+	if pageRaw == "" && pageSizeRaw == "" && search == "" {
+		tasks := h.scheduler.GetTasks()
+		response.Success(c, tasks)
+		return
+	}
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	tasks, total := h.scheduler.ListTasks(search, page, pageSize)
+	response.PageResult(c, tasks, total, page, pageSize)
+}
+
+// ListRuns 获取定时任务运行历史。
+// GET /api/v1/admin/cron-task-runs
+// GET /api/v1/admin/cron-tasks/:name/runs
+func (h *CronTaskHandler) ListRuns(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		name = c.Query("task_name")
+	}
+	status := c.Query("status")
+	search := c.Query("search")
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	runs, total, err := h.scheduler.ListTaskRuns(name, status, search, page, pageSize)
+	if err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	response.PageResult(c, runs, total, page, pageSize)
 }
 
 // toggleReq 启停请求体

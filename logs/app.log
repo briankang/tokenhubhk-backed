@@ -2,3 +2,125 @@
 {"level":"info","ts":"2026-04-24T13:57:58.953Z","caller":"seed-wangsu-image/main.go:35","msg":"seed-wangsu-image complete","database":"tokenhubhk"}
 {"level":"info","ts":"2026-04-24T14:02:56.778Z","caller":"database/seed_wangsu_video.go:137","msg":"seed_wangsu_video: complete","created":5,"updated":0,"total":5}
 {"level":"info","ts":"2026-04-24T14:02:56.783Z","caller":"seed-wangsu-video/main.go:35","msg":"seed-wangsu-video complete","database":"tokenhubhk"}
+{"level":"info","ts":"2026-04-26T02:50:35.531Z","caller":"database/database.go:26","msg":"database: starting init","host":"tokenhubhk.mysql.polardb.rds.aliyuncs.com","port":3306,"user":"tokenhubadmin","dbname":"tokenhubhk"}
+{"level":"info","ts":"2026-04-26T02:50:35.539Z","caller":"database/database.go:26","msg":"database: tcp preflight","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306"}
+{"level":"info","ts":"2026-04-26T02:50:35.598Z","caller":"database/database.go:26","msg":"database: tcp preflight OK","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306","cost":58}
+{"level":"info","ts":"2026-04-26T02:50:35.598Z","caller":"database/database.go:26","msg":"database: gorm.Open"}
+{"level":"info","ts":"2026-04-26T02:50:35.690Z","caller":"database/database.go:26","msg":"database: gorm.Open OK"}
+{"level":"info","ts":"2026-04-26T02:50:35.690Z","caller":"database/database.go:26","msg":"database: ping (auth check)"}
+{"level":"info","ts":"2026-04-26T02:50:35.706Z","caller":"database/database.go:26","msg":"database: ping OK"}
+{"level":"info","ts":"2026-04-26T02:50:35.721Z","caller":"database/database.go:26","msg":"database: connected","max_open":100,"max_idle":10,"conn_max_idle_time_sec":300}
+{"level":"info","ts":"2026-04-26T02:50:35.840Z","caller":"database/database.go:26","msg":"database: schema version OK","version":"v5.1.0"}
+{"level":"info","ts":"2026-04-26T02:50:44.188Z","caller":"database/seed_docs.go:192","msg":"seed_docs: 开始同步用户文档"}
+{"level":"info","ts":"2026-04-26T02:50:46.252Z","caller":"database/seed_docs.go:210","msg":"seed_docs: 用户文档同步完成","articles":16}
+{"level":"info","ts":"2026-04-26T02:51:40.710Z","caller":"database/database.go:26","msg":"database: starting init","host":"tokenhubhk.mysql.polardb.rds.aliyuncs.com","port":3306,"user":"tokenhubadmin","dbname":"tokenhubhk"}
+{"level":"info","ts":"2026-04-26T02:51:40.712Z","caller":"database/database.go:26","msg":"database: tcp preflight","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306"}
+{"level":"info","ts":"2026-04-26T02:51:40.735Z","caller":"database/database.go:26","msg":"database: tcp preflight OK","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306","cost":22}
+{"level":"info","ts":"2026-04-26T02:51:40.736Z","caller":"database/database.go:26","msg":"database: gorm.Open"}
+{"level":"info","ts":"2026-04-26T02:51:40.817Z","caller":"database/database.go:26","msg":"database: gorm.Open OK"}
+{"level":"info","ts":"2026-04-26T02:51:40.818Z","caller":"database/database.go:26","msg":"database: ping (auth check)"}
+{"level":"info","ts":"2026-04-26T02:51:40.832Z","caller":"database/database.go:26","msg":"database: ping OK"}
+{"level":"info","ts":"2026-04-26T02:51:40.846Z","caller":"database/database.go:26","msg":"database: connected","max_open":100,"max_idle":10,"conn_max_idle_time_sec":300}
+{"level":"info","ts":"2026-04-26T02:51:40.951Z","caller":"database/database.go:26","msg":"database: schema version OK","version":"v5.1.0"}
+{"level":"info","ts":"2026-04-26T02:51:48.814Z","caller":"database/seed_docs.go:192","msg":"seed_docs: 开始同步用户文档"}
+{"level":"info","ts":"2026-04-26T02:51:50.699Z","caller":"database/seed_docs.go:210","msg":"seed_docs: 用户文档同步完成","articles":16}
+{"level":"info","ts":"2026-04-26T03:08:22.262Z","caller":"database/database.go:26","msg":"database: starting init","host":"tokenhubhk.mysql.polardb.rds.aliyuncs.com","port":3306,"user":"tokenhubadmin","dbname":"tokenhubhk"}
+{"level":"info","ts":"2026-04-26T03:08:22.265Z","caller":"database/database.go:26","msg":"database: tcp preflight","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306"}
+{"level":"info","ts":"2026-04-26T03:08:22.304Z","caller":"database/database.go:26","msg":"database: tcp preflight OK","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306","cost":38}
+{"level":"info","ts":"2026-04-26T03:08:22.304Z","caller":"database/database.go:26","msg":"database: gorm.Open"}
+{"level":"info","ts":"2026-04-26T03:08:22.390Z","caller":"database/database.go:26","msg":"database: gorm.Open OK"}
+{"level":"info","ts":"2026-04-26T03:08:22.391Z","caller":"database/database.go:26","msg":"database: ping (auth check)"}
+{"level":"info","ts":"2026-04-26T03:08:22.404Z","caller":"database/database.go:26","msg":"database: ping OK"}
+{"level":"info","ts":"2026-04-26T03:08:22.419Z","caller":"database/database.go:26","msg":"database: connected","max_open":100,"max_idle":10,"conn_max_idle_time_sec":300}
+{"level":"info","ts":"2026-04-26T03:08:22.537Z","caller":"database/database.go:26","msg":"database: schema version OK","version":"v5.1.0"}
+{"level":"info","ts":"2026-04-26T03:08:31.221Z","caller":"database/seed_docs.go:212","msg":"seed_docs: 开始同步用户文档"}
+{"level":"error","ts":"2026-04-26T03:08:33.474Z","caller":"database/seed_docs.go:226","msg":"seed_docs: 用户文档同步失败","error":"articles: create article quick-start: Error 1062 (23000): Duplicate entry 'quick-start' for key 'idx_doc_articles_slug'","stacktrace":"tokenhub-server/internal/database.RunSeedDocs\n\t/app/internal/database/seed_docs.go:226\nmain.main\n\t/app/cmd/sync-user-docs/main.go:40\nruntime.main\n\t/usr/local/go/src/runtime/proc.go:272"}
+{"level":"info","ts":"2026-04-26T03:09:39.629Z","caller":"database/database.go:26","msg":"database: starting init","host":"tokenhubhk.mysql.polardb.rds.aliyuncs.com","port":3306,"user":"tokenhubadmin","dbname":"tokenhubhk"}
+{"level":"info","ts":"2026-04-26T03:09:39.631Z","caller":"database/database.go:26","msg":"database: tcp preflight","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306"}
+{"level":"info","ts":"2026-04-26T03:09:39.669Z","caller":"database/database.go:26","msg":"database: tcp preflight OK","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306","cost":37}
+{"level":"info","ts":"2026-04-26T03:09:39.669Z","caller":"database/database.go:26","msg":"database: gorm.Open"}
+{"level":"info","ts":"2026-04-26T03:09:39.765Z","caller":"database/database.go:26","msg":"database: gorm.Open OK"}
+{"level":"info","ts":"2026-04-26T03:09:39.765Z","caller":"database/database.go:26","msg":"database: ping (auth check)"}
+{"level":"info","ts":"2026-04-26T03:09:39.780Z","caller":"database/database.go:26","msg":"database: ping OK"}
+{"level":"info","ts":"2026-04-26T03:09:39.796Z","caller":"database/database.go:26","msg":"database: connected","max_open":100,"max_idle":10,"conn_max_idle_time_sec":300}
+{"level":"info","ts":"2026-04-26T03:09:39.921Z","caller":"database/database.go:26","msg":"database: schema version OK","version":"v5.1.0"}
+{"level":"info","ts":"2026-04-26T03:09:50.411Z","caller":"database/seed_docs.go:212","msg":"seed_docs: 开始同步用户文档"}
+{"level":"info","ts":"2026-04-26T03:09:55.532Z","caller":"database/seed_docs.go:235","msg":"seed_docs: 用户文档同步完成","articles":32}
+{"level":"info","ts":"2026-04-26T03:12:43.511Z","caller":"database/database.go:26","msg":"database: starting init","host":"tokenhubhk.mysql.polardb.rds.aliyuncs.com","port":3306,"user":"tokenhubadmin","dbname":"tokenhubhk"}
+{"level":"info","ts":"2026-04-26T03:12:43.512Z","caller":"database/database.go:26","msg":"database: tcp preflight","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306"}
+{"level":"info","ts":"2026-04-26T03:12:43.538Z","caller":"database/database.go:26","msg":"database: tcp preflight OK","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306","cost":25}
+{"level":"info","ts":"2026-04-26T03:12:43.539Z","caller":"database/database.go:26","msg":"database: gorm.Open"}
+{"level":"info","ts":"2026-04-26T03:12:43.654Z","caller":"database/database.go:26","msg":"database: gorm.Open OK"}
+{"level":"info","ts":"2026-04-26T03:12:43.654Z","caller":"database/database.go:26","msg":"database: ping (auth check)"}
+{"level":"info","ts":"2026-04-26T03:12:43.668Z","caller":"database/database.go:26","msg":"database: ping OK"}
+{"level":"info","ts":"2026-04-26T03:12:43.682Z","caller":"database/database.go:26","msg":"database: connected","max_open":100,"max_idle":10,"conn_max_idle_time_sec":300}
+{"level":"info","ts":"2026-04-26T03:12:43.791Z","caller":"database/database.go:26","msg":"database: schema version OK","version":"v5.1.0"}
+{"level":"info","ts":"2026-04-26T03:12:51.915Z","caller":"database/seed_docs.go:212","msg":"seed_docs: 开始同步用户文档"}
+{"level":"info","ts":"2026-04-26T03:12:56.174Z","caller":"database/seed_docs.go:235","msg":"seed_docs: 用户文档同步完成","articles":32}
+{"level":"info","ts":"2026-04-26T03:26:14.696Z","caller":"database/database.go:26","msg":"database: starting init","host":"tokenhubhk.mysql.polardb.rds.aliyuncs.com","port":3306,"user":"tokenhubadmin","dbname":"tokenhubhk"}
+{"level":"info","ts":"2026-04-26T03:26:14.699Z","caller":"database/database.go:26","msg":"database: tcp preflight","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306"}
+{"level":"info","ts":"2026-04-26T03:26:14.720Z","caller":"database/database.go:26","msg":"database: tcp preflight OK","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306","cost":21}
+{"level":"info","ts":"2026-04-26T03:26:14.720Z","caller":"database/database.go:26","msg":"database: gorm.Open"}
+{"level":"info","ts":"2026-04-26T03:26:14.815Z","caller":"database/database.go:26","msg":"database: gorm.Open OK"}
+{"level":"info","ts":"2026-04-26T03:26:14.816Z","caller":"database/database.go:26","msg":"database: ping (auth check)"}
+{"level":"info","ts":"2026-04-26T03:26:14.830Z","caller":"database/database.go:26","msg":"database: ping OK"}
+{"level":"info","ts":"2026-04-26T03:26:14.845Z","caller":"database/database.go:26","msg":"database: connected","max_open":100,"max_idle":10,"conn_max_idle_time_sec":300}
+{"level":"info","ts":"2026-04-26T03:26:14.960Z","caller":"database/database.go:26","msg":"database: schema version OK","version":"v5.1.0"}
+{"level":"info","ts":"2026-04-26T03:26:23.999Z","caller":"database/seed_docs.go:212","msg":"seed_docs: 开始同步用户文档"}
+{"level":"info","ts":"2026-04-26T03:26:28.926Z","caller":"database/seed_docs.go:235","msg":"seed_docs: 用户文档同步完成","articles":32}
+{"level":"info","ts":"2026-04-26T03:37:50.251Z","caller":"database/database.go:26","msg":"database: starting init","host":"tokenhubhk.mysql.polardb.rds.aliyuncs.com","port":3306,"user":"tokenhubadmin","dbname":"tokenhubhk"}
+{"level":"info","ts":"2026-04-26T03:37:50.254Z","caller":"database/database.go:26","msg":"database: tcp preflight","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306"}
+{"level":"info","ts":"2026-04-26T03:37:50.288Z","caller":"database/database.go:26","msg":"database: tcp preflight OK","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306","cost":33}
+{"level":"info","ts":"2026-04-26T03:37:50.288Z","caller":"database/database.go:26","msg":"database: gorm.Open"}
+{"level":"info","ts":"2026-04-26T03:37:50.373Z","caller":"database/database.go:26","msg":"database: gorm.Open OK"}
+{"level":"info","ts":"2026-04-26T03:37:50.374Z","caller":"database/database.go:26","msg":"database: ping (auth check)"}
+{"level":"info","ts":"2026-04-26T03:37:50.388Z","caller":"database/database.go:26","msg":"database: ping OK"}
+{"level":"info","ts":"2026-04-26T03:37:50.402Z","caller":"database/database.go:26","msg":"database: connected","max_open":100,"max_idle":10,"conn_max_idle_time_sec":300}
+{"level":"info","ts":"2026-04-26T03:37:50.511Z","caller":"database/database.go:26","msg":"database: schema version OK","version":"v5.1.0"}
+{"level":"info","ts":"2026-04-26T03:37:58.559Z","caller":"database/seed_docs.go:212","msg":"seed_docs: 开始同步用户文档"}
+{"level":"info","ts":"2026-04-26T03:38:02.044Z","caller":"database/seed_docs.go:235","msg":"seed_docs: 用户文档同步完成","articles":32}
+{"level":"info","ts":"2026-04-26T03:41:50.089Z","caller":"database/database.go:26","msg":"database: starting init","host":"tokenhubhk.mysql.polardb.rds.aliyuncs.com","port":3306,"user":"tokenhubadmin","dbname":"tokenhubhk"}
+{"level":"info","ts":"2026-04-26T03:41:50.091Z","caller":"database/database.go:26","msg":"database: tcp preflight","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306"}
+{"level":"info","ts":"2026-04-26T03:41:50.095Z","caller":"database/database.go:26","msg":"database: tcp preflight OK","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306","cost":3}
+{"level":"info","ts":"2026-04-26T03:41:50.096Z","caller":"database/database.go:26","msg":"database: gorm.Open"}
+{"level":"info","ts":"2026-04-26T03:41:50.180Z","caller":"database/database.go:26","msg":"database: gorm.Open OK"}
+{"level":"info","ts":"2026-04-26T03:41:50.181Z","caller":"database/database.go:26","msg":"database: ping (auth check)"}
+{"level":"info","ts":"2026-04-26T03:41:50.195Z","caller":"database/database.go:26","msg":"database: ping OK"}
+{"level":"info","ts":"2026-04-26T03:41:50.209Z","caller":"database/database.go:26","msg":"database: connected","max_open":100,"max_idle":10,"conn_max_idle_time_sec":300}
+{"level":"info","ts":"2026-04-26T03:41:50.329Z","caller":"database/database.go:26","msg":"database: schema version OK","version":"v5.1.0"}
+{"level":"info","ts":"2026-04-26T03:41:58.530Z","caller":"database/seed_docs.go:212","msg":"seed_docs: 开始同步用户文档"}
+{"level":"info","ts":"2026-04-26T03:42:01.992Z","caller":"database/seed_docs.go:235","msg":"seed_docs: 用户文档同步完成","articles":32}
+{"level":"info","ts":"2026-04-26T03:54:06.207Z","caller":"database/database.go:26","msg":"database: starting init","host":"tokenhubhk.mysql.polardb.rds.aliyuncs.com","port":3306,"user":"tokenhubadmin","dbname":"tokenhubhk"}
+{"level":"info","ts":"2026-04-26T03:54:06.211Z","caller":"database/database.go:26","msg":"database: tcp preflight","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306"}
+{"level":"info","ts":"2026-04-26T03:54:06.259Z","caller":"database/database.go:26","msg":"database: tcp preflight OK","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306","cost":47}
+{"level":"info","ts":"2026-04-26T03:54:06.260Z","caller":"database/database.go:26","msg":"database: gorm.Open"}
+{"level":"info","ts":"2026-04-26T03:54:06.350Z","caller":"database/database.go:26","msg":"database: gorm.Open OK"}
+{"level":"info","ts":"2026-04-26T03:54:06.350Z","caller":"database/database.go:26","msg":"database: ping (auth check)"}
+{"level":"info","ts":"2026-04-26T03:54:06.364Z","caller":"database/database.go:26","msg":"database: ping OK"}
+{"level":"info","ts":"2026-04-26T03:54:06.377Z","caller":"database/database.go:26","msg":"database: connected","max_open":100,"max_idle":10,"conn_max_idle_time_sec":300}
+{"level":"info","ts":"2026-04-26T03:54:06.494Z","caller":"database/database.go:26","msg":"database: schema version OK","version":"v5.1.0"}
+{"level":"info","ts":"2026-04-26T03:54:15.165Z","caller":"database/seed_docs.go:212","msg":"seed_docs: 开始同步用户文档"}
+{"level":"info","ts":"2026-04-26T03:54:18.754Z","caller":"database/seed_docs.go:235","msg":"seed_docs: 用户文档同步完成","articles":32}
+{"level":"info","ts":"2026-04-26T07:21:36.539Z","caller":"database/database.go:26","msg":"database: starting init","host":"tokenhubhk.mysql.polardb.rds.aliyuncs.com","port":3306,"user":"tokenhubadmin","dbname":"tokenhubhk"}
+{"level":"info","ts":"2026-04-26T07:21:36.551Z","caller":"database/database.go:26","msg":"database: tcp preflight","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306"}
+{"level":"info","ts":"2026-04-26T07:21:36.641Z","caller":"database/database.go:26","msg":"database: tcp preflight OK","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306","cost":89}
+{"level":"info","ts":"2026-04-26T07:21:36.643Z","caller":"database/database.go:26","msg":"database: gorm.Open"}
+{"level":"info","ts":"2026-04-26T07:21:36.740Z","caller":"database/database.go:26","msg":"database: gorm.Open OK"}
+{"level":"info","ts":"2026-04-26T07:21:36.741Z","caller":"database/database.go:26","msg":"database: ping (auth check)"}
+{"level":"info","ts":"2026-04-26T07:21:36.756Z","caller":"database/database.go:26","msg":"database: ping OK"}
+{"level":"info","ts":"2026-04-26T07:21:36.772Z","caller":"database/database.go:26","msg":"database: connected","max_open":100,"max_idle":10,"conn_max_idle_time_sec":300}
+{"level":"info","ts":"2026-04-26T07:21:36.878Z","caller":"database/database.go:26","msg":"database: schema version OK","version":"v5.1.0"}
+{"level":"info","ts":"2026-04-26T07:21:48.148Z","caller":"database/seed_docs.go:212","msg":"seed_docs: 开始同步用户文档"}
+{"level":"info","ts":"2026-04-26T07:21:51.840Z","caller":"database/seed_docs.go:235","msg":"seed_docs: 用户文档同步完成","articles":32}
+{"level":"warn","ts":"2026-04-26T07:21:52.257Z","caller":"database/seed_model_api_docs.go:41","msg":"seed model api docs failed","error":"update model api doc aliyun-dashscope-qwen-plus: Error 1054 (42S22): Unknown column 'faqs' in 'field list'"}
+{"level":"info","ts":"2026-04-26T07:25:49.341Z","caller":"database/database.go:26","msg":"database: starting init","host":"tokenhubhk.mysql.polardb.rds.aliyuncs.com","port":3306,"user":"tokenhubadmin","dbname":"tokenhubhk"}
+{"level":"info","ts":"2026-04-26T07:25:49.343Z","caller":"database/database.go:26","msg":"database: tcp preflight","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306"}
+{"level":"info","ts":"2026-04-26T07:25:49.390Z","caller":"database/database.go:26","msg":"database: tcp preflight OK","addr":"tokenhubhk.mysql.polardb.rds.aliyuncs.com:3306","cost":47}
+{"level":"info","ts":"2026-04-26T07:25:49.393Z","caller":"database/database.go:26","msg":"database: gorm.Open"}
+{"level":"info","ts":"2026-04-26T07:25:49.499Z","caller":"database/database.go:26","msg":"database: gorm.Open OK"}
+{"level":"info","ts":"2026-04-26T07:25:49.499Z","caller":"database/database.go:26","msg":"database: ping (auth check)"}
+{"level":"info","ts":"2026-04-26T07:25:49.516Z","caller":"database/database.go:26","msg":"database: ping OK"}
+{"level":"info","ts":"2026-04-26T07:25:49.532Z","caller":"database/database.go:26","msg":"database: connected","max_open":100,"max_idle":10,"conn_max_idle_time_sec":300}
+{"level":"info","ts":"2026-04-26T07:25:49.672Z","caller":"database/database.go:26","msg":"database: schema version OK","version":"v5.1.0"}
+{"level":"info","ts":"2026-04-26T07:26:02.680Z","caller":"database/seed_docs.go:212","msg":"seed_docs: 开始同步用户文档"}
+{"level":"info","ts":"2026-04-26T07:26:08.696Z","caller":"database/seed_docs.go:235","msg":"seed_docs: 用户文档同步完成","articles":32}

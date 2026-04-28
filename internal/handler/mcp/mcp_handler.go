@@ -35,11 +35,11 @@ type MCPHandler struct {
 
 // SSESession SSE 长连接会话
 type SSESession struct {
-	ID       string          // 会话唯一标识
-	UserID   uint            // 认证用户 ID
-	Messages chan []byte     // 消息发送通道
-	Done     chan struct{}   // 关闭信号
-	Created  time.Time       // 创建时间
+	ID       string        // 会话唯一标识
+	UserID   uint          // 认证用户 ID
+	Messages chan []byte   // 消息发送通道
+	Done     chan struct{} // 关闭信号
+	Created  time.Time     // 创建时间
 }
 
 // NewMCPHandler 创建 MCP HTTP 处理器实例
@@ -53,9 +53,41 @@ func NewMCPHandler(server *mcp.MCPServer, db *gorm.DB) *MCPHandler {
 
 // Register 注册 MCP 路由到路由组
 func (h *MCPHandler) Register(rg *gin.RouterGroup) {
+	rg.POST("", h.StreamableHTTP)
+	rg.GET("", h.StreamableHTTPGet)
 	rg.GET("/sse", h.SSE)
 	rg.POST("/message", h.Message)
 	rg.GET("/manifest", h.Manifest)
+}
+
+// StreamableHTTP 处理新版 MCP Streamable HTTP 传输。
+// POST /api/v1/mcp 使用 Authorization: Bearer <api_key> 认证，响应直接返回 JSON-RPC。
+func (h *MCPHandler) StreamableHTTP(c *gin.Context) {
+	userID, err := h.authenticateMCP(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized", "message": err.Error()})
+		return
+	}
+
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+		return
+	}
+	if !hasJSONRPCRequest(body) {
+		c.Status(http.StatusAccepted)
+		return
+	}
+
+	c.Header("Content-Type", "application/json")
+	c.JSON(http.StatusOK, h.server.HandleMessage(body, userID))
+}
+
+// StreamableHTTPGet 明确声明当前新版 HTTP 入口不提供独立 SSE 监听流。
+// MCP SDK 会把 405 视为可接受的无监听流模式，并继续通过 POST 收发请求。
+func (h *MCPHandler) StreamableHTTPGet(c *gin.Context) {
+	c.Header("Allow", "POST")
+	c.Status(http.StatusMethodNotAllowed)
 }
 
 // ─── SSE 传输端点 ──────────────────────────────────────────
@@ -198,16 +230,46 @@ func (h *MCPHandler) Manifest(c *gin.Context) {
 		"name":        "TokenHub MCP Server",
 		"version":     "1.0.0",
 		"description": "TokenHub AI 平台 MCP 协议服务端，提供模型调用、余额查询、API Key 管理等能力",
-		"protocol":    "MCP/2024-11-05",
+		"protocol":    "MCP/2025-03-26",
 		"transport": gin.H{
+			"streamable_http": gin.H{
+				"endpoint": "/api/v1/mcp",
+			},
 			"sse": gin.H{
 				"endpoint": "/api/v1/mcp/sse",
 				"message":  "/api/v1/mcp/message",
+				"legacy":   true,
 			},
 		},
 		"tools":     h.server.GetToolsList(),
 		"resources": h.server.GetResourcesList(),
 	})
+}
+
+func hasJSONRPCRequest(raw []byte) bool {
+	var one map[string]interface{}
+	if err := json.Unmarshal(raw, &one); err == nil {
+		return jsonRPCObjectHasRequestID(one)
+	}
+
+	var many []map[string]interface{}
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return true
+	}
+	for _, item := range many {
+		if jsonRPCObjectHasRequestID(item) {
+			return true
+		}
+	}
+	return false
+}
+
+func jsonRPCObjectHasRequestID(obj map[string]interface{}) bool {
+	if _, hasMethod := obj["method"]; !hasMethod {
+		return false
+	}
+	_, hasID := obj["id"]
+	return hasID
 }
 
 // ─── 认证辅助函数 ──────────────────────────────────────────

@@ -5,10 +5,16 @@
 package v1
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/url"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -67,6 +73,7 @@ func NewVideosHandler(
 // Register 注册路由
 func (h *VideosHandler) Register(rg *gin.RouterGroup) {
 	rg.POST("/videos/generations", h.GenerateVideos)
+	rg.POST("/videos/uploads", h.UploadVideo)
 	rg.GET("/videos/tasks/:task_id", h.GetVideoTask)
 }
 
@@ -75,10 +82,14 @@ type videoGenerationRequest struct {
 	Model          string `json:"model" binding:"required"`
 	Prompt         string `json:"prompt" binding:"required"`
 	ImageURL       string `json:"image_url,omitempty"`    // 图生视频
+	VideoURL       string `json:"video_url,omitempty"`    // 视频输入
 	Duration       int    `json:"duration,omitempty"`     // 秒数
 	Resolution     string `json:"resolution,omitempty"`   // 720P/1080P
 	AspectRatio    string `json:"aspect_ratio,omitempty"` // 16:9
 	FPS            int    `json:"fps,omitempty"`
+	GenerateAudio  *bool  `json:"generate_audio,omitempty"` // Seedance 1.5 Pro: true=有声, false=无声
+	ServiceTier    string `json:"service_tier,omitempty"`   // default=在线推理, flex=离线推理
+	Draft          *bool  `json:"draft,omitempty"`          // Seedance 1.5 Pro 样片模式
 	NegativePrompt string `json:"negative_prompt,omitempty"`
 	Seed           int64  `json:"seed,omitempty"`
 }
@@ -110,8 +121,9 @@ func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 	var rawMap map[string]json.RawMessage
 	_ = json.Unmarshal(rawBody, &rawMap)
 	standardFields := map[string]bool{
-		"model": true, "prompt": true, "image_url": true, "duration": true,
+		"model": true, "prompt": true, "image_url": true, "video_url": true, "duration": true,
 		"resolution": true, "aspect_ratio": true, "fps": true,
+		"generate_audio": true, "service_tier": true, "draft": true,
 		"negative_prompt": true, "seed": true,
 	}
 	userExtra := make(map[string]interface{})
@@ -137,6 +149,15 @@ func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 		estimatedDurationSec = 1
 	}
 	estimatedVideoTokens := int(estimatedDurationSec*1280*720*24/1024 + 0.999)
+	if req.VideoURL != "" && isSeedanceVideoModel(req.Model) {
+		if minTokens := seedanceInputVideoMinTokens(req.Resolution); estimatedVideoTokens < minTokens {
+			estimatedVideoTokens = minTokens
+		}
+	}
+	// S3 + S4 (2026-04-28): 使用业务维度透传到计费层（不再走 token-scale 黑魔法）
+	// PriceTier.DimValues 阶梯（resolution × input_has_video × inference_mode × audio_mode）
+	// 由 selectPriceForTokens 直接命中正确单价档；token 数量保持基础公式不变
+	estimateDims := buildVideoDimensions(req)
 	freezeID := ""
 	if h.billingSvc != nil {
 		freeze, fErr := h.billingSvc.FreezeUnitUsage(c.Request.Context(), billingsvc.UnitUsageRequest{
@@ -148,6 +169,8 @@ func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 				ImageCount:   estimatedVideoCount,
 				DurationSec:  estimatedDurationSec,
 				OutputTokens: estimatedVideoTokens,
+				Variant:      req.Resolution, // F3：wan2.7-t2v 等 per_second 路径仍用 Variant 兜底
+				Dimensions:   estimateDims,
 			},
 		})
 		if fErr != nil {
@@ -210,6 +233,7 @@ func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 				extra[k] = v
 			}
 		}
+		extra = applyVideoRequestExtraParams(extra, &req)
 		if h.paramSvc != nil && ch != nil && len(extra) > 0 {
 			code := ch.Supplier.Code
 			if code == "" {
@@ -227,10 +251,14 @@ func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 			Model:          actualModel,
 			Prompt:         req.Prompt,
 			ImageURL:       req.ImageURL,
+			VideoURL:       req.VideoURL,
 			Duration:       req.Duration,
 			Resolution:     req.Resolution,
 			AspectRatio:    req.AspectRatio,
 			FPS:            req.FPS,
+			GenerateAudio:  req.GenerateAudio,
+			ServiceTier:    req.ServiceTier,
+			Draft:          req.Draft,
 			NegativePrompt: req.NegativePrompt,
 			Seed:           req.Seed,
 			Extra:          extra,
@@ -262,10 +290,19 @@ func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 			totalDurationSec = float64(req.Duration * videoCount)
 		}
 		actualVideoTokens := int(totalDurationSec*1280*720*24/1024 + 0.999)
+		if req.VideoURL != "" && isSeedanceVideoModel(req.Model) {
+			if minTokens := seedanceInputVideoMinTokens(req.Resolution); actualVideoTokens < minTokens {
+				actualVideoTokens = minTokens
+			}
+		}
+		// S3 + S4：实际扣费走 DimValues 阶梯，不再 scale tokens
+		actualDims := buildVideoDimensions(req)
 		costCredits, costRMB := h.calculateAndDeductCost(c, req.Model, keyInfo, pricing.UsageInput{
 			ImageCount:   videoCount,
 			DurationSec:  totalDurationSec,
 			OutputTokens: actualVideoTokens,
+			Variant:      req.Resolution,
+			Dimensions:   actualDims,
 		}, requestID, freezeID)
 		h.recordApiCallLog(c, keyInfo, ch, requestID, req.Model, actualModel, c.ClientIP(), int(latency), 200, costCredits, costRMB, rawBody, videoCount, totalDurationSec)
 
@@ -302,6 +339,233 @@ func (h *VideosHandler) GenerateVideos(c *gin.Context) {
 		"error":      gin.H{"message": msg, "type": "server_error"},
 		"request_id": requestID,
 	})
+}
+
+func seedanceInputVideoMinTokens(resolution string) int {
+	switch strings.ToLower(resolution) {
+	case "480p", "480":
+		return 55000
+	case "1080p", "1080":
+		return 265882
+	default:
+		return 118260
+	}
+}
+
+func isSeedanceVideoModel(modelName string) bool {
+	return strings.Contains(strings.ToLower(modelName), "seedance")
+}
+
+// seedanceBillingOptions, applySeedanceBillingTokenScale, seedanceBillingPriceScale (RIP)
+//
+// 这些函数已被 buildVideoDimensions（下方）替代。整个 token-scale 黑魔法在
+// 2026-04-28 随 S4 数据迁移上线一起退役 —— PriceTier.DimValues 阶梯由
+// pricing.selectPriceForTokens 直接命中正确单价档，无需缩放 token 数。
+//
+// 配套迁移：RunSeedanceDimValuesMigration 已把 DB 中所有 Seedance 模型的 PriceTiers
+// 重写为 DimValues 形态。
+
+// buildVideoDimensions 把 videoGenerationRequest 翻译成 PriceTier.DimValues 匹配用的 dim map
+//
+// 设计（S3 + S4，2026-04-28）：
+//   - 取代 applySeedanceBillingTokenScale token-scale 黑魔法
+//   - 维度键统一：resolution / input_has_video / inference_mode / audio_mode
+//   - 不在此函数判断模型 family —— 计费层（selectPriceForTokens）按 PriceTier.DimValues
+//     精确命中即可（多余维度不影响匹配）
+//   - 所有维度都填，未来新模型若声明新维度（如 draft_mode/voice_kind）只需扩展此函数
+func buildVideoDimensions(req videoGenerationRequest) map[string]string {
+	dims := make(map[string]string, 4)
+
+	// resolution 归一化（用户传 "1080P"/"1080p"/"1080" 都视为 "1080p"）
+	res := strings.ToLower(strings.TrimSpace(req.Resolution))
+	switch {
+	case strings.Contains(res, "1080"):
+		dims[model.DimKeyResolution] = "1080p"
+	case strings.Contains(res, "720"):
+		dims[model.DimKeyResolution] = "720p"
+	case strings.Contains(res, "480"):
+		dims[model.DimKeyResolution] = "480p"
+	case res != "":
+		dims[model.DimKeyResolution] = res
+	}
+
+	// input_has_video：boolean → "true"/"false"
+	if req.VideoURL != "" {
+		dims[model.DimKeyInputHasVideo] = "true"
+	} else {
+		dims[model.DimKeyInputHasVideo] = "false"
+	}
+
+	// inference_mode：service_tier=flex → offline，否则 online
+	if strings.EqualFold(strings.TrimSpace(req.ServiceTier), "flex") {
+		dims[model.DimKeyInferenceMode] = "offline"
+	} else {
+		dims[model.DimKeyInferenceMode] = "online"
+	}
+
+	// audio_mode：generate_audio=false → silent，true 或未指定 → audio
+	if req.GenerateAudio != nil && !*req.GenerateAudio {
+		dims[model.DimKeyAudioMode] = "false"
+	} else {
+		dims[model.DimKeyAudioMode] = "true"
+	}
+
+	// draft_mode：仅当用户显式传 true 时设为 true（兼容 1.5 Pro 480p Draft 路径）
+	if req.Draft != nil && *req.Draft {
+		dims[model.DimKeyDraftMode] = "true"
+	} else {
+		dims[model.DimKeyDraftMode] = "false"
+	}
+
+	return dims
+}
+
+func applyVideoRequestExtraParams(extra map[string]interface{}, req *videoGenerationRequest) map[string]interface{} {
+	if req == nil {
+		return extra
+	}
+	if extra == nil {
+		extra = make(map[string]interface{})
+	}
+	if req.GenerateAudio != nil {
+		extra["generate_audio"] = *req.GenerateAudio
+	}
+	if strings.TrimSpace(req.ServiceTier) != "" {
+		extra["service_tier"] = strings.TrimSpace(req.ServiceTier)
+	}
+	if req.Draft != nil {
+		extra["draft"] = *req.Draft
+	}
+	return extra
+}
+
+
+const maxVideoUploadSize = 100 * 1024 * 1024
+
+var allowedVideoExt = map[string]bool{
+	".mp4": true, ".mov": true, ".webm": true, ".m4v": true, ".mpeg": true, ".mpg": true, ".avi": true, ".flv": true,
+}
+
+var allowedVideoMIME = map[string]bool{
+	"video/mp4": true, "video/quicktime": true, "video/webm": true, "video/mpeg": true, "video/x-msvideo": true, "video/x-flv": true, "application/octet-stream": true,
+}
+
+// UploadVideo 上传视频调试输入，返回可传给上游 video_url 的公开 URL。
+func (h *VideosHandler) UploadVideo(c *gin.Context) {
+	if keyInfo, err := h.authenticateAPIKey(c); err != nil || keyInfo == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}})
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxVideoUploadSize+1024)
+	fileHeader, err := c.FormFile("video")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "missing video file or file exceeds 100MB", "type": "invalid_request_error"}})
+		return
+	}
+	if fileHeader.Size <= 0 || fileHeader.Size > maxVideoUploadSize {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "video size must be between 1 byte and 100MB", "type": "invalid_request_error"}})
+		return
+	}
+	ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
+	if !allowedVideoExt[ext] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "only mp4/mov/webm/m4v/mpeg/avi/flv videos are supported", "type": "invalid_request_error"}})
+		return
+	}
+	contentType := fileHeader.Header.Get("Content-Type")
+	if contentType != "" && !allowedVideoMIME[contentType] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "unsupported Content-Type: " + contentType, "type": "invalid_request_error"}})
+		return
+	}
+
+	src, err := fileHeader.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": "open video failed", "type": "server_error"}})
+		return
+	}
+	defer src.Close()
+	data, err := io.ReadAll(src)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": "read video failed", "type": "server_error"}})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+	defer cancel()
+	if uploadURL, err := uploadVideoToCatbox(ctx, data, fileHeader.Filename); err == nil && uploadURL != "" {
+		c.JSON(http.StatusOK, gin.H{"url": uploadURL, "provider": "catbox"})
+		return
+	}
+	ctx2, cancel2 := context.WithTimeout(c.Request.Context(), 45*time.Second)
+	defer cancel2()
+	if uploadURL, err := uploadVideoTo0x0(ctx2, data, fileHeader.Filename); err == nil && uploadURL != "" {
+		c.JSON(http.StatusOK, gin.H{"url": uploadURL, "provider": "0x0.st"})
+		return
+	}
+	c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "video upload failed, please try again later", "type": "server_error"}})
+}
+
+func uploadVideoToCatbox(ctx context.Context, data []byte, filename string) (string, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	if err := w.WriteField("reqtype", "fileupload"); err != nil {
+		return "", err
+	}
+	fw, err := w.CreateFormFile("fileToUpload", filename)
+	if err != nil {
+		return "", err
+	}
+	if _, err := fw.Write(data); err != nil {
+		return "", err
+	}
+	if err := w.Close(); err != nil {
+		return "", err
+	}
+	return postVideoUpload(ctx, "https://catbox.moe/user/api.php", w.FormDataContentType(), &buf)
+}
+
+func uploadVideoTo0x0(ctx context.Context, data []byte, filename string) (string, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	fw, err := w.CreateFormFile("file", filename)
+	if err != nil {
+		return "", err
+	}
+	if _, err := fw.Write(data); err != nil {
+		return "", err
+	}
+	if err := w.Close(); err != nil {
+		return "", err
+	}
+	return postVideoUpload(ctx, "https://0x0.st", w.FormDataContentType(), &buf)
+}
+
+func postVideoUpload(ctx context.Context, endpoint, contentType string, body io.Reader) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("User-Agent", "TokenHubHK-VideoUploader/1.0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return "", err
+	}
+	text := strings.TrimSpace(string(raw))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("upload HTTP %d: %s", resp.StatusCode, text)
+	}
+	if !strings.HasPrefix(text, "https://") {
+		return "", fmt.Errorf("upload returned non-URL response: %s", text)
+	}
+	if _, err := url.ParseRequestURI(text); err != nil {
+		return "", err
+	}
+	return text, nil
 }
 
 // GetVideoTask handles GET /v1/videos/tasks/:task_id.

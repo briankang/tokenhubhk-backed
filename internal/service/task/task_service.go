@@ -223,10 +223,10 @@ func (s *TaskService) runModelSync(ctx context.Context, task *model.BackgroundTa
 	}
 
 	resp := map[string]interface{}{
-		"results":       result.Results,
-		"total":         result.Total,
-		"models_found":  totalFound,
-		"models_added":  totalAdded,
+		"results":      result.Results,
+		"total":        result.Total,
+		"models_found": totalFound,
+		"models_added": totalAdded,
 	}
 
 	// 增量检测新增模型
@@ -346,13 +346,21 @@ func (s *TaskService) GetTask(id uint) (*model.BackgroundTask, error) {
 
 // ListTasks 分页查询任务列表
 func (s *TaskService) ListTasks(taskType string, page, pageSize int) ([]model.BackgroundTask, int64, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
 	query := s.db.Model(&model.BackgroundTask{})
 	if taskType != "" {
 		query = query.Where("task_type = ?", taskType)
 	}
 
 	var total int64
-	query.Count(&total)
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
 
 	var tasks []model.BackgroundTask
 	offset := (page - 1) * pageSize

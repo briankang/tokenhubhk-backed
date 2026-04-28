@@ -200,13 +200,7 @@ func GetCustomBodyParams(ch *model.Channel) map[string]interface{} {
 	}
 
 	// 移除 headers 字段（已在 BuildProviderRequest 中处理）
-	delete(params, "headers")
-
-	if len(params) == 0 {
-		return nil
-	}
-
-	return params
+	return flattenCustomBodyParams(params)
 }
 
 // ProtocolInfo 返回协议的可读描述信息

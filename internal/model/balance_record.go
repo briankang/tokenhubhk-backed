@@ -11,6 +11,9 @@ type BalanceRecord struct {
 	AmountRMB      float64 `gorm:"type:decimal(16,4);default:0" json:"amountRmb"` // 变动等值人民币
 	BeforeBalance  int64   `gorm:"type:bigint" json:"beforeBalance"`              // 变动前余额（积分）
 	AfterBalance   int64   `gorm:"type:bigint" json:"afterBalance"`               // 变动后余额（积分）
+	AmountUnits        int64 `gorm:"type:bigint;default:0" json:"amountUnits"`        // 变动 billing_units
+	BeforeBalanceUnits int64 `gorm:"type:bigint;default:0" json:"beforeBalanceUnits"` // 变动前余额（billing_units）
+	AfterBalanceUnits  int64 `gorm:"type:bigint;default:0" json:"afterBalanceUnits"`  // 变动后余额（billing_units）
 	Remark         string  `gorm:"size:200" json:"remark"`
 	RelatedID      string  `gorm:"size:50" json:"relatedId,omitempty"`            // 关联订单/请求ID
 }

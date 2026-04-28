@@ -2,70 +2,88 @@ package credits
 
 import "math"
 
-// CreditPerRMB 定义积分与人民币的换算比例
-// 1 RMB = 10,000 credits（1元 = 1万积分）
+// CreditPerRMB is the user-facing exchange rate: 1 CNY = 10,000 credits.
 const CreditPerRMB = 10000
 
-// BillingUnitsPerRMB 是内部高精度计费单位。
-// 1 RMB = 100,000,000 billing units，用于微额供应商成本和审计快照。
+// BillingUnitsPerRMB is the internal ledger precision: 1 CNY = 100,000,000 units.
 const BillingUnitsPerRMB = 100000000
 
-// BillingUnitsPerCredit 定义展示积分到内部计费单位的换算比例。
-// 1 credit = 0.0001 RMB = 10,000 billing units。
+// BillingUnitsPerCredit means 1 display credit = 10,000 internal billing units.
 const BillingUnitsPerCredit = BillingUnitsPerRMB / CreditPerRMB
 
-// RMBToCredits 将人民币金额转换为积分
-// 参数 rmb: 人民币金额（元）
-// 返回: 对应的积分数量（int64）
-// 换算规则: credits = round(rmb * 10000)
+// RMBToCredits converts RMB to display credits. Compatibility helper only.
 func RMBToCredits(rmb float64) int64 {
 	return int64(math.Round(rmb * CreditPerRMB))
 }
 
-// CreditsToRMB 将积分转换为人民币金额
-// 参数 credits: 积分数量
-// 返回: 对应的人民币金额（元），精确到小数点后4位
-// 换算规则: rmb = round(credits / 10000 * 10000) / 10000
+// CreditsToRMB converts display credits to RMB. Compatibility helper only.
 func CreditsToRMB(credits int64) float64 {
-	return math.Round(float64(credits)/CreditPerRMB*10000) / 10000
+	return float64(credits) / CreditPerRMB
 }
 
-// RMBToBillingUnits 将人民币金额转换为内部高精度计费单位。
+// RMBToBillingUnits converts RMB to internal ledger units.
 func RMBToBillingUnits(rmb float64) int64 {
 	return int64(math.Round(rmb * BillingUnitsPerRMB))
 }
 
-// BillingUnitsToRMB 将内部高精度计费单位转换为人民币金额。
+// BillingUnitsToRMB converts internal ledger units to RMB.
 func BillingUnitsToRMB(units int64) float64 {
 	return float64(units) / BillingUnitsPerRMB
 }
 
-// CreditsToBillingUnits 将展示/余额使用的积分转换为内部高精度计费单位。
+// CreditsToBillingUnits converts display credits to internal ledger units.
 func CreditsToBillingUnits(credits int64) int64 {
 	return credits * BillingUnitsPerCredit
 }
 
-// BillingUnitsToCredits 将内部高精度计费单位转换为积分，采用四舍五入。
+// BillingUnitsToCredits converts internal ledger units to rounded display credits.
+// Do not use this rounded value as the billing truth source.
 func BillingUnitsToCredits(units int64) int64 {
 	return int64(math.Round(float64(units) / BillingUnitsPerCredit))
 }
 
-// CalculateWithFee 计算外币支付时的实际到账人民币金额
-// 参数 amount: 原始外币金额
-// 参数 rate: 汇率（外币→CNY）
-// 参数 feeRate: 手续费比例（如 0.02 = 2%）
-// 返回: 扣除手续费后的人民币净额
+// BillingUnitsToCreditAmount returns display credits with decimals.
+func BillingUnitsToCreditAmount(units int64) float64 {
+	return float64(units) / BillingUnitsPerCredit
+}
+
+// MulDivRound computes round(numerator*multiplier/denominator) for positive units.
+func MulDivRound(numerator int64, multiplier int64, denominator int64) int64 {
+	if numerator <= 0 || multiplier <= 0 || denominator <= 0 {
+		return 0
+	}
+	return (numerator*multiplier + denominator/2) / denominator
+}
+
+// CreditsPerMillionToBillingUnits converts a per-million-token credit price to units.
+func CreditsPerMillionToBillingUnits(priceCreditsPerMillion int64) int64 {
+	if priceCreditsPerMillion <= 0 {
+		return 0
+	}
+	return CreditsToBillingUnits(priceCreditsPerMillion)
+}
+
+// CostUnitsFromCreditsPerMillion calculates token cost in billing units.
+func CostUnitsFromCreditsPerMillion(priceCreditsPerMillion int64, quantity int64) int64 {
+	return MulDivRound(CreditsPerMillionToBillingUnits(priceCreditsPerMillion), quantity, 1_000_000)
+}
+
+// CostUnitsFromRMBPerMillion calculates token cost in billing units from an RMB price.
+func CostUnitsFromRMBPerMillion(priceRMBPerMillion float64, quantity int64) int64 {
+	if priceRMBPerMillion <= 0 || quantity <= 0 {
+		return 0
+	}
+	return MulDivRound(RMBToBillingUnits(priceRMBPerMillion), quantity, 1_000_000)
+}
+
+// CalculateWithFee calculates net RMB after payment fees.
 func CalculateWithFee(amount, rate, feeRate float64) float64 {
 	rmbAmount := amount * rate
 	fee := rmbAmount * feeRate
 	return rmbAmount - fee
 }
 
-// CalculateCreditsFromForeignCurrency 计算外币支付可兑换的积分数量
-// 参数 amount: 原始外币金额
-// 参数 rate: 汇率（外币→CNY）
-// 参数 feeRate: 手续费比例
-// 返回: 可兑换的积分数量
+// CalculateCreditsFromForeignCurrency converts foreign payment amount to display credits.
 func CalculateCreditsFromForeignCurrency(amount, rate, feeRate float64) int64 {
 	rmbNet := CalculateWithFee(amount, rate, feeRate)
 	return RMBToCredits(rmbNet)

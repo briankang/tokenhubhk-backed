@@ -8,138 +8,110 @@ import (
 	"strings"
 )
 
-// DefaultTier 生成默认兜底阶梯 (0, +∞] × (0, +∞]
-// 用于没有显式分档的模型，保证计费链路统一走阶梯选择器
 func DefaultTier(inputPrice, outputPrice float64) PriceTier {
 	return PriceTier{
-		Name:               "(0, +∞] × (0, +∞]",
+		Name:               "(0, +inf)",
 		InputMin:           0,
 		InputMinExclusive:  true,
-		InputMax:           nil,
 		OutputMin:          0,
 		OutputMinExclusive: true,
-		OutputMax:          nil,
 		InputPrice:         inputPrice,
 		OutputPrice:        outputPrice,
 	}
 }
 
-// IsDefaultTier 判断一个阶梯是否是"全覆盖默认阶梯"
-// 全覆盖即 Input/Output 都是 (0, +∞]
 func (t PriceTier) IsDefaultTier() bool {
 	return t.InputMin == 0 && t.InputMinExclusive && t.InputMax == nil &&
 		t.OutputMin == 0 && t.OutputMinExclusive && t.OutputMax == nil
 }
 
-// Matches 判断 (inputTokens, outputTokens) 是否落在本阶梯区间内
-// 二维 AND 条件：输入必须命中 AND 输出必须命中
 func (t PriceTier) Matches(inputTokens, outputTokens int64) bool {
 	return matchRange(inputTokens, t.InputMin, t.InputMinExclusive, t.InputMax, t.InputMaxExclusive) &&
 		matchRange(outputTokens, t.OutputMin, t.OutputMinExclusive, t.OutputMax, t.OutputMaxExclusive)
 }
 
-// matchRange 单维度区间匹配
-// min 开(Exclusive=true)=严格大于，闭=大于等于；max nil=+∞
+// MatchesDims 检查 tier 的 DimValues 是否与请求 dims 完全匹配（S1 多维匹配）
+//
+// 语义：
+//   - tier.DimValues 中**每个非空键**都必须在 dims 中找到相同值
+//   - tier.DimValues 中的空字符串值视为"该维度不限定"，不参与匹配
+//   - dims 中存在但 tier.DimValues 未声明的键 → 不影响匹配（tier 维度更宽松）
+//   - tier.DimValues == nil 或全空 → 不参与维度匹配（旧行为，调用方应回退到 token 区间）
+//
+// 返回：
+//   - tier 是否声明了维度（是否需要走维度匹配路径）
+//   - 维度匹配是否成功
+//
+// 调用方应当：tier 未声明维度 → 走 token 区间；声明了 → 必须命中维度才算匹配
+func (t PriceTier) MatchesDims(dims map[string]string) (declared bool, matched bool) {
+	if len(t.DimValues) == 0 {
+		return false, false
+	}
+	for key, expected := range t.DimValues {
+		if expected == "" {
+			continue // 空值视为通配
+		}
+		declared = true
+		actual, ok := dims[key]
+		if !ok || actual != expected {
+			return true, false
+		}
+	}
+	if !declared {
+		// 全是空值通配 → 等同未声明
+		return false, false
+	}
+	return true, true
+}
+
 func matchRange(v, min int64, minExcl bool, max *int64, maxExcl bool) bool {
-	// 下界
 	if minExcl {
 		if v <= min {
 			return false
 		}
-	} else {
-		if v < min {
-			return false
-		}
+	} else if v < min {
+		return false
 	}
-	// 上界
 	if max != nil {
 		if maxExcl {
 			if v >= *max {
 				return false
 			}
-		} else {
-			if v > *max {
-				return false
-			}
+		} else if v > *max {
+			return false
 		}
 	}
 	return true
 }
 
-// Normalize 同步新旧字段 + 修正零值
-// 旧字段 MinTokens/MaxTokens 迁移到 InputMin/InputMax（仅当新字段为默认值时）
-// Output 维度未设置时填默认 (0, +∞]
 func (t *PriceTier) Normalize() {
-	// 1. 从旧字段回填到新字段（仅在新字段未设置时）
-	//    判定"未设置"：InputMin==0 && InputMinExclusive==false && InputMax==nil
-	legacyActive := t.MinTokens > 0 || t.MaxTokens != nil
-	newDefault := t.InputMin == 0 && !t.InputMinExclusive && t.InputMax == nil
-	if legacyActive && newDefault {
-		t.InputMin = t.MinTokens
-		t.InputMax = t.MaxTokens
-		// 旧语义：MinTokens 为闭区间下界，保持 Exclusive=false
-		t.InputMinExclusive = false
-		t.InputMaxExclusive = false
-	}
-
-	// 2. 同步新字段回旧字段（方便读旧代码）
-	t.MinTokens = t.InputMin
-	t.MaxTokens = t.InputMax
-
-	// 3. Output 维度如果完全未设置，填默认 (0, +∞]
-	//    判定"未设置"：OutputMin==0 && OutputMinExclusive==false && OutputMax==nil
 	if t.OutputMin == 0 && !t.OutputMinExclusive && t.OutputMax == nil {
 		t.OutputMinExclusive = true
 	}
-
-	// 4. 如果 InputMin==0 且没有任何其他标记，也视为 (0, +∞] 默认下界
-	//    但用户显式设置 InputMinExclusive=false + InputMin=0 应保留（表示 [0, ...)）
-	//    这里不主动改写，交由调用方。
-
-	// 5. 自动生成 Name（UI 上用户不再手动输入阶梯名称）
 	if strings.TrimSpace(t.Name) == "" {
 		t.Name = t.AutoName()
 	}
 }
 
-// AutoName 按区间自动生成阶梯名称，供 UI 展示与保存兜底。
-// 规则：
-//   - 默认全覆盖 (0, +∞] × (0, +∞] → "0-无限"
-//   - 仅有输入上界 → "(0, <max>]" 或 "[0, <max>)"
-//   - 有输入下界和上界 → "(min, max]" 等
-//   - 无法表达 → "tier"
 func (t PriceTier) AutoName() string {
 	lowerBracket := "("
 	if !t.InputMinExclusive {
 		lowerBracket = "["
 	}
-	// 默认全覆盖
-	if t.InputMin == 0 && t.InputMinExclusive && t.InputMax == nil {
-		return "0-无限"
+	if t.InputMin == 0 && t.InputMax == nil {
+		return "0-inf"
 	}
-	if t.InputMin == 0 && !t.InputMinExclusive && t.InputMax == nil {
-		return "0-无限"
-	}
-
 	minStr := formatTokenLabel(t.InputMin)
-
 	if t.InputMax == nil {
-		return fmt.Sprintf("%s%s, +∞)", lowerBracket, minStr)
+		return fmt.Sprintf("%s%s, +inf)", lowerBracket, minStr)
 	}
-
 	upperBracket := "]"
 	if t.InputMaxExclusive {
 		upperBracket = ")"
 	}
-	maxStr := formatTokenLabel(*t.InputMax)
-	return fmt.Sprintf("%s%s, %s%s", lowerBracket, minStr, maxStr, upperBracket)
+	return fmt.Sprintf("%s%s, %s%s", lowerBracket, minStr, formatTokenLabel(*t.InputMax), upperBracket)
 }
 
-// formatTokenLabel 将 token 数转为简短标签
-//   32000   → "32k"
-//   128000  → "128k"
-//   1000000 → "1M"
-//   100     → "100"
 func formatTokenLabel(n int64) string {
 	if n <= 0 {
 		return "0"
@@ -153,7 +125,6 @@ func formatTokenLabel(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
 
-// Validate 校验区间合法性
 func (t PriceTier) Validate() error {
 	if t.InputMin < 0 {
 		return fmt.Errorf("input_min must be non-negative, got %d", t.InputMin)
@@ -173,9 +144,6 @@ func (t PriceTier) Validate() error {
 	return nil
 }
 
-// SelectTier 在 tiers 列表中查找第一个能同时容纳 (inputTokens, outputTokens) 的阶梯
-// tiers 应按 InputMin 升序排列（由调用方或 Sort 保证）
-// 未命中返回 (-1, nil)
 func SelectTier(tiers []PriceTier, inputTokens, outputTokens int64) (int, *PriceTier) {
 	for i := range tiers {
 		if tiers[i].Matches(inputTokens, outputTokens) {
@@ -185,18 +153,98 @@ func SelectTier(tiers []PriceTier, inputTokens, outputTokens int64) (int, *Price
 	return -1, nil
 }
 
-// SortTiers 按 InputMin 升序排序（稳定排序）
+// SelectTierByDims 仅按 DimValues 匹配（S1，2026-04-28）
+//
+// 用途：当请求侧已知业务维度（resolution/has_input_video/thinking_mode 等）时，
+// 优先按维度精确命中 tier，避免 magic-InputMin 编码维度的脆弱性。
+//
+// 行为：
+//   - 遍历 tiers，找第一个 MatchesDims 命中的 tier
+//   - 如果有声明 dims 但都不命中 → 返回 -1（调用方应回退到 token 区间或最大档兜底）
+//   - 如果 tiers 中**没有任何 tier 声明 DimValues** → 返回 -1（调用方走旧路径）
+//
+// 注：dims 全空时直接返回 -1，避免误命中"全维度通配"tier
+func SelectTierByDims(tiers []PriceTier, dims map[string]string) (int, *PriceTier) {
+	if len(dims) == 0 {
+		return -1, nil
+	}
+	hasAnyDeclared := false
+	for i := range tiers {
+		declared, matched := tiers[i].MatchesDims(dims)
+		if declared {
+			hasAnyDeclared = true
+			if matched {
+				return i, &tiers[i]
+			}
+		}
+	}
+	_ = hasAnyDeclared
+	return -1, nil
+}
+
+// SelectTierOrLargest 先严格按输入/输出区间匹配；若配置了阶梯但未命中，返回最大阶梯兜底。
+//
+// 注：此签名保持向后兼容（不接受 dims）。多维匹配请显式调用 SelectTierByDims，
+// 由调用方决定优先级（推荐：先 SelectTierByDims，再 SelectTierOrLargest，参见
+// pricing/tier_calculator.go 的 selectPriceForTokens 三步匹配实现）。
+func SelectTierOrLargest(tiers []PriceTier, inputTokens, outputTokens int64) (int, *PriceTier, bool) {
+	idx, tier := SelectTier(tiers, inputTokens, outputTokens)
+	if tier != nil {
+		return idx, tier, true
+	}
+	if len(tiers) == 0 {
+		return -1, nil, false
+	}
+	maxIdx := 0
+	for i := 1; i < len(tiers); i++ {
+		if tierGreater(tiers[i], tiers[maxIdx]) {
+			maxIdx = i
+		}
+	}
+	return maxIdx, &tiers[maxIdx], false
+}
+
+func tierGreater(a, b PriceTier) bool {
+	if a.InputMin != b.InputMin {
+		return a.InputMin > b.InputMin
+	}
+	if a.OutputMin != b.OutputMin {
+		return a.OutputMin > b.OutputMin
+	}
+	if compareMaxBound(a.InputMax, b.InputMax) != 0 {
+		return compareMaxBound(a.InputMax, b.InputMax) > 0
+	}
+	return compareMaxBound(a.OutputMax, b.OutputMax) > 0
+}
+
+func compareMaxBound(a, b *int64) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return 1
+	}
+	if b == nil {
+		return -1
+	}
+	if *a > *b {
+		return 1
+	}
+	if *a < *b {
+		return -1
+	}
+	return 0
+}
+
 func SortTiers(tiers []PriceTier) {
 	sort.SliceStable(tiers, func(i, j int) bool {
 		if tiers[i].InputMin != tiers[j].InputMin {
 			return tiers[i].InputMin < tiers[j].InputMin
 		}
-		// InputMin 相同时按 OutputMin 排序
 		return tiers[i].OutputMin < tiers[j].OutputMin
 	})
 }
 
-// EnsureDefaultTier 若列表为空，注入默认阶梯（便于数据补齐与运行时兜底）
 func EnsureDefaultTier(data *PriceTiersData, fallbackInput, fallbackOutput float64) {
 	if data == nil {
 		return
@@ -206,67 +254,42 @@ func EnsureDefaultTier(data *PriceTiersData, fallbackInput, fallbackOutput float
 	}
 }
 
-// ---- ParseRangeExpression ----
-// 支持格式：
-//   [0, 32]         闭区间
-//   (32, 128]       左开右闭
-//   [32, 128)       左闭右开
-//   (32, 128)       全开
-//   [0, +∞)          无上界
-//   32k<input<=128k 不等式
-//   input<=128k     只有上界
-//   input>=32k      只有下界
-//   32k-128k        连字符（一律按 [32k, 128k] 闭区间）
-//   0-1M            带单位
-//   输入长度 [0, 32]  含中文前缀（自动剥离）
-
 var (
-	// 区间式正则：[/( <数> , <数> ]/) 支持 +∞
-	rangeRe = regexp.MustCompile(`(?i)([\[\(])\s*([+\-]?[\d.]+[kKmM]?|\+?∞|inf|infinity)\s*,\s*([+\-]?[\d.]+[kKmM]?|\+?∞|inf|infinity)\s*([\]\)])`)
-	// 不等式正则：a<b<=c 或 b<=c 或 b>=a
-	ineqBothRe = regexp.MustCompile(`(?i)([+\-]?[\d.]+[kKmM]?)\s*(<|<=|≤)\s*\w+\s*(<|<=|≤)\s*([+\-]?[\d.]+[kKmM]?)`)
-	ineqLERe   = regexp.MustCompile(`(?i)\w+\s*(<|<=|≤)\s*([+\-]?[\d.]+[kKmM]?)`)
-	ineqGERe   = regexp.MustCompile(`(?i)\w+\s*(>|>=|≥)\s*([+\-]?[\d.]+[kKmM]?)`)
-	// 连字符式：a-b
-	dashRe = regexp.MustCompile(`([+\-]?[\d.]+[kKmM]?)\s*[-–—]\s*([+\-]?[\d.]+[kKmM]?)`)
+	rangeRe    = regexp.MustCompile(`(?i)([\[\(])\s*([+\-]?[\d.]+[kKmM]?|\+?inf|infinity)\s*,\s*([+\-]?[\d.]+[kKmM]?|\+?inf|infinity)\s*([\]\)])`)
+	ineqBothRe = regexp.MustCompile(`(?i)([+\-]?[\d.]+[kKmM]?)\s*(<|<=)\s*\w+\s*(<|<=)\s*([+\-]?[\d.]+[kKmM]?)`)
+	ineqLERe   = regexp.MustCompile(`(?i)\w+\s*(<|<=)\s*([+\-]?[\d.]+[kKmM]?)`)
+	ineqGERe   = regexp.MustCompile(`(?i)\w+\s*(>|>=)\s*([+\-]?[\d.]+[kKmM]?)`)
+	dashRe     = regexp.MustCompile(`([+\-]?[\d.]+[kKmM]?)\s*-\s*([+\-]?[\d.]+[kKmM]?)`)
 )
 
-// ParseRangeExpression 解析区间表达式
-// 返回 (min, minExclusive, max *int64, maxExclusive, err)
-// 无上界时 max=nil；解析失败返回错误
 func ParseRangeExpression(expr string) (int64, bool, *int64, bool, error) {
-	expr = strings.TrimSpace(expr)
+	expr = strings.TrimSpace(strings.ToLower(expr))
 	if expr == "" {
 		return 0, false, nil, false, fmt.Errorf("empty expression")
 	}
+	expr = strings.ReplaceAll(expr, "token", "")
+	expr = strings.ReplaceAll(expr, "tokens", "")
+	expr = strings.ReplaceAll(expr, " ", "")
 
-	// 1. 尝试区间式 [a, b] / (a, b] 等
 	if m := rangeRe.FindStringSubmatch(expr); m != nil {
-		leftBracket := m[1]
-		minStr := m[2]
-		maxStr := m[3]
-		rightBracket := m[4]
-
-		minVal, err := parseTokenCount(minStr)
+		minVal, err := parseTokenCount(m[2])
 		if err != nil {
 			return 0, false, nil, false, fmt.Errorf("parse min: %w", err)
 		}
+		maxExcl := m[4] == ")"
 		var maxPtr *int64
-		maxExcl := rightBracket == ")"
-		if !isInfinity(maxStr) {
-			mv, err := parseTokenCount(maxStr)
+		if !isInfinity(m[3]) {
+			maxVal, err := parseTokenCount(m[3])
 			if err != nil {
 				return 0, false, nil, false, fmt.Errorf("parse max: %w", err)
 			}
-			maxPtr = &mv
+			maxPtr = &maxVal
 		} else {
-			// +∞ 时 max=nil，exclusive 语义无意义，统一设为 false
 			maxExcl = false
 		}
-		return minVal, leftBracket == "(", maxPtr, maxExcl, nil
+		return minVal, m[1] == "(", maxPtr, maxExcl, nil
 	}
 
-	// 2. 尝试双不等式 a < x <= b
 	if m := ineqBothRe.FindStringSubmatch(expr); m != nil {
 		minVal, err := parseTokenCount(m[1])
 		if err != nil {
@@ -279,7 +302,6 @@ func ParseRangeExpression(expr string) (int64, bool, *int64, bool, error) {
 		return minVal, m[2] == "<", &maxVal, m[3] == "<", nil
 	}
 
-	// 3. 尝试单边 x <= b
 	if m := ineqLERe.FindStringSubmatch(expr); m != nil {
 		maxVal, err := parseTokenCount(m[2])
 		if err != nil {
@@ -288,7 +310,6 @@ func ParseRangeExpression(expr string) (int64, bool, *int64, bool, error) {
 		return 0, true, &maxVal, m[1] == "<", nil
 	}
 
-	// 4. 尝试单边 x >= a
 	if m := ineqGERe.FindStringSubmatch(expr); m != nil {
 		minVal, err := parseTokenCount(m[2])
 		if err != nil {
@@ -297,7 +318,6 @@ func ParseRangeExpression(expr string) (int64, bool, *int64, bool, error) {
 		return minVal, m[1] == ">", nil, false, nil
 	}
 
-	// 5. 连字符式 a-b（按闭区间）
 	if m := dashRe.FindStringSubmatch(expr); m != nil {
 		minVal, err := parseTokenCount(m[1])
 		if err != nil {
@@ -313,19 +333,13 @@ func ParseRangeExpression(expr string) (int64, bool, *int64, bool, error) {
 	return 0, false, nil, false, fmt.Errorf("unrecognized range expression: %s", expr)
 }
 
-// parseTokenCount 解析带 k/M 后缀的数字为整数 token 数
-//   "32" -> 32
-//   "32k" -> 32000
-//   "128K" -> 128000
-//   "1M" -> 1000000
-//   "+∞" / "inf" -> 无上界（由调用方处理）
 func parseTokenCount(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, fmt.Errorf("empty")
 	}
 	if isInfinity(s) {
-		return 0, fmt.Errorf("infinity cannot be parsed as concrete value")
+		return 0, fmt.Errorf("infinity cannot be parsed as a concrete value")
 	}
 
 	multiplier := int64(1)
@@ -348,5 +362,5 @@ func parseTokenCount(s string) (int64, error) {
 
 func isInfinity(s string) bool {
 	ls := strings.ToLower(strings.TrimSpace(s))
-	return ls == "+∞" || ls == "∞" || ls == "inf" || ls == "infinity" || ls == "+inf"
+	return ls == "+inf" || ls == "inf" || ls == "infinity"
 }

@@ -24,6 +24,7 @@ const (
 	TTLBalance     = 3 * time.Minute
 	TTLApiKeys     = 10 * time.Minute
 	TTLNotifUnread = 2 * time.Minute
+	TTLPaidStatus  = time.Minute
 )
 
 // Key 前缀
@@ -32,6 +33,7 @@ const (
 	PrefixBalance     = "user:balance:"
 	PrefixApiKeys     = "user:apikeys:"
 	PrefixNotifUnread = "user:notif:unread:"
+	PrefixPaidStatus  = "user:paid_status:"
 )
 
 // Key 生成器
@@ -39,6 +41,7 @@ func KeyProfile(uid uint) string     { return fmt.Sprintf("%s%d", PrefixProfile,
 func KeyBalance(uid uint) string     { return fmt.Sprintf("%s%d", PrefixBalance, uid) }
 func KeyApiKeys(uid uint) string     { return fmt.Sprintf("%s%d", PrefixApiKeys, uid) }
 func KeyNotifUnread(uid uint) string { return fmt.Sprintf("%s%d", PrefixNotifUnread, uid) }
+func KeyPaidStatus(uid uint) string  { return fmt.Sprintf("%s%d", PrefixPaidStatus, uid) }
 
 // GetOrLoadProfile 读取/回源 用户 profile 缓存
 func GetOrLoadProfile[T any](ctx context.Context, uid uint, loader cachehelper.Loader[T]) (T, error) {
@@ -58,6 +61,11 @@ func GetOrLoadApiKeys[T any](ctx context.Context, uid uint, loader cachehelper.L
 // GetOrLoadNotifUnread 读取/回源 未读通知数量缓存
 func GetOrLoadNotifUnread[T any](ctx context.Context, uid uint, loader cachehelper.Loader[T]) (T, error) {
 	return cachehelper.GetOrLoad[T](ctx, KeyNotifUnread(uid), TTLNotifUnread, loader)
+}
+
+// GetOrLoadPaidStatus 璇诲彇/鍥炴簮鐢ㄦ埛浠樿垂鐘舵€佺紦瀛?
+func GetOrLoadPaidStatus[T any](ctx context.Context, uid uint, loader cachehelper.Loader[T]) (T, error) {
+	return cachehelper.GetOrLoad[T](ctx, KeyPaidStatus(uid), TTLPaidStatus, loader)
 }
 
 // InvalidateProfile 失效用户 profile 缓存
@@ -80,6 +88,16 @@ func InvalidateNotifUnread(ctx context.Context, uid uint) {
 	cachehelper.Invalidate(ctx, KeyNotifUnread(uid))
 }
 
+// InvalidatePaidStatus 澶辨晥鐢ㄦ埛浠樿垂鐘舵€佺紦瀛?
+func InvalidatePaidStatus(ctx context.Context, uid uint) {
+	cachehelper.Invalidate(ctx, KeyPaidStatus(uid))
+}
+
+// InvalidatePaidStatusPatternAll 娓呯悊鍏ㄩ儴鐢ㄦ埛浠樿垂鐘舵€佺紦瀛?
+func InvalidatePaidStatusPatternAll(ctx context.Context) (int, error) {
+	return cachehelper.InvalidatePattern(ctx, PrefixPaidStatus+"*", 500)
+}
+
 // InvalidateAll 失效该用户全部缓存（登出、角色变更等场景）
 func InvalidateAll(ctx context.Context, uid uint) {
 	cachehelper.Invalidate(ctx,
@@ -87,6 +105,7 @@ func InvalidateAll(ctx context.Context, uid uint) {
 		KeyBalance(uid),
 		KeyApiKeys(uid),
 		KeyNotifUnread(uid),
+		KeyPaidStatus(uid),
 	)
 }
 
@@ -95,7 +114,7 @@ func InvalidateAll(ctx context.Context, uid uint) {
 // 返回删除的 key 数量。
 func InvalidatePatternAll(ctx context.Context) (int, error) {
 	total := 0
-	for _, p := range []string{PrefixProfile + "*", PrefixBalance + "*", PrefixApiKeys + "*", PrefixNotifUnread + "*"} {
+	for _, p := range []string{PrefixProfile + "*", PrefixBalance + "*", PrefixApiKeys + "*", PrefixNotifUnread + "*", PrefixPaidStatus + "*"} {
 		n, err := cachehelper.InvalidatePattern(ctx, p, 500)
 		total += n
 		if err != nil {

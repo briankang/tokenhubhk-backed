@@ -42,6 +42,69 @@ func (h *ParamMappingHandler) Coverage(c *gin.Context) {
 	response.Success(c, report)
 }
 
+// RecommendedTemplate previews the recommended supplier mapping template.
+func (h *ParamMappingHandler) RecommendedTemplate(c *gin.Context) {
+	supplierCode := c.Query("supplier_code")
+	if supplierCode == "" {
+		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
+		return
+	}
+	overwrite := c.Query("overwrite") == "1" || c.Query("overwrite") == "true"
+	result, err := h.svc.PreviewRecommendedTemplate(c.Request.Context(), supplierCode, overwrite)
+	if err != nil {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
+		return
+	}
+	response.Success(c, result)
+}
+
+type applyRecommendedTemplateReq struct {
+	SupplierCode string `json:"supplier_code"`
+	Overwrite    bool   `json:"overwrite"`
+}
+
+// ApplyRecommendedTemplate applies the recommended supplier mapping template.
+func (h *ParamMappingHandler) ApplyRecommendedTemplate(c *gin.Context) {
+	var req applyRecommendedTemplateReq
+	if err := c.ShouldBindJSON(&req); err != nil || req.SupplierCode == "" {
+		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
+		return
+	}
+	result, err := h.svc.ApplyRecommendedTemplate(c.Request.Context(), req.SupplierCode, req.Overwrite)
+	if err != nil {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
+		return
+	}
+	response.Success(c, result)
+}
+
+// StandardParams previews standard platform parameter definitions.
+func (h *ParamMappingHandler) StandardParams(c *gin.Context) {
+	overwrite := c.Query("overwrite") == "1" || c.Query("overwrite") == "true"
+	result, err := h.svc.PreviewStandardParamDefinitions(c.Request.Context(), overwrite)
+	if err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	response.Success(c, result)
+}
+
+type applyStandardParamsReq struct {
+	Overwrite bool `json:"overwrite"`
+}
+
+// ApplyStandardParams creates or refreshes standard platform parameter definitions.
+func (h *ParamMappingHandler) ApplyStandardParams(c *gin.Context) {
+	var req applyStandardParamsReq
+	_ = c.ShouldBindJSON(&req)
+	result, err := h.svc.EnsureStandardParamDefinitions(c.Request.Context(), req.Overwrite)
+	if err != nil {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
+		return
+	}
+	response.Success(c, result)
+}
+
 // GetParam 获取单个参数详情 GET /admin/param-mappings/:id
 func (h *ParamMappingHandler) GetParam(c *gin.Context) {
 	id, err := strconv.ParseUint(c.Param("id"), 10, 64)

@@ -94,9 +94,10 @@ type geminiCandidate struct {
 }
 
 type geminiUsage struct {
-	PromptTokenCount     int `json:"promptTokenCount"`
-	CandidatesTokenCount int `json:"candidatesTokenCount"`
-	TotalTokenCount      int `json:"totalTokenCount"`
+	PromptTokenCount        int `json:"promptTokenCount"`
+	CandidatesTokenCount    int `json:"candidatesTokenCount"`
+	TotalTokenCount         int `json:"totalTokenCount"`
+	CachedContentTokenCount int `json:"cachedContentTokenCount,omitempty"`
 }
 
 func (p *GoogleProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
@@ -240,6 +241,7 @@ func (p *GoogleProvider) convertResponse(model string, gResp *geminiResponse) *C
 			PromptTokens:     gResp.UsageMetadata.PromptTokenCount,
 			CompletionTokens: gResp.UsageMetadata.CandidatesTokenCount,
 			TotalTokens:      gResp.UsageMetadata.TotalTokenCount,
+			CacheReadTokens:  gResp.UsageMetadata.CachedContentTokenCount,
 		}
 	}
 	return resp
@@ -320,6 +322,7 @@ func (s *googleStreamReader) Read() (*StreamChunk, error) {
 				PromptTokens:     gResp.UsageMetadata.PromptTokenCount,
 				CompletionTokens: gResp.UsageMetadata.CandidatesTokenCount,
 				TotalTokens:      gResp.UsageMetadata.TotalTokenCount,
+				CacheReadTokens:  gResp.UsageMetadata.CachedContentTokenCount,
 			}
 		}
 

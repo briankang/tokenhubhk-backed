@@ -3,6 +3,8 @@ package billing
 import (
 	"context"
 	"encoding/json"
+	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -20,10 +22,25 @@ const (
 	BillingStatusDeductFailed = "deduct_failed"
 )
 
+const billableModelCacheTTL = 2 * time.Minute
+
+type billableModelCacheEntry struct {
+	model     model.AIModel
+	expiresAt time.Time
+}
+
+type billableModelCacheKey struct {
+	db        *gorm.DB
+	modelName string
+}
+
+var billableModelCache sync.Map
+
 type Service struct {
 	db          *gorm.DB
 	pricingCalc *pricing.PricingCalculator
 	balanceSvc  *balancesvc.BalanceService
+	quoteSvc    *QuoteService
 }
 
 type UsageRequest struct {
@@ -35,6 +52,9 @@ type UsageRequest struct {
 	Usage        provider.Usage
 	ThinkingMode bool
 	FreezeID     string
+	// DimValues v3 引入:按维度命中 PriceMatrix 单元格(如 thinking_mode/context_tier)。
+	// 留空时不参与矩阵命中,走旧 PriceTiers / 顶层售价路径。
+	DimValues map[string]interface{}
 }
 
 type UnitUsageRequest struct {
@@ -45,6 +65,10 @@ type UnitUsageRequest struct {
 	ModelName  string
 	Usage      pricing.UsageInput
 	FreezeID   string
+	// DimValues v3 引入:按维度命中 PriceMatrix 单元格
+	// 例如视频:{resolution: "1080p", input_has_video: true, inference_mode: "online"}
+	// 例如图片:{resolution: "1024x1024", quality: "hd", mode: "generation"}
+	DimValues map[string]interface{}
 }
 
 type FreezeOutcome struct {
@@ -81,15 +105,51 @@ func NewService(db *gorm.DB, pricingCalc *pricing.PricingCalculator, balanceSvc 
 	if db == nil {
 		panic("billing service: db is nil")
 	}
-	return &Service{db: db, pricingCalc: pricingCalc, balanceSvc: balanceSvc}
+	return &Service{
+		db:          db,
+		pricingCalc: pricingCalc,
+		balanceSvc:  balanceSvc,
+		quoteSvc:    NewQuoteService(db, pricingCalc),
+	}
+}
+
+// QuoteService 暴露内部统一计价服务，供 handler 层（如试算端点）共享真相源。
+func (s *Service) QuoteService() *QuoteService { return s.quoteSvc }
+
+func (s *Service) loadBillableModel(ctx context.Context, modelName string) (model.AIModel, error) {
+	cacheKey := billableModelCacheKey{db: s.db, modelName: modelName}
+	if raw, ok := billableModelCache.Load(cacheKey); ok {
+		if cached, ok := raw.(*billableModelCacheEntry); ok && time.Now().Before(cached.expiresAt) {
+			return cached.model, nil
+		}
+		billableModelCache.Delete(cacheKey)
+	}
+
+	var aiModel model.AIModel
+	err := s.db.WithContext(ctx).Where("model_name = ? AND is_active = true", modelName).First(&aiModel).Error
+	if err == nil {
+		billableModelCache.Store(cacheKey, &billableModelCacheEntry{
+			model:     aiModel,
+			expiresAt: time.Now().Add(billableModelCacheTTL),
+		})
+		return aiModel, nil
+	}
+	err = s.db.WithContext(ctx).Where("model_name = ?", modelName).Order("id ASC").First(&aiModel).Error
+	if err == nil {
+		billableModelCache.Store(cacheKey, &billableModelCacheEntry{
+			model:     aiModel,
+			expiresAt: time.Now().Add(billableModelCacheTTL),
+		})
+	}
+	return aiModel, err
 }
 
 func (s *Service) SettleUsage(ctx context.Context, req UsageRequest) (*UsageOutcome, error) {
 	if s.pricingCalc == nil {
 		return &UsageOutcome{BillingStatus: BillingStatusNoCharge, UsageSource: "provider"}, nil
 	}
-	var aiModel model.AIModel
-	if err := s.db.WithContext(ctx).Where("model_name = ? AND is_active = true", req.ModelName).First(&aiModel).Error; err != nil {
+	aiModel, err := s.loadBillableModel(ctx, req.ModelName)
+	if err != nil {
 		if req.FreezeID != "" {
 			_ = s.ReleaseFrozen(ctx, req.FreezeID)
 		}
@@ -108,10 +168,10 @@ func (s *Service) SettleUsage(ctx context.Context, req UsageRequest) (*UsageOutc
 		Model:             aiModel,
 		CostResult:        costResult,
 		CostCredits:       costResult.TotalCost,
-		CostUnits:         credits.CreditsToBillingUnits(costResult.TotalCost),
+		CostUnits:         costResult.TotalCostUnits,
 		CostRMB:           costResult.TotalCostRMB,
-		PlatformCostRMB:   float64(costResult.PlatformCost) / 10000.0,
-		PlatformCostUnits: credits.CreditsToBillingUnits(costResult.PlatformCost),
+		PlatformCostRMB:   credits.BillingUnitsToRMB(costResult.PlatformCostUnits),
+		PlatformCostUnits: costResult.PlatformCostUnits,
 		BillingStatus:     BillingStatusNoCharge,
 		UsageSource:       "provider",
 		UsageEstimated:    false,
@@ -120,16 +180,16 @@ func (s *Service) SettleUsage(ctx context.Context, req UsageRequest) (*UsageOutc
 	if req.ThinkingMode {
 		s.applyThinkingSurcharge(ctx, req, &aiModel, costResult, out)
 		out.CostCredits = costResult.TotalCost
-		out.CostUnits = credits.CreditsToBillingUnits(costResult.TotalCost)
+		out.CostUnits = costResult.TotalCostUnits
 		out.CostRMB = costResult.TotalCostRMB
 	}
 
 	var deductErr error
 	if s.balanceSvc != nil {
 		if req.FreezeID != "" {
-			deductErr = s.balanceSvc.SettleBalance(ctx, req.FreezeID, costResult.TotalCost)
-		} else if costResult.TotalCost > 0 {
-			deductErr = s.balanceSvc.DeductForRequest(ctx, req.UserID, req.TenantID, costResult.TotalCost, req.ModelName, req.RequestID)
+			deductErr = s.balanceSvc.SettleBalanceUnits(ctx, req.FreezeID, costResult.TotalCostUnits)
+		} else if costResult.TotalCostUnits > 0 {
+			deductErr = s.balanceSvc.DeductUnitsForRequest(ctx, req.UserID, req.TenantID, costResult.TotalCostUnits, req.ModelName, req.RequestID)
 		}
 	}
 
@@ -138,16 +198,16 @@ func (s *Service) SettleUsage(ctx context.Context, req UsageRequest) (*UsageOutc
 		out.ActualCostCredits = 0
 		out.ActualCostUnits = 0
 		out.UnderCollectedCredits = costResult.TotalCost
-		out.UnderCollectedUnits = credits.CreditsToBillingUnits(costResult.TotalCost)
+		out.UnderCollectedUnits = costResult.TotalCostUnits
 		out.Snapshot = s.buildSnapshot(req, out)
 		out.SnapshotJSON = encodeSnapshot(out.Snapshot)
 		return out, deductErr
 	}
 
-	if costResult.TotalCost > 0 {
+	if costResult.TotalCostUnits > 0 {
 		out.BillingStatus = BillingStatusSettled
 		out.ActualCostCredits = costResult.TotalCost
-		out.ActualCostUnits = credits.CreditsToBillingUnits(costResult.TotalCost)
+		out.ActualCostUnits = costResult.TotalCostUnits
 	} else {
 		out.BillingStatus = BillingStatusNoCharge
 	}
@@ -161,8 +221,8 @@ func (s *Service) FreezeUsage(ctx context.Context, req UsageRequest) (*FreezeOut
 	if s.pricingCalc == nil || s.balanceSvc == nil {
 		return &FreezeOutcome{}, nil
 	}
-	var aiModel model.AIModel
-	if err := s.db.WithContext(ctx).Where("model_name = ? AND is_active = true", req.ModelName).First(&aiModel).Error; err != nil {
+	aiModel, err := s.loadBillableModel(ctx, req.ModelName)
+	if err != nil {
 		return &FreezeOutcome{}, nil
 	}
 	costResult, err := s.calculateCost(ctx, req, &aiModel)
@@ -175,15 +235,15 @@ func (s *Service) FreezeUsage(ctx context.Context, req UsageRequest) (*FreezeOut
 	}
 	freeze := &FreezeOutcome{
 		EstimatedCostCredits: costResult.TotalCost,
-		EstimatedCostUnits:   credits.CreditsToBillingUnits(costResult.TotalCost),
+		EstimatedCostUnits:   costResult.TotalCostUnits,
 		EstimatedCostRMB:     costResult.TotalCostRMB,
 		Model:                aiModel,
 		CostResult:           costResult,
 	}
-	if costResult.TotalCost <= 0 {
+	if costResult.TotalCostUnits <= 0 {
 		return freeze, nil
 	}
-	freezeID, err := s.balanceSvc.FreezeBalance(ctx, req.UserID, req.TenantID, costResult.TotalCost, req.ModelName, req.RequestID)
+	freezeID, err := s.balanceSvc.FreezeBalanceUnits(ctx, req.UserID, req.TenantID, costResult.TotalCostUnits, req.ModelName, req.RequestID)
 	if err != nil {
 		return freeze, err
 	}
@@ -195,27 +255,36 @@ func (s *Service) SettleUnitUsage(ctx context.Context, req UnitUsageRequest) (*U
 	if s.pricingCalc == nil {
 		return &UsageOutcome{BillingStatus: BillingStatusNoCharge, UsageSource: "provider"}, nil
 	}
-	var aiModel model.AIModel
-	if err := s.db.WithContext(ctx).Where("model_name = ? AND is_active = true", req.ModelName).First(&aiModel).Error; err != nil {
+	aiModel, err := s.loadBillableModel(ctx, req.ModelName)
+	if err != nil {
 		if req.FreezeID != "" {
 			_ = s.ReleaseFrozen(ctx, req.FreezeID)
 		}
 		return &UsageOutcome{BillingStatus: BillingStatusNoCharge, UsageSource: "provider"}, nil
 	}
 
+	// v3: PriceMatrix 命中预处理
+	matrixCell, matrixHit := s.tryMatchPriceMatrix(ctx, aiModel.ID, req.DimValues)
+
 	costResult, err := s.pricingCalc.CalculateCostByUnit(ctx, req.UserID, aiModel.ID, req.TenantID, req.AgentLevel, req.Usage)
 	if err != nil || costResult == nil {
 		return nil, err
+	}
+	if matrixHit && matrixCell != nil {
+		costResult.MatchedDimValues = matrixCell.DimValues
+		if matrixCell.Note != "" {
+			costResult.MatchedMatrixCellNote = matrixCell.Note
+		}
 	}
 
 	out := &UsageOutcome{
 		Model:             aiModel,
 		CostResult:        costResult,
 		CostCredits:       costResult.TotalCost,
-		CostUnits:         credits.CreditsToBillingUnits(costResult.TotalCost),
+		CostUnits:         costResult.TotalCostUnits,
 		CostRMB:           costResult.TotalCostRMB,
-		PlatformCostRMB:   float64(costResult.PlatformCost) / 10000.0,
-		PlatformCostUnits: credits.CreditsToBillingUnits(costResult.PlatformCost),
+		PlatformCostRMB:   credits.BillingUnitsToRMB(costResult.PlatformCostUnits),
+		PlatformCostUnits: costResult.PlatformCostUnits,
 		BillingStatus:     BillingStatusNoCharge,
 		UsageSource:       "provider",
 		UsageEstimated:    false,
@@ -224,9 +293,9 @@ func (s *Service) SettleUnitUsage(ctx context.Context, req UnitUsageRequest) (*U
 	var deductErr error
 	if s.balanceSvc != nil {
 		if req.FreezeID != "" {
-			deductErr = s.balanceSvc.SettleBalance(ctx, req.FreezeID, costResult.TotalCost)
-		} else if costResult.TotalCost > 0 {
-			deductErr = s.balanceSvc.DeductForRequest(ctx, req.UserID, req.TenantID, costResult.TotalCost, req.ModelName, req.RequestID)
+			deductErr = s.balanceSvc.SettleBalanceUnits(ctx, req.FreezeID, costResult.TotalCostUnits)
+		} else if costResult.TotalCostUnits > 0 {
+			deductErr = s.balanceSvc.DeductUnitsForRequest(ctx, req.UserID, req.TenantID, costResult.TotalCostUnits, req.ModelName, req.RequestID)
 		}
 	}
 	if deductErr != nil {
@@ -234,16 +303,16 @@ func (s *Service) SettleUnitUsage(ctx context.Context, req UnitUsageRequest) (*U
 		out.ActualCostCredits = 0
 		out.ActualCostUnits = 0
 		out.UnderCollectedCredits = costResult.TotalCost
-		out.UnderCollectedUnits = credits.CreditsToBillingUnits(costResult.TotalCost)
+		out.UnderCollectedUnits = costResult.TotalCostUnits
 		out.Snapshot = s.buildUnitSnapshot(req, out)
 		out.SnapshotJSON = encodeSnapshot(out.Snapshot)
 		return out, deductErr
 	}
 
-	if costResult.TotalCost > 0 {
+	if costResult.TotalCostUnits > 0 {
 		out.BillingStatus = BillingStatusSettled
 		out.ActualCostCredits = costResult.TotalCost
-		out.ActualCostUnits = credits.CreditsToBillingUnits(costResult.TotalCost)
+		out.ActualCostUnits = costResult.TotalCostUnits
 	} else {
 		out.BillingStatus = BillingStatusNoCharge
 	}
@@ -257,8 +326,8 @@ func (s *Service) FreezeUnitUsage(ctx context.Context, req UnitUsageRequest) (*F
 	if s.pricingCalc == nil || s.balanceSvc == nil {
 		return &FreezeOutcome{}, nil
 	}
-	var aiModel model.AIModel
-	if err := s.db.WithContext(ctx).Where("model_name = ? AND is_active = true", req.ModelName).First(&aiModel).Error; err != nil {
+	aiModel, err := s.loadBillableModel(ctx, req.ModelName)
+	if err != nil {
 		return &FreezeOutcome{}, nil
 	}
 
@@ -268,15 +337,15 @@ func (s *Service) FreezeUnitUsage(ctx context.Context, req UnitUsageRequest) (*F
 	}
 	out := &FreezeOutcome{
 		EstimatedCostCredits: costResult.TotalCost,
-		EstimatedCostUnits:   credits.CreditsToBillingUnits(costResult.TotalCost),
+		EstimatedCostUnits:   costResult.TotalCostUnits,
 		EstimatedCostRMB:     costResult.TotalCostRMB,
 		Model:                aiModel,
 		CostResult:           costResult,
 	}
-	if costResult.TotalCost <= 0 {
+	if costResult.TotalCostUnits <= 0 {
 		return out, nil
 	}
-	freezeID, err := s.balanceSvc.FreezeBalance(ctx, req.UserID, req.TenantID, costResult.TotalCost, req.ModelName, req.RequestID)
+	freezeID, err := s.balanceSvc.FreezeBalanceUnits(ctx, req.UserID, req.TenantID, costResult.TotalCostUnits, req.ModelName, req.RequestID)
 	if err != nil {
 		return out, err
 	}
@@ -291,45 +360,105 @@ func (s *Service) ReleaseFrozen(ctx context.Context, freezeID string) error {
 	return s.balanceSvc.ReleaseFrozen(ctx, freezeID)
 }
 
-func (s *Service) calculateCost(ctx context.Context, req UsageRequest, aiModel *model.AIModel) (*pricing.CostResult, error) {
-	if req.Usage.CacheReadTokens > 0 || req.Usage.CacheWriteTokens > 0 {
-		return s.pricingCalc.CalculateCostWithCache(ctx, req.UserID, aiModel, req.TenantID, req.AgentLevel, pricing.CacheUsageInput{
-			InputTokens:      req.Usage.PromptTokens,
-			OutputTokens:     req.Usage.CompletionTokens,
-			CacheReadTokens:  req.Usage.CacheReadTokens,
-			CacheWriteTokens: req.Usage.CacheWriteTokens,
-		})
+// toQuoteRequest 把内部 UsageRequest 折算为 QuoteService.Calculate 的入参，
+// 便于试算预览、replay 等路径走同一份输入结构。
+func toQuoteRequest(req UsageRequest, aiModelID uint, scenario string) QuoteRequest {
+	return QuoteRequest{
+		Scenario:     scenario,
+		RequestID:    req.RequestID,
+		ModelID:      aiModelID,
+		ModelName:    req.ModelName,
+		UserID:       req.UserID,
+		TenantID:     req.TenantID,
+		AgentLevel:   req.AgentLevel,
+		Usage:        QuoteUsageFromProvider(req.Usage),
+		ThinkingMode: req.ThinkingMode,
+		FreezeID:     req.FreezeID,
+		DimValues:    req.DimValues,
 	}
-	return s.pricingCalc.CalculateCost(ctx, req.UserID, aiModel.ID, req.TenantID, req.AgentLevel, req.Usage.PromptTokens, req.Usage.CompletionTokens)
+}
+
+// toQuoteRequestUnit 把内部 UnitUsageRequest 折算为 QuoteService.Calculate 的入参。
+func toQuoteRequestUnit(req UnitUsageRequest, aiModelID uint, scenario string) QuoteRequest {
+	return QuoteRequest{
+		Scenario:   scenario,
+		RequestID:  req.RequestID,
+		ModelID:    aiModelID,
+		ModelName:  req.ModelName,
+		UserID:     req.UserID,
+		TenantID:   req.TenantID,
+		AgentLevel: req.AgentLevel,
+		Usage:      QuoteUsageFromUnit(req.Usage),
+		FreezeID:   req.FreezeID,
+		DimValues:  req.DimValues,
+	}
+}
+
+// finalizeQuoteForOutcome 在扣费结束后把 actual/under/billing_status 灌入 BillingQuote。
+//
+// quote_hash 不重算（hash 仅依赖定价输入,不依赖结算结果)。
+func finalizeQuoteForOutcome(q *BillingQuote, out *UsageOutcome) {
+	if q == nil || out == nil {
+		return
+	}
+	q.ActualCostCredits = out.ActualCostCredits
+	q.ActualCostUnits = out.ActualCostUnits
+	q.ActualCreditsDecimal = credits.BillingUnitsToCreditAmount(out.ActualCostUnits)
+	q.UnderCollectedCredits = out.UnderCollectedCredits
+	q.UnderCollectedUnits = out.UnderCollectedUnits
+	q.UnderCollectedCreditsDecimal = credits.BillingUnitsToCreditAmount(out.UnderCollectedUnits)
+	q.BillingStatus = out.BillingStatus
+}
+
+func (s *Service) calculateCost(ctx context.Context, req UsageRequest, aiModel *model.AIModel) (*pricing.CostResult, error) {
+	// v3: PriceMatrix 命中优先(若有维度命中,矩阵 cell 价格写回 ModelPricing 顶层后再算)
+	matrixCell, matrixHit := s.tryMatchPriceMatrix(ctx, aiModel.ID, req.DimValues)
+
+	var (
+		cr  *pricing.CostResult
+		err error
+	)
+	if req.Usage.CacheReadTokens > 0 || req.Usage.CacheWriteTokens > 0 {
+		cr, err = s.pricingCalc.CalculateCostWithCache(ctx, req.UserID, aiModel, req.TenantID, req.AgentLevel, pricing.CacheUsageInput{
+			InputTokens:        req.Usage.PromptTokens,
+			OutputTokens:       req.Usage.CompletionTokens,
+			CacheReadTokens:    req.Usage.CacheReadTokens,
+			CacheWriteTokens:   req.Usage.CacheWriteTokens,
+			CacheWrite1hTokens: req.Usage.CacheWrite1hTokens,
+		})
+	} else {
+		cr, err = s.pricingCalc.CalculateCost(ctx, req.UserID, aiModel.ID, req.TenantID, req.AgentLevel, req.Usage.PromptTokens, req.Usage.CompletionTokens)
+	}
+	if err != nil || cr == nil {
+		return cr, err
+	}
+	if matrixHit && matrixCell != nil {
+		cr.MatchedDimValues = matrixCell.DimValues
+		if matrixCell.Note != "" {
+			cr.MatchedMatrixCellNote = matrixCell.Note
+		}
+	}
+	return cr, nil
+}
+
+// tryMatchPriceMatrix 是 SettleUsage / SettleUnitUsage 用的便捷包装,
+// 内部委托给 pricing.MatchCellByModelID — 该函数也被 QuoteService.Calculate(预览路径)
+// 与 GetCostBreakdown(重放回退路径)共用,以保证三方在同一份矩阵数据上做匹配。
+func (s *Service) tryMatchPriceMatrix(ctx context.Context, modelID uint, dimValues map[string]interface{}) (*model.PriceMatrixCell, bool) {
+	return pricing.MatchCellByModelID(ctx, s.db, modelID, dimValues)
 }
 
 func (s *Service) applyThinkingSurcharge(ctx context.Context, req UsageRequest, aiModel *model.AIModel, costResult *pricing.CostResult, out *UsageOutcome) {
-	if req.Usage.CompletionTokens <= 0 {
-		return
+	applied, sellRMB := applyThinkingSurchargeToCostResult(s.db, ctx, aiModel, costResult, req.Usage.CompletionTokens)
+	if applied {
+		out.ThinkingModeApplied = true
+		out.ThinkingOutputPriceRMB = sellRMB
 	}
-	thinkingSellRMB := resolveThinkingOutputSellRMB(s.db, ctx, aiModel, costResult)
-	if thinkingSellRMB <= 0 {
-		return
-	}
-	normalSellRMB := costResult.PriceDetail.OutputPriceRMB
-	diffRMB := thinkingSellRMB - normalSellRMB
-	if diffRMB <= 0 {
-		return
-	}
-	surchargeRMB := diffRMB * float64(req.Usage.CompletionTokens) / 1_000_000
-	surchargeCredits := int64(surchargeRMB*10000 + 0.5)
-	if surchargeCredits <= 0 {
-		return
-	}
-	costResult.TotalCost += surchargeCredits
-	costResult.OutputCost += surchargeCredits
-	costResult.TotalCostRMB += surchargeRMB
-	out.ThinkingModeApplied = true
-	out.ThinkingOutputPriceRMB = thinkingSellRMB
 }
 
 func (s *Service) buildSnapshot(req UsageRequest, out *UsageOutcome) map[string]interface{} {
 	cr := out.CostResult
+	calculatorType := billingCalculatorType(out.Model)
 	snapshot := map[string]interface{}{
 		"schema_version":          1,
 		"generated_at":            time.Now().UTC().Format(time.RFC3339Nano),
@@ -337,6 +466,10 @@ func (s *Service) buildSnapshot(req UsageRequest, out *UsageOutcome) map[string]
 		"model_id":                out.Model.ID,
 		"model_name":              req.ModelName,
 		"pricing_unit":            out.Model.PricingUnit,
+		"calculator_type":         calculatorType,
+		"calculator_version":      "v1",
+		"calculator_source":       "billing_service",
+		"calculator_formula":      billingCalculatorFormula(calculatorType),
 		"prompt_tokens":           req.Usage.PromptTokens,
 		"completion_tokens":       req.Usage.CompletionTokens,
 		"total_tokens":            req.Usage.TotalTokens,
@@ -350,7 +483,9 @@ func (s *Service) buildSnapshot(req UsageRequest, out *UsageOutcome) map[string]
 		"sell_input_rmb":          cr.PriceDetail.InputPriceRMB,
 		"sell_output_rmb":         cr.PriceDetail.OutputPriceRMB,
 		"input_cost_credits":      cr.InputCost,
+		"input_cost_units":        cr.InputCostUnits,
 		"output_cost_credits":     cr.OutputCost,
+		"output_cost_units":       cr.OutputCostUnits,
 		"total_cost_credits":      cr.TotalCost,
 		"total_cost_units":        out.CostUnits,
 		"total_cost_rmb":          cr.TotalCostRMB,
@@ -367,9 +502,13 @@ func (s *Service) buildSnapshot(req UsageRequest, out *UsageOutcome) map[string]
 		"under_collected_credits": out.UnderCollectedCredits,
 		"under_collected_units":   out.UnderCollectedUnits,
 		"cache_read_cost":         cr.CacheReadCost,
+		"cache_read_cost_units":   cr.CacheReadCostUnits,
 		"cache_write_cost":        cr.CacheWriteCost,
+		"cache_write_cost_units":  cr.CacheWriteCostUnits,
 		"regular_input_cost":      cr.RegularInputCost,
+		"regular_input_cost_units": cr.RegularInputCostUnits,
 		"cache_saving_credits":    cr.CacheSavingCredits,
+		"cache_saving_units":      cr.CacheSavingUnits,
 		"thinking_mode":           req.ThinkingMode,
 		"thinking_mode_applied":   out.ThinkingModeApplied,
 	}
@@ -382,11 +521,20 @@ func (s *Service) buildSnapshot(req UsageRequest, out *UsageOutcome) map[string]
 	if out.ThinkingOutputPriceRMB > 0 {
 		snapshot["thinking_output_price_rmb"] = out.ThinkingOutputPriceRMB
 	}
+	// 通过 canonical formatter 构造 BillingQuote(与 QuoteService.Calculate 同源)。
+	quote := buildBillingQuote(toQuoteRequest(req, out.Model.ID, QuoteScenarioCharge), &out.Model, cr, out.ThinkingModeApplied)
+	finalizeQuoteForOutcome(quote, out)
+	if quoteMap := quote.ToSnapshotMap(); quoteMap != nil {
+		snapshot["quote"] = quoteMap
+		snapshot["quote_hash"] = quote.QuoteHash
+		snapshot["quote_schema_version"] = quoteSchemaVersion
+	}
 	return snapshot
 }
 
 func (s *Service) buildUnitSnapshot(req UnitUsageRequest, out *UsageOutcome) map[string]interface{} {
 	cr := out.CostResult
+	calculatorType := billingCalculatorType(out.Model)
 	snapshot := map[string]interface{}{
 		"schema_version":          1,
 		"generated_at":            time.Now().UTC().Format(time.RFC3339Nano),
@@ -395,6 +543,10 @@ func (s *Service) buildUnitSnapshot(req UnitUsageRequest, out *UsageOutcome) map
 		"model_name":              req.ModelName,
 		"model_type":              out.Model.ModelType,
 		"pricing_unit":            out.Model.PricingUnit,
+		"calculator_type":         calculatorType,
+		"calculator_version":      "v1",
+		"calculator_source":       "billing_service",
+		"calculator_formula":      billingCalculatorFormula(calculatorType),
 		"input_tokens":            req.Usage.InputTokens,
 		"output_tokens":           req.Usage.OutputTokens,
 		"image_count":             req.Usage.ImageCount,
@@ -406,7 +558,9 @@ func (s *Service) buildUnitSnapshot(req UnitUsageRequest, out *UsageOutcome) map
 		"sell_input_rmb":          cr.PriceDetail.InputPriceRMB,
 		"sell_output_rmb":         cr.PriceDetail.OutputPriceRMB,
 		"input_cost_credits":      cr.InputCost,
+		"input_cost_units":        cr.InputCostUnits,
 		"output_cost_credits":     cr.OutputCost,
+		"output_cost_units":       cr.OutputCostUnits,
 		"total_cost_credits":      cr.TotalCost,
 		"total_cost_units":        out.CostUnits,
 		"total_cost_rmb":          cr.TotalCostRMB,
@@ -429,7 +583,74 @@ func (s *Service) buildUnitSnapshot(req UnitUsageRequest, out *UsageOutcome) map
 	if cr.UserDiscountRate != nil {
 		snapshot["user_discount_rate"] = *cr.UserDiscountRate
 	}
+	// 通过 canonical formatter 构造 BillingQuote(与 QuoteService.Calculate 同源)。
+	quote := buildBillingQuote(toQuoteRequestUnit(req, out.Model.ID, QuoteScenarioCharge), &out.Model, cr, false)
+	finalizeQuoteForOutcome(quote, out)
+	if quoteMap := quote.ToSnapshotMap(); quoteMap != nil {
+		snapshot["quote"] = quoteMap
+		snapshot["quote_hash"] = quote.QuoteHash
+		snapshot["quote_schema_version"] = quoteSchemaVersion
+	}
 	return snapshot
+}
+
+func billingCalculatorType(aiModel model.AIModel) string {
+	name := strings.ToLower(aiModel.ModelName)
+	switch aiModel.PricingUnit {
+	case model.UnitPerImage:
+		if strings.Contains(name, "vision") || strings.Contains(name, "vl") {
+			return "vision_image_unit"
+		}
+		return "image_unit"
+	case model.UnitPerSecond, model.UnitPerMinute, model.UnitPerHour:
+		if aiModel.ModelType == model.ModelTypeVideoGeneration {
+			return "video_duration_resolution"
+		}
+		return "asr_duration"
+	case model.UnitPer10kCharacters, model.UnitPerMillionCharacters, model.UnitPerKChars:
+		return "tts_characters"
+	case model.UnitPerCall:
+		return "rerank_call"
+	default:
+		if strings.Contains(name, "seedance-2") {
+			return "volc_seedance_2_video_formula"
+		}
+		if strings.Contains(name, "embed") || aiModel.ModelType == model.ModelTypeEmbedding {
+			return "embedding_token"
+		}
+		if strings.Contains(name, "rerank") || aiModel.ModelType == model.ModelTypeRerank {
+			return "rerank_token"
+		}
+		if aiModel.SupportsCache || len(aiModel.PriceTiers) > 2 {
+			return "token_io_tiered_cache"
+		}
+		return "token_io"
+	}
+}
+
+func billingCalculatorFormula(calculatorType string) []string {
+	switch calculatorType {
+	case "volc_seedance_2_video_formula":
+		return []string{
+			"估算 tokens = max(min_tokens, (input_seconds + output_seconds) * width * height * fps / 1024)",
+			"金额 = token 单价 * 估算 tokens / 1,000,000",
+		}
+	case "video_duration_resolution":
+		return []string{"金额 = 视频条数 * 分辨率/音频/草稿档位单价"}
+	case "image_unit", "vision_image_unit":
+		return []string{"金额 = 图片张数 * 图片档位单价"}
+	case "tts_characters":
+		return []string{"金额 = 字符数 / 计费字符单位 * 字符单价"}
+	case "asr_duration":
+		return []string{"金额 = 音频时长 / 计费时长单位 * 时长单价"}
+	case "rerank_call":
+		return []string{"金额 = 调用次数 * 单次调用价格"}
+	default:
+		return []string{
+			"输入金额 = 输入单价 * 输入 tokens / 1,000,000",
+			"输出金额 = 输出单价 * 输出 tokens / 1,000,000",
+		}
+	}
 }
 
 func encodeSnapshot(snapshot map[string]interface{}) string {

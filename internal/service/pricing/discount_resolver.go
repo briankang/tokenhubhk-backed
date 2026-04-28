@@ -3,6 +3,7 @@ package pricing
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -10,11 +11,84 @@ import (
 	"tokenhub-server/internal/model"
 )
 
+const discountMissCacheTTL = 10 * time.Minute
+
+type discountMissCacheKey struct {
+	db       *gorm.DB
+	kind     string
+	userID   uint
+	tenantID uint
+	modelID  uint
+	level    int
+}
+
+type discountMissCacheEntry struct {
+	expiresAt time.Time
+}
+
+var discountMissCache sync.Map
+var discountMissLocks sync.Map
+
+func loadDiscountMiss(key discountMissCacheKey, now time.Time) bool {
+	v, ok := discountMissCache.Load(key)
+	if !ok {
+		return false
+	}
+	entry, ok := v.(discountMissCacheEntry)
+	if !ok || now.After(entry.expiresAt) {
+		discountMissCache.Delete(key)
+		return false
+	}
+	return true
+}
+
+func storeDiscountMiss(key discountMissCacheKey, now time.Time) {
+	discountMissCache.Store(key, discountMissCacheEntry{expiresAt: now.Add(discountMissCacheTTL)})
+}
+
+func clearDiscountMissCache() {
+	discountMissCache.Range(func(key, _ interface{}) bool {
+		discountMissCache.Delete(key)
+		return true
+	})
+	discountMissLocks.Range(func(key, _ interface{}) bool {
+		discountMissLocks.Delete(key)
+		return true
+	})
+}
+
+func discountMissLockFor(key discountMissCacheKey) *sync.Mutex {
+	v, _ := discountMissLocks.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+func withDiscountMissLock(key discountMissCacheKey, now time.Time, query func(time.Time) (bool, error)) (bool, error) {
+	if loadDiscountMiss(key, now) {
+		return false, nil
+	}
+	lock := discountMissLockFor(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	queryNow := time.Now()
+	if loadDiscountMiss(key, queryNow) {
+		return false, nil
+	}
+	found, err := query(queryNow)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		storeDiscountMiss(key, queryNow)
+	}
+	return found, nil
+}
+
 // DiscountResult 折扣解析结果，包含租户/模型/代理层级/用户级的折扣信息
 type DiscountResult struct {
-	Type           string   `json:"type"`            // "user_custom" / "agent_custom" / "level_discount" / "none"
-	PricingType    string   `json:"pricing_type"`    // FIXED / MARKUP / DISCOUNT / INHERIT / NONE
-	InputDiscount  float64  `json:"input_discount"`  // e.g. 0.8 means 20% off
+	Type           string   `json:"type"`           // "user_custom" / "agent_custom" / "level_discount" / "none"
+	PricingType    string   `json:"pricing_type"`   // FIXED / MARKUP / DISCOUNT / INHERIT / NONE
+	InputDiscount  float64  `json:"input_discount"` // e.g. 0.8 means 20% off
 	OutputDiscount float64  `json:"output_discount"`
 	FixedInput     *float64 `json:"fixed_input,omitempty"`
 	FixedOutput    *float64 `json:"fixed_output,omitempty"`
@@ -40,114 +114,53 @@ func NewDiscountResolver(db *gorm.DB) *DiscountResolver {
 }
 
 // ResolveDiscount 确定请求的最终折扣
+//
+// **2026-04-28 简化**:代理折扣体系(AgentPricing / AgentLevelDiscount)已物理移除,
+// 仅保留 UserModelDiscount(用户级特殊折扣)。tenantID/agentLevel 参数保留以兼容调用方,
+// 但仅 UserModelDiscount 路径生效。
+//
 // 查找顺序：
-//  0. UserModelDiscount（用户+模型精确匹配，生效期内，优先级最高）
-//  1. AgentPricing（租户+模型精确匹配）
-//  2. AgentLevelDiscount（层级+模型匹配）
-//  3. AgentLevelDiscount（层级+全局匹配，model_id IS NULL）
-//  4. 无折扣（原价）
+//  0. UserModelDiscount(用户+模型精确匹配,生效期内)
+//  1. 无折扣(原价)
 func (r *DiscountResolver) ResolveDiscount(ctx context.Context, userID uint, tenantID uint, modelID uint, agentLevel int) (*DiscountResult, error) {
+	_ = tenantID  // deprecated: 代理体系已移除
+	_ = agentLevel // deprecated: 代理体系已移除
 	if modelID == 0 {
 		return &DiscountResult{Type: "none", PricingType: "NONE", InputDiscount: 1.0, OutputDiscount: 1.0}, nil
 	}
+	now := time.Now()
 
 	// Step 0: Check UserModelDiscount (user-level override, highest priority)
 	if userID > 0 {
+		key := discountMissCacheKey{db: r.db, kind: "user_model_discount", userID: userID, modelID: modelID}
 		var userDiscount model.UserModelDiscount
-		err := r.db.WithContext(ctx).
-			Where("user_id = ? AND model_id = ? AND is_active = ?", userID, modelID, true).
-			First(&userDiscount).Error
-		if err == nil && userDiscount.IsEffective(time.Now()) {
+		found, err := withDiscountMissLock(key, now, func(queryNow time.Time) (bool, error) {
+			err := r.db.WithContext(ctx).
+				Where("user_id = ? AND model_id = ? AND is_active = ?", userID, modelID, true).
+				First(&userDiscount).Error
+			if err == nil && userDiscount.IsEffective(queryNow) {
+				return true, nil
+			}
+			if err != nil && err != gorm.ErrRecordNotFound {
+				return false, fmt.Errorf("query user model discount: %w", err)
+			}
+			return false, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if found {
 			return r.buildUserDiscountResult(&userDiscount), nil
-		} else if err != nil && err != gorm.ErrRecordNotFound {
-			return nil, fmt.Errorf("query user model discount: %w", err)
 		}
 	}
 
-	if tenantID == 0 {
-		return &DiscountResult{Type: "none", PricingType: "NONE", InputDiscount: 1.0, OutputDiscount: 1.0}, nil
-	}
-
-	// Step 1: Check AgentPricing (custom pricing for this tenant + model)
-	var agentPricing model.AgentPricing
-	err := r.db.WithContext(ctx).
-		Where("tenant_id = ? AND model_id = ?", tenantID, modelID).
-		First(&agentPricing).Error
-	if err == nil {
-		// Found custom pricing
-		if agentPricing.PricingType != "INHERIT" {
-			return r.buildAgentPricingResult(&agentPricing), nil
-		}
-		// INHERIT → fall through to level discount
-	} else if err != gorm.ErrRecordNotFound {
-		return nil, fmt.Errorf("query agent pricing: %w", err)
-	}
-
-	// Step 2: Check AgentLevelDiscount with specific model
-	if agentLevel < 1 {
-		agentLevel = 1
-	}
-	var modelDiscount model.AgentLevelDiscount
-	err = r.db.WithContext(ctx).
-		Where("level = ? AND model_id = ?", agentLevel, modelID).
-		First(&modelDiscount).Error
-	if err == nil {
-		return &DiscountResult{
-			Type:           "level_discount",
-			PricingType:    "DISCOUNT",
-			InputDiscount:  modelDiscount.InputDiscount,
-			OutputDiscount: modelDiscount.OutputDiscount,
-		}, nil
-	} else if err != gorm.ErrRecordNotFound {
-		return nil, fmt.Errorf("query model-level discount: %w", err)
-	}
-
-	// Step 3: Check AgentLevelDiscount global (model_id IS NULL)
-	var globalDiscount model.AgentLevelDiscount
-	err = r.db.WithContext(ctx).
-		Where("level = ? AND model_id IS NULL", agentLevel).
-		First(&globalDiscount).Error
-	if err == nil {
-		return &DiscountResult{
-			Type:           "level_discount",
-			PricingType:    "DISCOUNT",
-			InputDiscount:  globalDiscount.InputDiscount,
-			OutputDiscount: globalDiscount.OutputDiscount,
-		}, nil
-	} else if err != gorm.ErrRecordNotFound {
-		return nil, fmt.Errorf("query global-level discount: %w", err)
-	}
-
-	// Step 4: No discount
+	// Step 1: No discount (代理折扣已移除,只剩 user 级)
 	return &DiscountResult{
 		Type:           "none",
 		PricingType:    "NONE",
 		InputDiscount:  1.0,
 		OutputDiscount: 1.0,
 	}, nil
-}
-
-// buildAgentPricingResult 将 AgentPricing 转换为 DiscountResult
-func (r *DiscountResolver) buildAgentPricingResult(ap *model.AgentPricing) *DiscountResult {
-	result := &DiscountResult{
-		Type:           "agent_custom",
-		PricingType:    ap.PricingType,
-		InputDiscount:  1.0,
-		OutputDiscount: 1.0,
-	}
-	switch ap.PricingType {
-	case "FIXED":
-		result.FixedInput = ap.InputPrice
-		result.FixedOutput = ap.OutputPrice
-	case "MARKUP":
-		result.MarkupRate = ap.MarkupRate
-	case "DISCOUNT":
-		if ap.DiscountRate != nil {
-			result.InputDiscount = *ap.DiscountRate
-			result.OutputDiscount = *ap.DiscountRate
-		}
-	}
-	return result
 }
 
 // buildUserDiscountResult 将 UserModelDiscount 转换为 DiscountResult

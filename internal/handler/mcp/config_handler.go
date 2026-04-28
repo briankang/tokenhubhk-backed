@@ -25,87 +25,130 @@ func (h *ConfigHandler) Register(rg *gin.RouterGroup) {
 
 // GenerateConfig 处理 GET /api/v1/mcp/config?tool=cursor&token=sk-xxx
 // 根据指定工具生成对应的 MCP 配置片段
-// 支持的工具: claude_desktop, cursor, continue, cline, windsurf, generic
+// 支持的工具: claude_desktop, claude_code, cursor, vscode, copilot, continue, cline, roo_code, windsurf, zed, chatgpt, librechat, goose, generic
 func (h *ConfigHandler) GenerateConfig(c *gin.Context) {
 	tool := c.DefaultQuery("tool", "generic")
 	apiKey := c.DefaultQuery("token", "sk-your-api-key")
 
 	// 获取服务器基础 URL
 	baseURL := getBaseURL()
-	sseURL := fmt.Sprintf("%s/api/v1/mcp/sse?token=%s", baseURL, apiKey)
+	httpURL := fmt.Sprintf("%s/api/v1/mcp", baseURL)
+	authHeaders := map[string]interface{}{
+		"Authorization": "Bearer " + apiKey,
+	}
 
 	var config interface{}
 	var filename string
 
 	switch tool {
 	case "claude_desktop", "claude":
-		// Claude Desktop 配置格式（claude_desktop_config.json）
 		config = map[string]interface{}{
 			"mcpServers": map[string]interface{}{
 				"tokenhub": map[string]interface{}{
-					"url":       sseURL,
-					"transport": "sse",
+					"type":    "http",
+					"url":     httpURL,
+					"headers": authHeaders,
 				},
 			},
 		}
 		filename = "claude_desktop_config.json"
 
-	case "cursor":
-		// Cursor 配置格式（.cursor/mcp.json）
+	case "claude_code":
 		config = map[string]interface{}{
 			"mcpServers": map[string]interface{}{
 				"tokenhub": map[string]interface{}{
-					"url":       sseURL,
-					"transport": "sse",
+					"type":    "http",
+					"url":     httpURL,
+					"headers": authHeaders,
+				},
+			},
+		}
+		filename = ".mcp.json"
+
+	case "cursor":
+		config = map[string]interface{}{
+			"mcpServers": map[string]interface{}{
+				"tokenhub": map[string]interface{}{
+					"type":    "http",
+					"url":     httpURL,
+					"headers": authHeaders,
 				},
 			},
 		}
 		filename = ".cursor/mcp.json"
 
+	case "vscode", "copilot":
+		config = map[string]interface{}{
+			"servers": map[string]interface{}{
+				"tokenhub": map[string]interface{}{
+					"type":    "http",
+					"url":     httpURL,
+					"headers": authHeaders,
+				},
+			},
+		}
+		filename = ".vscode/mcp.json"
+
 	case "continue":
-		// Continue 配置格式（.continue/config.yaml 中的 MCP 部分）
 		config = map[string]interface{}{
 			"mcpServers": []map[string]interface{}{
 				{
 					"name":      "tokenhub",
-					"url":       sseURL,
-					"transport": "sse",
+					"url":       httpURL,
+					"transport": "http",
+					"headers":   authHeaders,
 				},
 			},
 		}
 		filename = ".continue/config.yaml (mcpServers section)"
 
-	case "cline":
-		// Cline 配置格式
+	case "cline", "roo_code":
 		config = map[string]interface{}{
 			"mcpServers": map[string]interface{}{
 				"tokenhub": map[string]interface{}{
-					"url":       sseURL,
-					"transport": "sse",
-					"disabled":  false,
+					"type":     "streamableHttp",
+					"url":      httpURL,
+					"headers":  authHeaders,
+					"disabled": false,
 				},
 			},
 		}
-		filename = "cline_mcp_settings.json"
+		if tool == "roo_code" {
+			filename = "roo_cline_mcp_settings.json"
+		} else {
+			filename = "cline_mcp_settings.json"
+		}
 
-	case "windsurf":
-		// Windsurf 配置格式
+	case "windsurf", "zed", "librechat", "goose":
 		config = map[string]interface{}{
 			"mcpServers": map[string]interface{}{
 				"tokenhub": map[string]interface{}{
-					"serverUrl": sseURL,
+					"url":     httpURL,
+					"type":    "http",
+					"headers": authHeaders,
 				},
 			},
 		}
-		filename = "~/.codeium/windsurf/mcp_config.json"
+		filename = "mcp_config.json"
+
+	case "chatgpt":
+		config = map[string]interface{}{
+			"name": "tokenhub",
+			"url":  httpURL,
+			"authentication": map[string]interface{}{
+				"type":  "bearer",
+				"token": apiKey,
+			},
+		}
+		filename = "ChatGPT custom connector"
 
 	default:
-		// 通用配置格式
 		config = map[string]interface{}{
 			"mcpServers": map[string]interface{}{
 				"tokenhub": map[string]interface{}{
-					"url":       sseURL,
-					"transport": "sse",
+					"type":    "http",
+					"url":     httpURL,
+					"headers": authHeaders,
 				},
 			},
 		}
@@ -113,11 +156,12 @@ func (h *ConfigHandler) GenerateConfig(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"tool":     tool,
-		"filename": filename,
-		"config":   config,
+		"tool":         tool,
+		"filename":     filename,
+		"config":       config,
 		"instructions": getInstructions(tool),
 		"endpoints": map[string]string{
+			"http":     httpURL,
 			"sse":      fmt.Sprintf("%s/api/v1/mcp/sse", baseURL),
 			"message":  fmt.Sprintf("%s/api/v1/mcp/message", baseURL),
 			"manifest": fmt.Sprintf("%s/api/v1/mcp/manifest", baseURL),
@@ -171,6 +215,6 @@ func getInstructions(tool string) string {
 	default:
 		return "将以下 MCP 配置添加到你的 AI 工具中。" +
 			"\n大多数支持 MCP 的工具都使用类似的配置格式。" +
-			"\n确保你的 API Key 有效，然后将 SSE URL 配置到工具中即可。"
+			"\n确保你的 API Key 有效，然后将 HTTP Endpoint 和 Authorization Header 配置到工具中即可。"
 	}
 }

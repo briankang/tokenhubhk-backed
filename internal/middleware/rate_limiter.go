@@ -30,15 +30,32 @@ const (
 	rateLimitWindow = 60 * time.Second
 	// 默认各级别限流阈值
 	// 指导原则：IP 宽松（共享出口防误伤） + 用户适中（Dashboard 并发留余量） + API Key 收紧（被盗快速熔断）
-	defaultIPRPM      = 600  // IP级：10 QPS 余量，CGNAT/办公室出口 IP 共享不误伤
-	defaultUserRPM    = 300  // 用户级：Dashboard 首屏并发 20+ 留 10 倍余量
-	defaultAPIKeyRPM  = 120  // API Key级：企业 Key 默认 2 QPS，高需求管理后台单独调高
-	defaultGlobalQPS  = 1000 // 全局 QPS 上限
+	defaultIPRPM     = 600  // IP级：10 QPS 余量，CGNAT/办公室出口 IP 共享不误伤
+	defaultUserRPM   = 300  // 用户级：Dashboard 首屏并发 20+ 留 10 倍余量
+	defaultAPIKeyRPM = 120  // API Key级：企业 Key 默认 2 QPS，高需求管理后台单独调高
+	defaultGlobalQPS = 1000 // 全局 QPS 上限
 )
 
 // globalRequestCounter 全局请求计数器（原子操作，每秒重置）
 var globalRequestCounter int64
 var globalCounterResetTime int64
+var rateLimiterConfigCache atomic.Value
+var rateLimiterConfigCacheUntil int64
+
+const rateLimiterConfigCacheTTL = 2 * time.Second
+
+var slidingWindowLua = goredis.NewScript(`
+redis.call("ZREMRANGEBYSCORE", KEYS[1], "0", ARGV[2])
+local count = redis.call("ZCARD", KEYS[1])
+local limit = tonumber(ARGV[5])
+if count >= limit then
+	redis.call("PEXPIRE", KEYS[1], ARGV[3])
+	return {0, count}
+end
+redis.call("ZADD", KEYS[1], ARGV[1], ARGV[4])
+redis.call("PEXPIRE", KEYS[1], ARGV[3])
+return {1, count + 1}
+`)
 
 // RateLimiterConfig 限流配置（可由管理后台动态调整）
 type RateLimiterConfig struct {
@@ -60,6 +77,13 @@ func DefaultRateLimiterConfig() *RateLimiterConfig {
 
 // LoadRateLimiterConfig 从 Redis 加载动态限流配置，加载失败则使用默认值
 func LoadRateLimiterConfig() *RateLimiterConfig {
+	now := time.Now()
+	if cached := rateLimiterConfigCache.Load(); cached != nil && now.UnixNano() < atomic.LoadInt64(&rateLimiterConfigCacheUntil) {
+		if cfg, ok := cached.(*RateLimiterConfig); ok {
+			return cfg
+		}
+	}
+
 	cfg := DefaultRateLimiterConfig()
 	if pkgredis.Client == nil {
 		return cfg
@@ -89,6 +113,8 @@ func LoadRateLimiterConfig() *RateLimiterConfig {
 			}
 		}
 	}
+	rateLimiterConfigCache.Store(cfg)
+	atomic.StoreInt64(&rateLimiterConfigCacheUntil, now.Add(rateLimiterConfigCacheTTL).UnixNano())
 	return cfg
 }
 
@@ -98,12 +124,17 @@ func SaveRateLimiterConfig(cfg *RateLimiterConfig) error {
 		return fmt.Errorf("redis not available")
 	}
 	ctx := context.Background()
-	return pkgredis.Client.HSet(ctx, "config:rate_limits", map[string]interface{}{
+	if err := pkgredis.Client.HSet(ctx, "config:rate_limits", map[string]interface{}{
 		"ip_rpm":      cfg.IPRPM,
 		"user_rpm":    cfg.UserRPM,
 		"api_key_rpm": cfg.APIKeyRPM,
 		"global_qps":  cfg.GlobalQPS,
-	}).Err()
+	}).Err(); err != nil {
+		return err
+	}
+	rateLimiterConfigCache.Store(cfg)
+	atomic.StoreInt64(&rateLimiterConfigCacheUntil, time.Now().Add(rateLimiterConfigCacheTTL).UnixNano())
+	return nil
 }
 
 // MultiLevelRateLimiter 多层级限流中间件
@@ -112,6 +143,11 @@ func SaveRateLimiterConfig(cfg *RateLimiterConfig) error {
 // 特殊头 X-Test-Skip-RateLimit + RATE_LIMIT_BYPASS_TOKEN 环境变量可在测试时绕过
 func MultiLevelRateLimiter() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if IsHealthPath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+
 		// 测试绕过：RATE_LIMIT_BYPASS_TOKEN 环境变量非空且 Header 匹配时放行
 		if bypassToken := os.Getenv("RATE_LIMIT_BYPASS_TOKEN"); bypassToken != "" {
 			if c.GetHeader("X-Test-Skip-RateLimit") == bypassToken {
@@ -212,8 +248,15 @@ func checkGlobalQPS(maxQPS int) bool {
 // 步骤：ZADD + ZREMRANGEBYSCORE（清除窗口外） + ZCARD（计数）
 // 返回：true=放行，false=已拒绝并设置响应
 func slidingWindowCheck(ctx context.Context, redis *goredis.Client, key string, limit int, c *gin.Context) bool {
+	if limit <= 0 {
+		return true
+	}
+
 	now := time.Now().UnixMilli()
 	windowStart := now - rateLimitWindow.Milliseconds()
+	if allowed, count, ok := runSlidingWindowLua(ctx, redis, key, limit, now, windowStart); ok {
+		return finishSlidingWindowCheck(c, key, limit, allowed, count)
+	}
 
 	pipe := redis.Pipeline()
 	// 移除滑动窗口外的过期条目
@@ -232,6 +275,7 @@ func slidingWindowCheck(ctx context.Context, redis *goredis.Client, key string, 
 	}
 
 	count := countCmd.Val()
+	allowed := count < int64(limit)
 	remaining := int64(limit) - count
 	if remaining < 0 {
 		remaining = 0
@@ -242,7 +286,7 @@ func slidingWindowCheck(ctx context.Context, redis *goredis.Client, key string, 
 	setRateLimitHeaders(c, limit, remaining, resetTime)
 
 	// 超限返回 429，消息中包含重置时间
-	if count >= int64(limit) {
+	if !allowed {
 		secondsUntilReset := resetTime - time.Now().Unix()
 		if secondsUntilReset < 1 {
 			secondsUntilReset = 1
@@ -257,6 +301,45 @@ func slidingWindowCheck(ctx context.Context, redis *goredis.Client, key string, 
 		return false
 	}
 
+	return true
+}
+
+func runSlidingWindowLua(ctx context.Context, redis *goredis.Client, key string, limit int, now, windowStart int64) (bool, int64, bool) {
+	member := fmt.Sprintf("%d:%d", now, time.Now().UnixNano()%1000000)
+	ttlMs := int64((rateLimitWindow + time.Second) / time.Millisecond)
+	result, err := slidingWindowLua.Run(ctx, redis, []string{key}, now, windowStart, ttlMs, member, limit).Result()
+	if err != nil {
+		return false, 0, false
+	}
+	values, ok := result.([]interface{})
+	if !ok || len(values) < 2 {
+		return false, 0, false
+	}
+	allowed, _ := values[0].(int64)
+	count, _ := values[1].(int64)
+	return allowed == 1, count, true
+}
+
+func finishSlidingWindowCheck(c *gin.Context, key string, limit int, allowed bool, count int64) bool {
+	remaining := int64(limit) - count
+	if remaining < 0 {
+		remaining = 0
+	}
+	resetTime := time.Now().Add(rateLimitWindow).Unix()
+	setRateLimitHeaders(c, limit, remaining, resetTime)
+	if !allowed {
+		secondsUntilReset := resetTime - time.Now().Unix()
+		if secondsUntilReset < 1 {
+			secondsUntilReset = 1
+		}
+		c.Header("Retry-After", strconv.FormatInt(secondsUntilReset, 10))
+		subjectType, subjectID, rule := parseRateLimitKey(key)
+		recordRateLimitEvent(c, subjectType, subjectID, rule, limit, int(rateLimitWindow.Seconds()))
+		response.ErrorMsg(c, http.StatusTooManyRequests, errcode.ErrRateLimit.Code,
+			fmt.Sprintf("Too many requests, please retry after %d seconds", secondsUntilReset))
+		c.Abort()
+		return false
+	}
 	return true
 }
 

@@ -7,6 +7,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"tokenhub-server/internal/database"
+	"tokenhub-server/internal/middleware"
+	"tokenhub-server/internal/model"
 	"tokenhub-server/internal/pkg/errcode"
 	"tokenhub-server/internal/pkg/response"
 	permissionsvc "tokenhub-server/internal/service/permission"
@@ -221,6 +224,24 @@ func (h *RoleAdminHandler) RevokeUserRole(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, errcode.ErrBadRequest)
 		return
 	}
+
+	// 受保护管理员账号守卫: 撤销 admin@tokenhubhk.com 的 SUPER_ADMIN 角色
+	// 视为高危,即使 admin 本人也禁止 (防止账号被降级失去管理权限)
+	if database.DB != nil {
+		var targetUser model.User
+		if err := database.DB.Select("email").Where("id = ?", uid).First(&targetUser).Error; err == nil {
+			if middleware.ShouldBlockProtectedAdminCritical(targetUser.Email) {
+				var roleCode string
+				database.DB.Table("roles").Where("id = ?", rid).Select("code").Scan(&roleCode)
+				if roleCode == "SUPER_ADMIN" {
+					response.ErrorMsg(c, http.StatusForbidden, 40301,
+						"cannot revoke SUPER_ADMIN role from protected admin account; this is a critical operation forbidden by CLAUDE.md covenant")
+					return
+				}
+			}
+		}
+	}
+
 	if err := h.svc.RevokeUserRole(c.Request.Context(), uid, rid); err != nil {
 		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
 		return

@@ -18,55 +18,45 @@ import (
 	"tokenhub-server/internal/pkg/logger"
 )
 
-// =====================================================
-// 阿里云（百炼平台）价格爬虫
-// 使用 DashScope 原生 API 获取模型列表及定价
-// API 端点: GET https://dashscope.aliyuncs.com/api/v1/models
-// 该 API 返回完整的模型元数据和分层价格，无需浏览器渲染
-// =====================================================
+// Alibaba DashScope price scraper.
+// It uses the native model list API and supplements known official pricing gaps.
 
 const (
-	// alibabaAPIURL 阿里云 DashScope 原生模型列表 API（用于获取模型元数据）
-	alibabaAPIURL = "https://dashscope.aliyuncs.com/api/v1/models"
-	// alibabaPriceDocURL 阿里云百炼官方定价页（用于 SourceURL 展示和浏览器抓取）
-	alibabaPriceDocURL = "https://help.aliyun.com/zh/model-studio/model-pricing"
-	// alibabaSupplierName 供应商名称标识
+	alibabaAPIURL       = "https://dashscope.aliyuncs.com/api/v1/models"
+	alibabaPriceDocURL  = "https://help.aliyun.com/zh/model-studio/model-pricing"
 	alibabaSupplierName = "阿里云百炼"
-	// alibabaPageSize 每页模型数
-	alibabaPageSize = 200
+	alibabaPageSize     = 200
 )
 
-// AlibabaScraper 阿里云价格爬虫（基于 API）
 type AlibabaScraper struct {
 	apiKey     string
 	httpClient *http.Client
 }
 
-// SetAPIKey 动态更新 API Key（优先使用渠道配置的 Key）
+// SetAPIKey updates the scraper API key, usually from channel config.
 func (s *AlibabaScraper) SetAPIKey(key string) {
 	if key != "" {
 		s.apiKey = key
 	}
 }
 
-// NewAlibabaScraper 创建阿里云爬虫实例
 func NewAlibabaScraper(apiKey string) *AlibabaScraper {
-	// 自定义 Transport：强制 HTTP/1.1（避免 Docker 环境下 HTTP/2 导致 unexpected EOF），
-	// TLSNextProto 设为空 map 可彻底禁用 HTTP/2
+	// 鑷畾涔?Transport锛氬己鍒?HTTP/1.1锛堥伩鍏?Docker 鐜涓?HTTP/2 瀵艰嚧 unexpected EOF锛夛紝
+	// TLSNextProto 璁句负绌?map 鍙交搴曠鐢?HTTP/2
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},
-		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper), // 强制 HTTP/1.1
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper), // 寮哄埗 HTTP/1.1
 		DialContext: (&net.Dialer{
 			Timeout:   15 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout:  30 * time.Second,
-		MaxIdleConns:           10,
-		IdleConnTimeout:        90 * time.Second,
-		ForceAttemptHTTP2:      false,
+		ResponseHeaderTimeout: 30 * time.Second,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2:     false,
 	}
 
 	return &AlibabaScraper{
@@ -78,28 +68,28 @@ func NewAlibabaScraper(apiKey string) *AlibabaScraper {
 	}
 }
 
-// ---- API 响应结构 ----
+// ---- API 鍝嶅簲缁撴瀯 ----
 
 type alibabaAPIResponse struct {
 	Code    interface{} `json:"code"`
 	Message string      `json:"message"`
 	Success bool        `json:"success"`
 	Output  struct {
-		Total    int             `json:"total"`
-		PageNo   int             `json:"page_no"`
-		PageSize int             `json:"page_size"`
-		Models   []alibabaModel  `json:"models"`
+		Total    int            `json:"total"`
+		PageNo   int            `json:"page_no"`
+		PageSize int            `json:"page_size"`
+		Models   []alibabaModel `json:"models"`
 	} `json:"output"`
 }
 
 type alibabaModel struct {
-	Model       string              `json:"model"`       // 模型 ID，如 "qwen3-max"
-	Name        string              `json:"name"`        // 展示名称，如 "Qwen3-Max"
-	Description string              `json:"description"` // 中文描述
-	Provider    string              `json:"provider"`    // 提供商，如 "qwen"
-	Capabilities []string           `json:"capabilities"` // 能力标签 ["TG", "Reasoning"]
-	ModelInfo   *alibabaModelInfo   `json:"model_info"`
-	Prices      []alibabaPriceRange `json:"prices"`      // 分层定价
+	Model        string              `json:"model"`        // 妯″瀷 ID锛屽 "qwen3-max"
+	Name         string              `json:"name"`         // 灞曠ず鍚嶇О锛屽 "Qwen3-Max"
+	Description  string              `json:"description"`  // 涓枃鎻忚堪
+	Provider     string              `json:"provider"`     // 鎻愪緵鍟嗭紝濡?"qwen"
+	Capabilities []string            `json:"capabilities"` // 鑳藉姏鏍囩 ["TG", "Reasoning"]
+	ModelInfo    *alibabaModelInfo   `json:"model_info"`
+	Prices       []alibabaPriceRange `json:"prices"` // 鍒嗗眰瀹氫环
 }
 
 type alibabaModelInfo struct {
@@ -109,39 +99,37 @@ type alibabaModelInfo struct {
 }
 
 type alibabaPriceRange struct {
-	RangeName  string             `json:"range_name"`  // 如 "input<=128k"
-	PriceRange string             `json:"price_range"`  // 兼容旧格式
-	Prices     []alibabaPriceItem `json:"prices"`       // 实际字段名为 prices
+	RangeName  string             `json:"range_name"`
+	PriceRange string             `json:"price_range"`
+	Prices     []alibabaPriceItem `json:"prices"`
 }
 
 type alibabaPriceItem struct {
-	Type      string `json:"type"`       // "input_token", "output_token" 等
-	Price     string `json:"price"`      // 价格字符串，如 "2.5"
-	PriceUnit string `json:"price_unit"` // "每百万tokens"
-	PriceName string `json:"price_name"` // 中文名
+	Type      string `json:"type"`
+	Price     string `json:"price"`
+	PriceUnit string `json:"price_unit"`
+	PriceName string `json:"price_name"`
 }
 
-// ScrapePrices 通过 API 获取阿里云模型价格
 func (s *AlibabaScraper) ScrapePrices(ctx context.Context) (*ScrapedPriceData, error) {
 	log := logger.L
 	if log == nil {
 		log = zap.NewNop()
 	}
 
-	log.Info("开始通过 API 获取阿里云百炼价格", zap.String("url", alibabaAPIURL))
+	log.Info("start fetching Alibaba DashScope prices", zap.String("url", alibabaAPIURL))
 
-	// 分页获取所有模型
 	var allModels []alibabaModel
 	pageNo := 1
 
 	for {
 		models, total, err := s.fetchPage(ctx, pageNo)
 		if err != nil {
-			return nil, fmt.Errorf("获取阿里云模型列表第 %d 页失败: %w", pageNo, err)
+			return nil, fmt.Errorf("鑾峰彇闃块噷浜戞ā鍨嬪垪琛ㄧ %d 椤靛け璐? %w", pageNo, err)
 		}
 
 		allModels = append(allModels, models...)
-		log.Info("获取阿里云模型列表",
+		log.Info("fetched Alibaba model page",
 			zap.Int("page", pageNo),
 			zap.Int("fetched", len(models)),
 			zap.Int("total", total))
@@ -152,9 +140,9 @@ func (s *AlibabaScraper) ScrapePrices(ctx context.Context) (*ScrapedPriceData, e
 		pageNo++
 	}
 
-	// 转换为 ScrapedModel
+	// 杞崲涓?ScrapedModel
 	var scrapedModels []ScrapedModel
-	seen := make(map[string]bool) // 去重
+	seen := make(map[string]bool) // 鍘婚噸
 
 	for _, m := range allModels {
 		if seen[m.Model] {
@@ -168,16 +156,13 @@ func (s *AlibabaScraper) ScrapePrices(ctx context.Context) (*ScrapedPriceData, e
 		}
 	}
 
-	// v3.5：合并补充价格表（图片/视频/TTS/ASR/Embedding/Rerank 等非 Token 模型）
-	// API 返回值优先，仅在 API 未覆盖时用硬编码数据兜底
+	// Merge supplementary prices for non-token models when the API omits them.
 	scrapedModels = mergeAlibabaWithSupplementary(scrapedModels, getAlibabaSupplementaryPrices())
 
-	// v4.4：合并阿里云思考模式双价格覆盖表（官网文档页拆列的模型）
-	// API 返回的 output_token 是统一价，官网文档页对部分推理模型分列「非思考 / 思考」，
-	// 本表仅对这些确定拆列的模型，按阶梯 name 对齐覆盖 OutputPriceThinking 字段。
+	// Merge explicit thinking-output prices documented on the official pricing page.
 	scrapedModels = applyAlibabaThinkingOverrides(scrapedModels, getAlibabaThinkingPrices())
 
-	log.Info("阿里云 API 价格获取完成",
+	log.Info("闃块噷浜?API 浠锋牸鑾峰彇瀹屾垚",
 		zap.Int("api_models", len(allModels)),
 		zap.Int("with_prices", len(scrapedModels)))
 
@@ -185,12 +170,11 @@ func (s *AlibabaScraper) ScrapePrices(ctx context.Context) (*ScrapedPriceData, e
 		SupplierName: alibabaSupplierName,
 		FetchedAt:    time.Now(),
 		Models:       scrapedModels,
-		// SourceURL 使用官方定价页（不是 API 端点），便于前端"查看官网定价"跳转
+		// SourceURL 浣跨敤瀹樻柟瀹氫环椤碉紙涓嶆槸 API 绔偣锛夛紝渚夸簬鍓嶇"鏌ョ湅瀹樼綉瀹氫环"璺宠浆
 		SourceURL: alibabaPriceDocURL,
 	}, nil
 }
 
-// fetchPage 获取单页模型数据（含重试）
 func (s *AlibabaScraper) fetchPage(ctx context.Context, pageNo int) ([]alibabaModel, int, error) {
 	url := fmt.Sprintf("%s?page_no=%d&page_size=%d", alibabaAPIURL, pageNo, alibabaPageSize)
 
@@ -206,13 +190,13 @@ func (s *AlibabaScraper) fetchPage(ctx context.Context, pageNo int) ([]alibabaMo
 
 		log := logger.L
 		if log != nil {
-			log.Warn("阿里云 API 请求失败，准备重试",
+			log.Warn("Alibaba API request failed, retrying",
 				zap.Int("attempt", attempt),
 				zap.Int("max_retries", maxRetries),
 				zap.Error(err))
 		}
 
-		// EOF 错误时关闭空闲连接，强制建立新连接
+		// Close idle connections after transient EOF/network errors.
 		if s.httpClient.Transport != nil {
 			if t, ok := s.httpClient.Transport.(*http.Transport); ok {
 				t.CloseIdleConnections()
@@ -228,10 +212,10 @@ func (s *AlibabaScraper) fetchPage(ctx context.Context, pageNo int) ([]alibabaMo
 		}
 	}
 
-	return nil, 0, fmt.Errorf("重试 %d 次后仍失败: %w", maxRetries, lastErr)
+	return nil, 0, fmt.Errorf("閲嶈瘯 %d 娆″悗浠嶅け璐? %w", maxRetries, lastErr)
 }
 
-// doFetchPage 执行单次 HTTP 请求获取模型数据
+// doFetchPage 鎵ц鍗曟 HTTP 璇锋眰鑾峰彇妯″瀷鏁版嵁
 func (s *AlibabaScraper) doFetchPage(ctx context.Context, url string) ([]alibabaModel, int, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -240,35 +224,34 @@ func (s *AlibabaScraper) doFetchPage(ctx context.Context, url string) ([]alibaba
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "application/json")
-	// 使用 Connection: close 避免连接复用导致的 EOF
+	// 浣跨敤 Connection: close 閬垮厤杩炴帴澶嶇敤瀵艰嚧鐨?EOF
 	req.Header.Set("Connection", "close")
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("HTTP 请求失败: %w", err)
+		return nil, 0, fmt.Errorf("HTTP 璇锋眰澶辫触: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, 0, fmt.Errorf("读取响应失败: %w", err)
+		return nil, 0, fmt.Errorf("璇诲彇鍝嶅簲澶辫触: %w", err)
 	}
 
 	if resp.StatusCode != 200 {
-		return nil, 0, fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(body[:min(len(body), 500)]))
+		return nil, 0, fmt.Errorf("API 杩斿洖 %d: %s", resp.StatusCode, string(body[:min(len(body), 500)]))
 	}
 
 	var apiResp alibabaAPIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, 0, fmt.Errorf("解析 JSON 失败: %w", err)
+		return nil, 0, fmt.Errorf("瑙ｆ瀽 JSON 澶辫触: %w", err)
 	}
 
 	return apiResp.Output.Models, apiResp.Output.Total, nil
 }
 
-// convertModel 将 API 模型数据转换为 ScrapedModel
-// v3.5：支持全类型模型（LLM/VLM/Image/Video/TTS/ASR/Embedding/Rerank）
-// 按 Prices[].Type 推断计费单位，按模型名 + capabilities 推断模型类型
+// convertModel 灏?API 妯″瀷鏁版嵁杞崲涓?ScrapedModel
+// v3.5锛氭敮鎸佸叏绫诲瀷妯″瀷锛圠LM/VLM/Image/Video/TTS/ASR/Embedding/Rerank锛?// 鎸?Prices[].Type 鎺ㄦ柇璁¤垂鍗曚綅锛屾寜妯″瀷鍚?+ capabilities 鎺ㄦ柇妯″瀷绫诲瀷
 func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 	sm := ScrapedModel{
 		ModelName:   m.Model,
@@ -276,24 +259,20 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 		Currency:    "CNY",
 	}
 
-	// 1. 推断模型类型（优先 capabilities，其次模型名）
+	// Infer model type from capabilities first, then model name.
 	sm.ModelType = inferAlibabaModelType(m.Model, m.Capabilities)
 
-	// 2. 遍历所有价格层级，按 type 分类
-	// 注意 Aliyun API 的 Type 字段可能包含：
-	//   input_token / output_token                 — Token 计费（LLM/VLM/Embedding）
-	//   input_image / output_image / image / per_image — 图片计费（按张）
-	//   input_video_sec / per_second / per_sec     — 视频/ASR 按秒
-	//   input_audio_10k_chars / per_10k_chars      — TTS 按万字符
-	//   per_million_chars / per_million_characters  — TTS 按百万字符
-	//   per_call / per_request                     — Rerank 按次
-	//   per_hour                                   — ASR 按小时
-	//   per_minute                                 — ASR 按分钟
+	// 2. 閬嶅巻鎵€鏈変环鏍煎眰绾э紝鎸?type 鍒嗙被
+	// 娉ㄦ剰 Aliyun API 鐨?Type 瀛楁鍙兘鍖呭惈锛?	//   input_token / output_token                 鈥?Token 璁¤垂锛圠LM/VLM/Embedding锛?	//   input_image / output_image / image / per_image 鈥?鍥剧墖璁¤垂锛堟寜寮狅級
+	//   input_video_sec / per_second / per_sec     鈥?瑙嗛/ASR 鎸夌
+	//   input_audio_10k_chars / per_10k_chars      鈥?TTS 鎸変竾瀛楃
+	//   per_million_chars / per_million_characters  鈥?TTS 鎸夌櫨涓囧瓧绗?	//   per_call / per_request                     鈥?Rerank 鎸夋
+	//   per_hour / per_minute                     duration-based ASR units
 	var hasAnyPrice bool
 	for _, priceRange := range m.Prices {
 		var inputPrice, outputPrice float64
 		var tierUnit string
-		var outputThinkingPrice float64 // 思考模式输出价（阿里云 qwen3.5-plus/qwen3.6-plus 等；API 若不区分则保持 0）
+		var outputThinkingPrice float64
 		for _, item := range priceRange.Prices {
 			price, err := strconv.ParseFloat(item.Price, 64)
 			if err != nil || price <= 0 {
@@ -302,7 +281,7 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 
 			typeLower := strings.ToLower(item.Type)
 			priceNameLower := strings.ToLower(item.PriceName)
-			// 识别思考模式：Type 含 thinking/reasoning，或中文 PriceName 含"思考模式"/"思维链"
+			// Identify thinking/reasoning output prices when the API exposes a split.
 			isThinking := strings.Contains(typeLower, "thinking") ||
 				strings.Contains(typeLower, "reasoning") ||
 				strings.Contains(priceNameLower, "thinking") ||
@@ -310,7 +289,7 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 				strings.Contains(item.PriceName, "思维链")
 
 			switch {
-			// ---- Token 计费 ----
+			// ---- Token 璁¤垂 ----
 			case typeLower == "input_token" || typeLower == "input_tokens":
 				inputPrice = price
 				tierUnit = PricingUnitPerMillionTokens
@@ -321,38 +300,37 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 					outputPrice = price
 				}
 				tierUnit = PricingUnitPerMillionTokens
-			// 思考模式专用 Type（若阿里云 API 未来改用独立 type 字段）
-			case typeLower == "output_token_thinking" || typeLower == "output_tokens_thinking":
+				// 鎬濊€冩ā寮忎笓鐢?Type锛堣嫢闃块噷浜?API 鏈潵鏀圭敤鐙珛 type 瀛楁锛?			case typeLower == "output_token_thinking" || typeLower == "output_tokens_thinking":
 				outputThinkingPrice = price
 				tierUnit = PricingUnitPerMillionTokens
-			// ---- 图片计费（按张）----
+			// ---- 鍥剧墖璁¤垂锛堟寜寮狅級----
 			case strings.Contains(typeLower, "image") || strings.Contains(typeLower, "per_image"):
 				inputPrice = price
 				tierUnit = PricingUnitPerImage
-			// ---- 视频 / ASR 按秒 ----
+			// ---- 瑙嗛 / ASR 鎸夌 ----
 			case typeLower == "per_second" || typeLower == "per_sec" ||
 				strings.Contains(typeLower, "video_sec") || strings.Contains(typeLower, "_sec"):
 				inputPrice = price
 				tierUnit = PricingUnitPerSecond
-			// ---- ASR 按分钟 ----
+			// ---- ASR 鎸夊垎閽?----
 			case strings.Contains(typeLower, "per_minute") || strings.Contains(typeLower, "minute"):
 				inputPrice = price
 				tierUnit = PricingUnitPerMinute
-			// ---- ASR 按小时 ----
+			// ---- ASR 鎸夊皬鏃?----
 			case strings.Contains(typeLower, "per_hour") || strings.Contains(typeLower, "hour"):
 				inputPrice = price
 				tierUnit = PricingUnitPerHour
-			// ---- TTS 按万字符 ----
+			// ---- TTS 鎸変竾瀛楃 ----
 			case strings.Contains(typeLower, "10k_chars") || strings.Contains(typeLower, "10k_character") ||
 				strings.Contains(typeLower, "万字符"):
 				inputPrice = price
 				tierUnit = PricingUnitPer10kCharacters
-			// ---- TTS 按百万字符 ----
-			case strings.Contains(typeLower, "million_char") || strings.Contains(typeLower, "百万字符") ||
+			// ---- TTS 鎸夌櫨涓囧瓧绗?----
+			case strings.Contains(typeLower, "million_char") || strings.Contains(typeLower, "鐧句竾瀛楃") ||
 				strings.Contains(typeLower, "per_m_chars"):
 				inputPrice = price
 				tierUnit = PricingUnitPerMillionCharacters
-			// ---- Rerank 按次 ----
+			// ---- Rerank 鎸夋 ----
 			case strings.Contains(typeLower, "per_call") || strings.Contains(typeLower, "per_request") ||
 				typeLower == "call":
 				inputPrice = price
@@ -367,7 +345,7 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 			continue
 		}
 
-		// 首个区间作为基础价格 + 计费单位
+		// 棣栦釜鍖洪棿浣滀负鍩虹浠锋牸 + 璁¤垂鍗曚綅
 		if sm.InputPrice == 0 && inputPrice > 0 {
 			sm.InputPrice = inputPrice
 		}
@@ -381,7 +359,7 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 			sm.PricingUnit = tierUnit
 		}
 
-		// 所有区间记录为 PriceTiers
+		// 鎵€鏈夊尯闂磋褰曚负 PriceTiers
 		tierName := priceRange.RangeName
 		if tierName == "" {
 			tierName = priceRange.PriceRange
@@ -395,38 +373,33 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 			OutputPrice:         outputPrice,
 			OutputPriceThinking: outputThinkingPrice,
 		}
-		// 仅 Token 计费单位注入阶梯缓存价（按张/按秒等不支持缓存）
 		if tierUnit == PricingUnitPerMillionTokens && inputPrice > 0 {
 			tier.CacheInputPrice = inputPrice * 0.20
 			tier.CacheWritePrice = inputPrice * 1.25
 		}
-		// 尝试从 price_range 解析 token 范围（Token 单位才有意义）
 		if tierUnit == PricingUnitPerMillionTokens {
 			parseTierRange(tierName, &tier)
 		}
 		sm.PriceTiers = append(sm.PriceTiers, tier)
 	}
 
-	// 3. 无任何价格 → 跳过
+	// 3. 鏃犱换浣曚环鏍?鈫?璺宠繃
 	if !hasAnyPrice {
 		return nil
 	}
 
-	// 4. 计费单位兜底（基于模型类型）
+	// 4. 璁¤垂鍗曚綅鍏滃簳锛堝熀浜庢ā鍨嬬被鍨嬶級
 	if sm.PricingUnit == "" {
 		sm.PricingUnit = inferPricingUnitFromName(sm.ModelName, sm.ModelType)
 	}
 
-	// 5. 缓存定价：仅 LLM/VLM 启用 both 模式（Embedding/Image/Video/TTS/ASR/Rerank 不支持）
-	// 阿里云百炼缓存规则（2026-04）：
-	//   - 隐式 auto：输入价 × 0.20（节省 80%，自动触发，无写入费，最小 1024 Token）
-	//   - 显式 explicit：输入价 × 0.10（节省 90%，需 cache_control 参数）
-	//   - 显式写入：输入价 × 1.25（首次写入溢价）
+	// 5. 缂撳瓨瀹氫环锛氫粎 LLM/VLM 鍚敤 both 妯″紡锛圗mbedding/Image/Video/TTS/ASR/Rerank 涓嶆敮鎸侊級
+	// 闃块噷浜戠櫨鐐肩紦瀛樿鍒欙紙2026-04锛夛細
+	//   - 闅愬紡 auto锛氳緭鍏ヤ环 脳 0.20锛堣妭鐪?80%锛岃嚜鍔ㄨЕ鍙戯紝鏃犲啓鍏ヨ垂锛屾渶灏?1024 Token锛?	//   - 鏄惧紡 explicit锛氳緭鍏ヤ环 脳 0.10锛堣妭鐪?90%锛岄渶 cache_control 鍙傛暟锛?	//   - 鏄惧紡鍐欏叆锛氳緭鍏ヤ环 脳 1.25锛堥娆″啓鍏ユ孩浠凤級
 	if (sm.ModelType == "LLM" || sm.ModelType == "VLM" || sm.ModelType == "Vision") &&
 		sm.PricingUnit == PricingUnitPerMillionTokens && sm.InputPrice > 0 {
 		sm.SupportsCache = true
 		sm.CacheMechanism = "both"
-		sm.CacheMinTokens = 1024
 		sm.CacheInputPrice = sm.InputPrice * 0.20
 		sm.CacheExplicitInputPrice = sm.InputPrice * 0.10
 		sm.CacheWritePrice = sm.InputPrice * 1.25
@@ -435,12 +408,11 @@ func (s *AlibabaScraper) convertModel(m alibabaModel) *ScrapedModel {
 	return &sm
 }
 
-// inferAlibabaModelType 推断阿里云模型的类型
-// 优先级：Capabilities → 模型名关键字 → 默认 LLM
+// inferAlibabaModelType 鎺ㄦ柇闃块噷浜戞ā鍨嬬殑绫诲瀷
+// 浼樺厛绾э細Capabilities 鈫?妯″瀷鍚嶅叧閿瓧 鈫?榛樿 LLM
 func inferAlibabaModelType(modelName string, capabilities []string) string {
 	name := strings.ToLower(modelName)
 
-	// 1. 通过 capabilities 标签判断（阿里云 API 返回如 ["TG","Reasoning"]）
 	for _, c := range capabilities {
 		switch strings.ToUpper(c) {
 		case "IMAGE_GENERATION", "T2I", "I2I":
@@ -458,9 +430,9 @@ func inferAlibabaModelType(modelName string, capabilities []string) string {
 		}
 	}
 
-	// 2. 按模型名推断（与 modeldiscovery / scraper_service 保持一致）
-	// 注意检查顺序：video 必须先于 image（"-t2v" 优先于 "wan2"），
-	// 否则 "wan2.7-t2v" 会被 "wan2" 吞成 ImageGeneration
+	// 2. 鎸夋ā鍨嬪悕鎺ㄦ柇锛堜笌 modeldiscovery / scraper_service 淇濇寔涓€鑷达級
+	// 娉ㄦ剰妫€鏌ラ『搴忥細video 蹇呴』鍏堜簬 image锛?-t2v" 浼樺厛浜?"wan2"锛夛紝
+	// 鍚﹀垯 "wan2.7-t2v" 浼氳 "wan2" 鍚炴垚 ImageGeneration
 	switch {
 	case containsAnyStr(name, "-t2v", "video", "wanx-video", "wanx-t2v"):
 		return "VideoGeneration"
@@ -484,26 +456,24 @@ func inferAlibabaModelType(modelName string, capabilities []string) string {
 	}
 }
 
-// parseTierRange 从价格区间描述解析 token 范围，写入 tier 的 InputMin/InputMax 字段。
-// 支持格式（中英文混合）：
-//   "输入<=256k"           → (0, 256k]
-//   "128k<输入<=256k"      → (128k, 256k]
-//   "256k<输入<=1m"        → (256k, 1m]
-//   "输入>128k"            → (128k, +∞)
-//   "input<=128k"          → (0, 128k]
-//   "128k<input<=256k"     → (128k, 256k]
-//   "上下文<=32k"          → 同 "输入<=32k"
-//   "32k tokens"           → 仅含数字（宽松解析，作上限）
+// parseTierRange 浠庝环鏍煎尯闂存弿杩拌В鏋?token 鑼冨洿锛屽啓鍏?tier 鐨?InputMin/InputMax 瀛楁銆?// 鏀寔鏍煎紡锛堜腑鑻辨枃娣峰悎锛夛細
+//   "杈撳叆<=256k"           鈫?(0, 256k]
+//   "128k<杈撳叆<=256k"      鈫?(128k, 256k]
+//   "256k<杈撳叆<=1m"        鈫?(256k, 1m]
+//   "杈撳叆>128k"            鈫?(128k, +鈭?
+//   "input<=128k"          鈫?(0, 128k]
+//   "128k<input<=256k"     鈫?(128k, 256k]
+//   "涓婁笅鏂?=32k"          鈫?鍚?"杈撳叆<=32k"
+//   "32k tokens"           鈫?浠呭惈鏁板瓧锛堝鏉捐В鏋愶紝浣滀笂闄愶級
 func parseTierRange(rangeStr string, tier *model.PriceTier) {
-	// 统一替换中文关键字为英文占位符
 	normalized := strings.ToLower(rangeStr)
 	normalized = strings.ReplaceAll(normalized, "输入token数", "input")
-	normalized = strings.ReplaceAll(normalized, "输入tokens", "input")
-	normalized = strings.ReplaceAll(normalized, "输入token", "input")
+	normalized = strings.ReplaceAll(normalized, "杈撳叆tokens", "input")
+	normalized = strings.ReplaceAll(normalized, "杈撳叆token", "input")
 	normalized = strings.ReplaceAll(normalized, "上下文长度", "input")
 	normalized = strings.ReplaceAll(normalized, "上下文", "input")
-	normalized = strings.ReplaceAll(normalized, "输入", "input")
-	normalized = strings.ReplaceAll(normalized, "输出", "output")
+	normalized = strings.ReplaceAll(normalized, "杈撳叆", "input")
+	normalized = strings.ReplaceAll(normalized, "杈撳嚭", "output")
 	normalized = strings.ReplaceAll(normalized, "tokens", "")
 	normalized = strings.ReplaceAll(normalized, "token", "")
 	normalized = strings.TrimSpace(normalized)
@@ -533,13 +503,13 @@ func parseTierRange(rangeStr string, tier *model.PriceTier) {
 
 	ptr := func(v int64) *int64 { return &v }
 
-	// 情况1: "NNk<input<=NNk" 或 "NNk<input<NNk"（有下限和上限）
+	// 鎯呭喌1: "NNk<input<=NNk" 鎴?"NNk<input<NNk"锛堟湁涓嬮檺鍜屼笂闄愶級
 	if idx := strings.Index(normalized, "<input"); idx > 0 {
 		minStr := strings.TrimSpace(normalized[:idx])
 		minVal := parseTokenCount(minStr)
 		tier.InputMin = minVal
 		tier.InputMinExclusive = true
-		// 提取上限：<= 或 <
+		// 鎻愬彇涓婇檺锛?= 鎴?<
 		rest := normalized[idx+len("<input"):]
 		if strings.HasPrefix(rest, "<=") {
 			maxVal := parseTokenCount(rest[2:])
@@ -553,12 +523,10 @@ func parseTierRange(rangeStr string, tier *model.PriceTier) {
 				tier.InputMaxExclusive = true
 			}
 		}
-		tier.MinTokens = tier.InputMin // 同步旧字段
-		tier.MaxTokens = tier.InputMax
 		return
 	}
 
-	// 情况2: "input<=NNk" 或 "input<NNk"（只有上限）
+	// 鎯呭喌2: "input<=NNk" 鎴?"input<NNk"锛堝彧鏈変笂闄愶級
 	if strings.HasPrefix(normalized, "input") {
 		rest := strings.TrimPrefix(normalized, "input")
 		rest = strings.TrimSpace(rest)
@@ -566,37 +534,31 @@ func parseTierRange(rangeStr string, tier *model.PriceTier) {
 			maxVal := parseTokenCount(rest[2:])
 			if maxVal > 0 {
 				tier.InputMax = ptr(maxVal)
-				tier.MaxTokens = tier.InputMax
 			}
 		} else if strings.HasPrefix(rest, "<") {
 			maxVal := parseTokenCount(rest[1:])
 			if maxVal > 0 {
 				tier.InputMax = ptr(maxVal)
 				tier.InputMaxExclusive = true
-				tier.MaxTokens = tier.InputMax
-			}
-		} else if strings.HasPrefix(rest, ">") {
-			// "input>NNk" → 下界（开区间）
-			minVal := parseTokenCount(strings.TrimPrefix(rest, ">"))
-			if minVal > 0 {
-				tier.InputMin = minVal
-				tier.InputMinExclusive = true
-				tier.MinTokens = minVal
 			}
 		} else if strings.HasPrefix(rest, ">=") {
 			minVal := parseTokenCount(strings.TrimPrefix(rest, ">="))
 			if minVal > 0 {
 				tier.InputMin = minVal
-				tier.MinTokens = minVal
+			}
+		} else if strings.HasPrefix(rest, ">") {
+			minVal := parseTokenCount(strings.TrimPrefix(rest, ">"))
+			if minVal > 0 {
+				tier.InputMin = minVal
+				tier.InputMinExclusive = true
 			}
 		}
 		return
 	}
 
-	// 情况3: "NNk<=" 或 "NNk<" + "input" 位于后方（已在情况1处理，此处处理简化形式）
-	// 宽松回退：只有数字，视为上限
+	// 鎯呭喌3: "NNk<=" 鎴?"NNk<" + "input" 浣嶄簬鍚庢柟锛堝凡鍦ㄦ儏鍐?澶勭悊锛屾澶勫鐞嗙畝鍖栧舰寮忥級
+	// 瀹芥澗鍥為€€锛氬彧鏈夋暟瀛楋紝瑙嗕负涓婇檺
 	if v := parseTokenCount(normalized); v > 0 {
 		tier.InputMax = ptr(v)
-		tier.MaxTokens = tier.InputMax
 	}
 }

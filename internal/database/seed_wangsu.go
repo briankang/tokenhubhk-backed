@@ -26,7 +26,7 @@ const WangsuSellMarkup = 1.30
 //   - 按 model_name+supplier_id 检查模型，已存在则跳过
 //   - 通道 API Key 从环境变量读取：WANGSU_GPT_KEY / WANGSU_CLAUDE_KEY / WANGSU_GEMINI_KEY
 //     （env 未设置时：通道仍创建但 APIKey 留空 + status=inactive，管理员可在 UI 手填）
-//   - 价格：上游官网 USD 价 × USDCNYSnapshot × 家族折扣 = 成本价 RMB
+//   - 价格：上游官网 USD 价 × USDCNYSnapshot = 官网 RMB；家族折扣单独保存并用于折后成本与售价
 //
 // 调用场景：
 //   - RunAllSeeds() 中按序执行
@@ -184,16 +184,20 @@ func RunSeedWangsu(db *gorm.DB) {
 			continue
 		}
 
-		// 计算成本价（RMB/百万 tokens）= USD × 汇率 × 折扣
-		inputCost := round6(m.InputUSDPerM * USDCNYSnapshot * m.Discount)
-		outputCost := round6(m.OutputUSDPerM * USDCNYSnapshot * m.Discount)
-		cacheReadCost := round6(m.CacheReadUSDPerM * USDCNYSnapshot * m.Discount)
-		cacheWriteCost := round6(m.CacheWriteUSDPerM * USDCNYSnapshot * m.Discount)
+		// 官网价保持为 USD × 汇率，供应商折扣单独保存，折后成本由价格摘要动态计算。
+		inputOfficial := round6(m.InputUSDPerM * USDCNYSnapshot)
+		outputOfficial := round6(m.OutputUSDPerM * USDCNYSnapshot)
+		cacheReadOfficial := round6(m.CacheReadUSDPerM * USDCNYSnapshot)
+		cacheExplicitReadOfficial := round6(m.CacheExplicitReadUSDPerM * USDCNYSnapshot)
+		cacheWriteOfficial := round6(m.CacheWriteUSDPerM * USDCNYSnapshot)
+		cacheStorageOfficial := round6(m.CacheStorageUSDPerMHour * USDCNYSnapshot)
+		effectiveInputCost := round6(inputOfficial * m.Discount)
+		effectiveOutputCost := round6(outputOfficial * m.Discount)
 
 		// 幂等检查：模型已存在 → 尝试补齐 model_pricings（若缺失）后跳过
 		var existing model.AIModel
 		if err := db.Where("supplier_id = ? AND model_name = ?", sup.ID, m.ModelName).First(&existing).Error; err == nil {
-			ensureWangsuPricing(db, log, existing.ID, inputCost, outputCost, m.ModelName)
+			ensureWangsuPricing(db, log, existing.ID, effectiveInputCost, effectiveOutputCost, m.ModelName)
 			skipped++
 			continue
 		}
@@ -201,20 +205,22 @@ func RunSeedWangsu(db *gorm.DB) {
 		features := buildWangsuFeaturesJSON(m)
 
 		ai := model.AIModel{
-			CategoryID:                 catID,
-			SupplierID:                 sup.ID,
-			ModelName:                  m.ModelName,
-			DisplayName:                m.DisplayName,
-			Description:                fmt.Sprintf("%s - 经网宿网关代理（官方定价 × %.3f 折扣）", m.DisplayName, m.Discount),
+			CategoryID:  catID,
+			SupplierID:  sup.ID,
+			ModelName:   m.ModelName,
+			DisplayName: m.DisplayName,
+			Description: fmt.Sprintf("%s - 经网宿网关代理（官方 USD $%.4f/$%.4f per 1M，汇率 %.2f，折扣 %.3f）",
+				m.DisplayName, m.InputUSDPerM, m.OutputUSDPerM, USDCNYSnapshot, m.Discount),
 			IsActive:                   true,
 			Status:                     "online",
 			MaxTokens:                  m.MaxOutputTokens,
 			ContextWindow:              m.ContextWindow,
+			MaxInputTokens:             m.ContextWindow,
 			MaxOutputTokens:            m.MaxOutputTokens,
-			InputCostRMB:               inputCost,
-			OutputCostRMB:              outputCost,
-			InputPricePerToken:         int64(math.Round(inputCost * 10000)), // 积分 = RMB × 10000
-			OutputPricePerToken:        int64(math.Round(outputCost * 10000)),
+			InputCostRMB:               inputOfficial,
+			OutputCostRMB:              outputOfficial,
+			InputPricePerToken:         int64(math.Round(inputOfficial * 10000)), // 积分 = RMB × 10000
+			OutputPricePerToken:        int64(math.Round(outputOfficial * 10000)),
 			Currency:                   "CREDIT",
 			ModelType:                  m.ModelType,
 			Source:                     "manual",
@@ -222,9 +228,20 @@ func RunSeedWangsu(db *gorm.DB) {
 			SupportsCache:              m.SupportsCache,
 			CacheMechanism:             pickStr(m.CacheMechanism, "none"),
 			CacheMinTokens:             m.CacheMinTokens,
-			CacheInputPriceRMB:         cacheReadCost,
-			CacheExplicitInputPriceRMB: 0, // 非 both 模式
-			CacheWritePriceRMB:         cacheWriteCost,
+			CacheInputPriceRMB:         cacheReadOfficial,
+			CacheExplicitInputPriceRMB: cacheExplicitReadOfficial,
+			CacheWritePriceRMB:         cacheWriteOfficial,
+			CacheStoragePriceRMB:       cacheStorageOfficial,
+			PriceSourceCurrency:        "USD",
+			PriceSourceExchangeRate:    USDCNYSnapshot,
+			InputCostUSD:               round6(m.InputUSDPerM),
+			OutputCostUSD:              round6(m.OutputUSDPerM),
+			CacheInputPriceUSD:         round6(m.CacheReadUSDPerM),
+			CacheExplicitInputPriceUSD: round6(m.CacheExplicitReadUSDPerM),
+			CacheWritePriceUSD:         round6(m.CacheWriteUSDPerM),
+			CacheStoragePriceUSD:       round6(m.CacheStorageUSDPerMHour),
+			InputModalities:            jsonStringSlice(m.InputModalities),
+			OutputModalities:           jsonStringSlice(m.OutputModalities),
 			Features:                   features,
 			Tags:                       m.Tags,
 			Discount:                   m.Discount,
@@ -240,8 +257,8 @@ func RunSeedWangsu(db *gorm.DB) {
 
 		// 创建对应 ModelPricing（售价 = 成本价 × WangsuSellMarkup）
 		now := time.Now()
-		sellIn := round6(inputCost * WangsuSellMarkup)
-		sellOut := round6(outputCost * WangsuSellMarkup)
+		sellIn := round6(effectiveInputCost * WangsuSellMarkup)
+		sellOut := round6(effectiveOutputCost * WangsuSellMarkup)
 		mp := model.ModelPricing{
 			ModelID:             ai.ID,
 			InputPricePerToken:  int64(math.Round(sellIn * 10000)),
@@ -431,6 +448,17 @@ func ensureWangsuPricing(db *gorm.DB, log *zap.Logger, modelID uint, costIn, cos
 
 func round6(v float64) float64 {
 	return math.Round(v*1e6) / 1e6
+}
+
+func jsonStringSlice(values []string) model.JSON {
+	if len(values) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(values)
+	if err != nil {
+		return nil
+	}
+	return model.JSON(b)
 }
 
 func pickStr(v, fallback string) string {

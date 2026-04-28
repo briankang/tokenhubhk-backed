@@ -87,7 +87,12 @@ func (h *PricingHandler) CreateModelPricing(c *gin.Context) {
 		return
 	}
 	invalidatePublicModelsCache()
-	response.Success(c, mp)
+	// P4: 阶梯单价单调性校验，结果作为 warnings 返回（不阻断保存）
+	warnings, _ := h.pricingSvc.ValidatePriceTiersForModel(c.Request.Context(), mp.ModelID)
+	response.Success(c, gin.H{
+		"pricing":  mp,
+		"warnings": warnings,
+	})
 }
 
 // updateModelPricingReq is the request body for updating model pricing.
@@ -126,7 +131,15 @@ func (h *PricingHandler) UpdateModelPricing(c *gin.Context) {
 		return
 	}
 	invalidatePublicModelsCache()
-	response.Success(c, nil)
+	// P4: 阶梯单价单调性校验
+	// 通过 id 反查关联 model_id（UpdateModelPricing 内部已成功，故 existing 一定存在）
+	var existing model.ModelPricing
+	_ = database.DB.Select("model_id").First(&existing, id).Error
+	var warnings []string
+	if existing.ModelID > 0 {
+		warnings, _ = h.pricingSvc.ValidatePriceTiersForModel(c.Request.Context(), existing.ModelID)
+	}
+	response.Success(c, gin.H{"warnings": warnings})
 }
 
 // DeleteModelPricing handles DELETE /api/v1/admin/model-pricings/:id

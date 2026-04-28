@@ -117,11 +117,9 @@ func PermissionGate() gin.HandlerFunc {
 		// SUPER_ADMIN 短路：拥有此角色的用户绕过所有权限检查。
 		// 语义上 SUPER_ADMIN 等价 root，不受 role_permissions 表状态影响
 		// （例如新增权限码尚未 seed 到 DB 时，仍能调用）
-		for _, role := range perms.RoleCodes {
-			if role == "SUPER_ADMIN" {
-				c.Next()
-				return
-			}
+		if perms.IsSuperAdmin() {
+			c.Next()
+			return
 		}
 
 		if !perms.Has(meta.Action) {

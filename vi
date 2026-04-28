@@ -1,0 +1,40 @@
+# Go 编译输出文件
+# 可执行文件 (Windows/Linux/Mac)
+[._]exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go 测试覆盖率文件
+cover.out
+cover.html
+
+# Go 模块缓存
+/go/pkg/mod/
+/.go/pkg/mod/
+
+# Go 缓存目录（你需要的）
+.gocache/
+
+# 本地开发配置 & IDE 文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 环境变量文件
+.env
+.env.local
+
+# 临时目录
+tmp/
+temp/
+build/
+dist/
+out/
+
+# 日志文件
+*.log
+logs/

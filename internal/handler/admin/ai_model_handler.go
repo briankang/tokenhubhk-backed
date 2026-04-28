@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	aimodelsvc "tokenhub-server/internal/service/aimodel"
 	"tokenhub-server/internal/service/modeldiscovery"
 	"tokenhub-server/internal/service/pricescraper"
+	"tokenhub-server/internal/service/pricesync"
 	"tokenhub-server/internal/taskqueue"
 )
 
@@ -96,29 +98,37 @@ func parseLocaleForLabels(acceptLang string) string {
 // PublicModelResponse 公开模型列表响应格式（供前端 /models 页面使用）
 // 字段命名遵循前端 AdminModel 类型定义
 type PublicModelResponse struct {
-	ID             uint       `json:"id"`                       // 模型 ID
-	ModelID        string     `json:"model_id"`                 // 模型标识符（如 gpt-4o）
-	Name           string     `json:"name"`                     // 展示名称
-	Provider       string     `json:"provider"`                 // 供应商名称
-	ProviderIcon   string     `json:"provider_icon"`            // 供应商图标（emoji）
-	Description    string     `json:"description"`              // 模型描述
-	ContextWindow  int        `json:"context_window"`           // 上下文窗口大小
-	InputPrice     int64      `json:"input_price"`              // 输入价格（积分/百万token）
-	OutputPrice    int64      `json:"output_price"`             // 输出价格（积分/百万token）
-	InputPriceRMB  float64    `json:"input_price_rmb"`          // 输入价格（人民币/百万token）
-	OutputPriceRMB float64    `json:"output_price_rmb"`         // 输出价格（人民币/百万token）
-	Capabilities   []string   `json:"capabilities"`             // 能力标签
-	Status         string     `json:"status"`                   // 状态：online/offline
-	IsNew          bool       `json:"is_new"`                   // 是否新品
-	IsFeatured     bool       `json:"is_featured"`              // 是否推荐
-	MaxTokens      int        `json:"max_tokens"`               // 最大输出 Token 数
-	ModelType      string     `json:"model_type"`               // 模型类型: LLM/VLM/ImageGeneration/VideoGeneration/Audio 等
-	Tags           string     `json:"tags"`                     // 搜索标签（逗号分隔）
-	Labels         []LabelDTO `json:"labels,omitempty"`         // k:v 标签列表（热卖/开源/优惠等）
-	Discount       int        `json:"discount,omitempty"`       // 折扣百分比（如85表示85折），0表示无折扣信息
-	AvgLatencyMs   int64      `json:"avg_latency_ms,omitempty"` // 平均延迟（毫秒），最近24小时
-	SuccessRate    float64    `json:"success_rate,omitempty"`   // 成功率（0-100），最近24小时
-	RequestCount   int64      `json:"request_count,omitempty"`  // 请求量，最近24小时
+	ID              uint              `json:"id"`                         // 模型 ID
+	ModelID         string            `json:"model_id"`                   // 模型标识符（如 gpt-4o）
+	Name            string            `json:"name"`                       // 展示名称
+	Provider        string            `json:"provider"`                   // 供应商名称
+	ProviderIcon    string            `json:"provider_icon"`              // 供应商图标（emoji）
+	Description     string            `json:"description"`                // 模型描述
+	DescriptionI18n map[string]string `json:"description_i18n,omitempty"` // 多语言模型描述（公开页按语言选择）
+	ContextWindow   int               `json:"context_window"`             // 上下文窗口大小
+	InputPrice      int64             `json:"input_price"`                // 输入价格（积分/百万token）
+	OutputPrice     int64             `json:"output_price"`               // 输出价格（积分/百万token）
+	InputPriceRMB   float64           `json:"input_price_rmb"`            // 输入价格（人民币/百万token）
+	OutputPriceRMB  float64           `json:"output_price_rmb"`           // 输出价格（人民币/百万token）
+	// 双货币显示(v2 引入):USD 价 + 录入时锁定汇率
+	InputPriceUSD      float64    `json:"input_price_usd,omitempty"`      // 输入价格(美元/百万token,= input_price_rmb / exchange_rate)
+	OutputPriceUSD     float64    `json:"output_price_usd,omitempty"`     // 输出价格(美元/百万token)
+	ExchangeRate       float64    `json:"exchange_rate,omitempty"`        // 锁定汇率(USD→CNY,价格录入时记录)
+	ExchangeRateAt     string     `json:"exchange_rate_at,omitempty"`     // 汇率锁定日期 (YYYY-MM-DD)
+	ExchangeRateSource string     `json:"exchange_rate_source,omitempty"` // 汇率来源(aliyun_market/manual/fallback)
+	Capabilities       []string   `json:"capabilities"`                   // 能力标签
+	Status             string     `json:"status"`                         // 状态：online/offline
+	IsNew              bool       `json:"is_new"`                         // 是否新品
+	IsFeatured         bool       `json:"is_featured"`                    // 是否推荐
+	MaxTokens          int        `json:"max_tokens"`                     // 最大输出 Token 数（管理员配置）
+	MaxOutputTokens    int        `json:"max_output_tokens"`              // 供应商 API 同步的硬上限，0=未知
+	ModelType          string     `json:"model_type"`                     // 模型类型: LLM/VLM/ImageGeneration/VideoGeneration/Audio 等
+	Tags               string     `json:"tags"`                           // 搜索标签（逗号分隔）
+	Labels             []LabelDTO `json:"labels,omitempty"`               // k:v 标签列表（热卖/开源/优惠等）
+	Discount           int        `json:"discount,omitempty"`             // 折扣百分比（如85表示85折），0表示无折扣信息
+	AvgLatencyMs       int64      `json:"avg_latency_ms,omitempty"`       // 平均延迟（毫秒），最近24小时
+	SuccessRate        float64    `json:"success_rate,omitempty"`         // 成功率（0-100），最近24小时
+	RequestCount       int64      `json:"request_count,omitempty"`        // 请求量，最近24小时
 	// 多计费单位支持（v3.2）
 	PricingUnit string `json:"pricing_unit,omitempty"` // 计费单位: per_million_tokens / per_image / per_second / per_minute / per_10k_characters / per_million_characters / per_call / per_hour
 	Variant     string `json:"variant,omitempty"`      // 变体/质量档（如 1024x1024/hd/720p）
@@ -132,9 +142,10 @@ type PublicModelResponse struct {
 	CacheWritePriceRMB         float64 `json:"cache_write_price_rmb,omitempty"`          // 显式缓存写入价
 
 	// 阶梯定价展示字段（v3.4）
-	PriceTiers         []PublicPriceTier         `json:"price_tiers,omitempty"`          // 阶梯价格列表
-	HasTieredPricing   bool                      `json:"has_tiered_pricing"`             // 是否多阶梯（>1 条或非默认兜底）
-	VideoPricingConfig *model.VideoPricingConfig `json:"video_pricing_config,omitempty"` // 视频模型特殊计价配置
+	PriceTiers         []PublicPriceTier             `json:"price_tiers,omitempty"`          // 阶梯价格列表
+	HasTieredPricing   bool                          `json:"has_tiered_pricing"`             // 是否多阶梯（>1 条或非默认兜底）
+	VideoPricingConfig *model.VideoPricingConfig     `json:"video_pricing_config,omitempty"` // 视频模型特殊计价配置
+	DimensionConfig    *model.ModelDimensionConfig   `json:"dimension_config,omitempty"`     // 业务维度声明（M3, 2026-04-28）, 驱动前端 schema-driven 矩阵编辑器
 
 	// 能力特性字段（v3.5）— 由 features JSON 字段解析而来
 	SupportsThinking  bool `json:"supports_thinking"`   // 是否支持深度思考
@@ -147,6 +158,7 @@ type PublicModelResponse struct {
 // PublicPriceTier 公开展示用的阶梯价格简化视图
 type PublicPriceTier struct {
 	Name               string  `json:"name"`
+	Variant            string  `json:"variant,omitempty"`      // 非 Token 单位变体（如 "720P"/"1080P"，per_second 路径用）
 	InputRange         string  `json:"input_range,omitempty"`  // 人类可读的输入区间，如 "(0, 32k]"
 	OutputRange        string  `json:"output_range,omitempty"` // 人类可读的输出区间
 	InputMin           int64   `json:"input_min"`
@@ -157,8 +169,13 @@ type PublicPriceTier struct {
 	OutputMinExclusive bool    `json:"output_min_exclusive"`
 	OutputMax          *int64  `json:"output_max,omitempty"`
 	OutputMaxExclusive bool    `json:"output_max_exclusive"`
+	// 业务维度值（S5, 2026-04-28）：驱动前端 DimMatrixView 多维矩阵渲染
+	// 例：{"resolution":"1080p", "input_has_video":"true"} → Seedance 2.0 1080p+视频档
+	DimValues          map[string]string `json:"dim_values,omitempty"`
 	InputPrice         float64 `json:"input_price"`
 	OutputPrice        float64 `json:"output_price"`
+	CacheInputPrice    float64 `json:"cache_input_price,omitempty"`
+	CacheWritePrice    float64 `json:"cache_write_price,omitempty"`
 	// 思考模式价（阿里云 qwen3.x-plus 等）
 	OutputPriceThinking        float64  `json:"output_price_thinking,omitempty"`
 	SellingInputPrice          *float64 `json:"selling_input_price,omitempty"`
@@ -208,6 +225,7 @@ func convertTiersToPublic(tiers []model.PriceTier) []PublicPriceTier {
 	for _, t := range tiers {
 		out = append(out, PublicPriceTier{
 			Name:                       t.Name,
+			Variant:                    t.Variant,
 			InputRange:                 buildTierRangeString(t.InputMin, t.InputMinExclusive, t.InputMax, t.InputMaxExclusive),
 			OutputRange:                buildTierRangeString(t.OutputMin, t.OutputMinExclusive, t.OutputMax, t.OutputMaxExclusive),
 			InputMin:                   t.InputMin,
@@ -218,8 +236,11 @@ func convertTiersToPublic(tiers []model.PriceTier) []PublicPriceTier {
 			OutputMinExclusive:         t.OutputMinExclusive,
 			OutputMax:                  t.OutputMax,
 			OutputMaxExclusive:         t.OutputMaxExclusive,
+			DimValues:                  t.DimValues,
 			InputPrice:                 t.InputPrice,
 			OutputPrice:                t.OutputPrice,
+			CacheInputPrice:            t.CacheInputPrice,
+			CacheWritePrice:            t.CacheWritePrice,
 			OutputPriceThinking:        t.OutputPriceThinking,
 			SellingInputPrice:          t.SellingInputPrice,
 			SellingOutputPrice:         t.SellingOutputPrice,
@@ -248,6 +269,24 @@ func decodeVideoPricingJSON(raw model.JSON) *model.VideoPricingConfig {
 	}
 	var cfg model.VideoPricingConfig
 	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return nil
+	}
+	return &cfg
+}
+
+// decodeDimensionConfigJSON 把 ai_models.dimension_config JSON 解析为结构 (M3, 2026-04-28)
+//
+// 用于 PricingFormRouter / DimensionConfigBadge 渲染 schema-driven 维度声明。
+// 空或解析失败时返回 nil（前端按 nil 跳过渲染）
+func decodeDimensionConfigJSON(raw model.JSON) *model.ModelDimensionConfig {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var cfg model.ModelDimensionConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return nil
+	}
+	if len(cfg.Dimensions) == 0 {
 		return nil
 	}
 	return &cfg
@@ -347,6 +386,26 @@ func toPublicResponse(m model.AIModel) PublicModelResponse {
 	inputPrice := int64(inputPriceRMB * 10000)
 	outputPrice := int64(outputPriceRMB * 10000)
 
+	// 双货币显示(v2):优先使用 ModelPricing.PricedAtExchangeRate(锁定汇率),
+	// fallback 到 AIModel.PriceSourceExchangeRate(成本价导入时的汇率),
+	// 全部为 0 时不输出 USD 价(前端只显示 RMB)。
+	var inputPriceUSD, outputPriceUSD, lockedFxRate float64
+	var lockedFxAt, lockedFxSource string
+	if m.Pricing != nil && m.Pricing.PricedAtExchangeRate > 0 {
+		lockedFxRate = m.Pricing.PricedAtExchangeRate
+		lockedFxSource = m.Pricing.PricedAtRateSource
+		if m.Pricing.PricedAtAt != nil {
+			lockedFxAt = m.Pricing.PricedAtAt.Format("2006-01-02")
+		}
+	} else if m.PriceSourceExchangeRate > 0 {
+		lockedFxRate = m.PriceSourceExchangeRate
+		lockedFxSource = "ai_model_cost_import"
+	}
+	if lockedFxRate > 0 {
+		inputPriceUSD = math.Round(inputPriceRMB/lockedFxRate*1e6) / 1e6
+		outputPriceUSD = math.Round(outputPriceRMB/lockedFxRate*1e6) / 1e6
+	}
+
 	// 计算折扣百分比（基于输入价格）
 	// 只有折扣力度超过10%（即售价低于原价9折以下）才在前端展示折扣标签
 	discount := 0
@@ -365,35 +424,49 @@ func toPublicResponse(m model.AIModel) PublicModelResponse {
 	requiresStream := extractBoolFeature(m.Features, "requires_stream")
 	supportsFunctionCall := extractBoolFeature(m.Features, "supports_function_call")
 
-	// 描述回退：DB 中 description 为空时，基于模型名 + 供应商 + 能力自动生成一段富文本简介
-	description := m.Description
+	// 描述回退：公开页只展示模型本身能力，不展示供应商/代理/接入链路文案。
+	description := sanitizePublicModelDescription(m.Description, name, m.ModelName, provider)
 	if strings.TrimSpace(description) == "" {
 		description = buildAutoDescription(m.ModelName, name, provider, m.ModelType, m.ContextWindow,
 			supportsThinking, supportsVision, supportsWebSearch, supportsJsonMode, supportsFunctionCall)
 	}
+	description = strings.TrimSpace(strings.TrimRight(description, "，,；; "))
+	descriptionI18n := buildPublicDescriptionI18n(description, m.ModelName, name, provider, m.ModelType, m.ContextWindow,
+		supportsThinking, supportsVision, supportsWebSearch, supportsJsonMode, supportsFunctionCall)
+	if zh := strings.TrimSpace(descriptionI18n["zh"]); zh != "" {
+		description = zh
+	}
 
 	return PublicModelResponse{
-		ID:             m.ID,
-		ModelID:        m.ModelName,
-		Name:           name,
-		Provider:       provider,
-		ProviderIcon:   icon,
-		Description:    description,
-		ContextWindow:  m.ContextWindow,
-		InputPrice:     inputPrice,
-		OutputPrice:    outputPrice,
-		InputPriceRMB:  inputPriceRMB,
-		OutputPriceRMB: outputPriceRMB,
-		Capabilities:   capabilityKeywords(m.ModelName),
-		Status:         status,
-		IsNew:          false, // TODO: 可根据创建时间计算
-		IsFeatured:     false, // TODO: 可根据配置决定
-		MaxTokens:      m.MaxTokens,
-		ModelType:      m.ModelType,
-		Tags:           tags,
-		Discount:       discount,
-		PricingUnit:    m.PricingUnit,
-		Variant:        m.Variant,
+		ID:              m.ID,
+		ModelID:         m.ModelName,
+		Name:            name,
+		Provider:        provider,
+		ProviderIcon:    icon,
+		Description:     description,
+		DescriptionI18n: descriptionI18n,
+		ContextWindow:   m.ContextWindow,
+		InputPrice:      inputPrice,
+		OutputPrice:     outputPrice,
+		InputPriceRMB:   inputPriceRMB,
+		OutputPriceRMB:  outputPriceRMB,
+		// 双货币 + 锁定汇率(v2)
+		InputPriceUSD:      inputPriceUSD,
+		OutputPriceUSD:     outputPriceUSD,
+		ExchangeRate:       lockedFxRate,
+		ExchangeRateAt:     lockedFxAt,
+		ExchangeRateSource: lockedFxSource,
+		Capabilities:       capabilityKeywords(m.ModelName),
+		Status:             status,
+		IsNew:              false, // TODO: 可根据创建时间计算
+		IsFeatured:         false, // TODO: 可根据配置决定
+		MaxTokens:          m.MaxTokens,
+		MaxOutputTokens:    m.MaxOutputTokens,
+		ModelType:          m.ModelType,
+		Tags:               tags,
+		Discount:           discount,
+		PricingUnit:        m.PricingUnit,
+		Variant:            m.Variant,
 
 		// 缓存定价字段（展示用）
 		SupportsCache:              m.SupportsCache,
@@ -407,6 +480,7 @@ func toPublicResponse(m model.AIModel) PublicModelResponse {
 		PriceTiers:         buildPublicTiers(m.PriceTiers),
 		HasTieredPricing:   hasTieredPricing(m.PriceTiers),
 		VideoPricingConfig: decodeVideoPricingJSON(m.VideoPricingConfig),
+		DimensionConfig:    decodeDimensionConfigJSON(m.DimensionConfig),
 
 		// 能力特性（解析 features JSON）
 		SupportsThinking:  supportsThinking,
@@ -417,8 +491,75 @@ func toPublicResponse(m model.AIModel) PublicModelResponse {
 	}
 }
 
-// buildAutoDescription 根据模型元数据生成富文本中文简介
-// 当 DB 中 description 为空时调用，拼接供应商/模型家族/上下文窗口/能力标志等信息
+var publicDescriptionProxyPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)(?:^|[。；;，,]\s*)?(?:官网价|官方价)\s*[$￥¥]?[0-9.,]+(?:\s*/\s*[$￥¥]?[0-9.,]+)?\s*[×xX*]\s*汇率\s*[0-9.]+[^。；;，,\n]*[。；;，,]?`),
+	regexp.MustCompile(`(?i)\s*AI\s*网关（[^）]*）[。；;，,]?`),
+	regexp.MustCompile(`(?i)(?:官网价|官方价)[^。\n]*[。]?`),
+	regexp.MustCompile(`(?i)成本按[^。\n]*[。]?`),
+	regexp.MustCompile(`(?i)售价[^。\n]*官网价[^。\n]*[。]?`),
+	regexp.MustCompile(`(?i)(?:来源|Source)\s*[:：][^；。\n]*[；。]?`),
+	regexp.MustCompile(`(?i)\s*(?:OpenAI|Together AI|Google|Anthropic|MiniMax)\s+official[^；;。\n]*(?:price|pricing)[^；;。\n]*(?:[.。；;]|$)`),
+	regexp.MustCompile(`(?i)\s*\d+x\d+\s+is\s+about[^。；;\n]*(?:[.。；;]|$)`),
+	regexp.MustCompile(`(?i)(?:^|[。；;，,]\s*)?合同折扣\s*[0-9.]+[^。；;，,\n]*[。；;，,]?`),
+	regexp.MustCompile(`(?i)\s+via\s+(?:Wangsu\s+AI\s+Gateway|Wangsu|网宿(?:网关)?)`),
+	regexp.MustCompile(`(?i)\s*Default price uses[^\n]*(?:[.。]|$)`),
+	regexp.MustCompile(`(?i)\s*Cost is[^\n]*(?:[.。]|$)`),
+	regexp.MustCompile(`(?i)\s*selling price equals official API price[^.。\n]*(?:[.。]|$)`),
+	regexp.MustCompile(`(?i),?\s*keep only for Wangsu compatibility`),
+	regexp.MustCompile(`(?i),?\s*Wangsu\s*预览命名`),
+	regexp.MustCompile(`(?i),?\s*Wangsu\s*自有命名`),
+	regexp.MustCompile(`(?i)网宿(?:网关)?`),
+	regexp.MustCompile(`(?i)\s*[-–—]\s*经[^。.!；;，,\n]{0,60}(?:代理|网关|中转|转发)[。.!]?`),
+	regexp.MustCompile(`(?i)经[^。.!；;，,\n]{0,60}(?:代理|网关|中转|转发)[。.!]?`),
+	regexp.MustCompile(`(?i)\s*[-–—]\s*(?:代理|网关|中转|转发)[^。.!；;，,\n]{0,60}[。.!]?`),
+	regexp.MustCompile(`(?i)通过\s*OpenAI\s*兼容协议\s*/\s*v1/chat/completions\s*统一接入[^。.!]*[。.!]?`),
+}
+
+// sanitizePublicModelDescription 清理公开页不应出现的供应商、代理和平台接入文案。
+func sanitizePublicModelDescription(description, displayName, modelID, provider string) string {
+	out := strings.TrimSpace(description)
+	if out == "" {
+		return ""
+	}
+	for _, pattern := range publicDescriptionProxyPatterns {
+		out = pattern.ReplaceAllString(out, "")
+	}
+	if strings.Contains(out, "官方对标") || strings.Contains(strings.ToLower(out), "official") {
+		return ""
+	}
+	provider = strings.TrimSpace(provider)
+	if provider != "" {
+		replacements := []string{
+			provider + " 提供的",
+			provider + "提供的",
+			"由" + provider + "提供的",
+			"来自 " + provider + " 的",
+			"来自" + provider + "的",
+			provider + "代理",
+			provider + "网关",
+		}
+		for _, old := range replacements {
+			out = strings.ReplaceAll(out, old, "")
+		}
+	}
+	out = strings.TrimSpace(strings.Trim(out, "-–—，,。.!；; "))
+	if isOnlyModelIdentifier(out, displayName, modelID) {
+		return ""
+	}
+	return out
+}
+
+func isOnlyModelIdentifier(text, displayName, modelID string) bool {
+	normalize := func(s string) string {
+		s = strings.TrimSpace(strings.Trim(s, "-–—，,。.!；; "))
+		return strings.ToLower(s)
+	}
+	t := normalize(text)
+	return t != "" && (t == normalize(displayName) || t == normalize(modelID))
+}
+
+// buildAutoDescription 根据模型元数据生成公开模型简介。
+// 当 DB 中 description 为空或只剩代理文案时调用，只描述模型类型、家族、上下文窗口和能力标志。
 func buildAutoDescription(modelID, displayName, provider, modelType string, ctxWindow int,
 	thinking, vision, webSearch, jsonMode, functionCall bool) string {
 	family := detectModelFamily(modelID)
@@ -428,21 +569,21 @@ func buildAutoDescription(modelID, displayName, provider, modelType string, ctxW
 	var head string
 	switch {
 	case strings.Contains(mt, "embedding"):
-		head = fmt.Sprintf("%s 提供的文本嵌入（Embedding）模型", provider)
+		head = "文本嵌入（Embedding）模型"
 	case strings.Contains(mt, "rerank"):
-		head = fmt.Sprintf("%s 提供的重排序（Rerank）模型", provider)
+		head = "重排序（Rerank）模型"
 	case strings.Contains(mt, "imagegeneration"):
-		head = fmt.Sprintf("%s 提供的图像生成模型", provider)
+		head = "图像生成模型"
 	case strings.Contains(mt, "videogeneration"):
-		head = fmt.Sprintf("%s 提供的视频生成模型", provider)
+		head = "视频生成模型"
 	case strings.Contains(mt, "tts"):
-		head = fmt.Sprintf("%s 提供的语音合成（TTS）模型", provider)
+		head = "语音合成（TTS）模型"
 	case strings.Contains(mt, "asr"):
-		head = fmt.Sprintf("%s 提供的语音识别（ASR）模型", provider)
+		head = "语音识别（ASR）模型"
 	case strings.Contains(mt, "vision"):
-		head = fmt.Sprintf("%s 提供的多模态视觉大模型", provider)
+		head = "多模态视觉大模型"
 	default:
-		head = fmt.Sprintf("%s 提供的大语言模型", provider)
+		head = "大语言模型"
 	}
 	if family != "" {
 		head = fmt.Sprintf("%s，隶属 %s 家族", head, family)
@@ -498,8 +639,108 @@ func buildAutoDescription(modelID, displayName, provider, modelType string, ctxW
 	if len(caps) > 0 {
 		out += "支持" + strings.Join(dedupStrings(caps), "、") + "。"
 	}
-	out += "通过 OpenAI 兼容协议 / v1/chat/completions 统一接入，无需修改现有代码。"
 	return out
+}
+
+// buildPublicDescriptionI18n 为公开模型列表生成稳定的中英文描述，避免前端只能展示单一语言文案。
+func buildPublicDescriptionI18n(base, modelID, displayName, provider, modelType string, ctxWindow int,
+	thinking, vision, webSearch, jsonMode, functionCall bool) map[string]string {
+	base = strings.TrimSpace(strings.TrimRight(base, "，,；; "))
+	zh := base
+	if zh == "" || !hasCJK(zh) {
+		zh = buildAutoDescription(modelID, displayName, provider, modelType, ctxWindow,
+			thinking, vision, webSearch, jsonMode, functionCall)
+	}
+	en := buildAutoDescriptionEN(modelID, displayName, modelType, ctxWindow,
+		thinking, vision, webSearch, jsonMode, functionCall)
+	return map[string]string{
+		"zh": strings.TrimSpace(strings.TrimRight(zh, "，,；; ")),
+		"en": strings.TrimSpace(strings.TrimRight(en, ".,; ")),
+	}
+}
+
+// buildAutoDescriptionEN 只基于模型元数据生成英文简介，不包含供应商、代理或成本换算信息。
+func buildAutoDescriptionEN(modelID, displayName, modelType string, ctxWindow int,
+	thinking, vision, webSearch, jsonMode, functionCall bool) string {
+	family := detectModelFamily(modelID)
+	mt := strings.ToLower(modelType)
+
+	head := "Large language model"
+	switch {
+	case strings.Contains(mt, "embedding"):
+		head = "Text embedding model"
+	case strings.Contains(mt, "rerank"):
+		head = "Rerank model"
+	case strings.Contains(mt, "imagegeneration"):
+		head = "Image generation model"
+	case strings.Contains(mt, "videogeneration"):
+		head = "Video generation model"
+	case strings.Contains(mt, "tts"):
+		head = "Text-to-speech model"
+	case strings.Contains(mt, "asr"):
+		head = "Speech recognition model"
+	case strings.Contains(mt, "vision"):
+		head = "Multimodal vision model"
+	}
+	if family != "" {
+		head = fmt.Sprintf("%s in the %s family", head, family)
+	}
+
+	var specs []string
+	if ctxWindow >= 1_000_000 {
+		specs = append(specs, fmt.Sprintf("%.1fM-token context window", float64(ctxWindow)/1_000_000))
+	} else if ctxWindow >= 1000 {
+		specs = append(specs, fmt.Sprintf("%dK-token context window", ctxWindow/1000))
+	}
+
+	var caps []string
+	if thinking {
+		caps = append(caps, "deep reasoning")
+	}
+	if webSearch {
+		caps = append(caps, "web search")
+	}
+	if vision {
+		caps = append(caps, "image understanding")
+	}
+	if jsonMode {
+		caps = append(caps, "JSON structured output")
+	}
+	if functionCall {
+		caps = append(caps, "function calling")
+	}
+
+	lowerName := strings.ToLower(displayName + " " + modelID)
+	switch {
+	case strings.Contains(lowerName, "code") || strings.Contains(lowerName, "coder"):
+		caps = append(caps, "code generation and analysis")
+	case strings.Contains(lowerName, "math"):
+		caps = append(caps, "mathematical reasoning")
+	}
+	switch {
+	case strings.Contains(lowerName, "flash"), strings.Contains(lowerName, "mini"), strings.Contains(lowerName, "haiku"), strings.Contains(lowerName, "lite"), strings.Contains(lowerName, "turbo"):
+		caps = append(caps, "low-latency responses")
+	case strings.Contains(lowerName, "pro"), strings.Contains(lowerName, "max"), strings.Contains(lowerName, "plus"), strings.Contains(lowerName, "ultra"), strings.Contains(lowerName, "opus"):
+		caps = append(caps, "high reasoning performance")
+	}
+
+	out := head + "."
+	if len(specs) > 0 {
+		out += " " + strings.Join(specs, ", ") + "."
+	}
+	if len(caps) > 0 {
+		out += " Supports " + strings.Join(dedupStrings(caps), ", ") + "."
+	}
+	return out
+}
+
+func hasCJK(text string) bool {
+	for _, r := range text {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			return true
+		}
+	}
+	return false
 }
 
 // detectModelFamily 从模型 ID 中识别常见家族名
@@ -569,6 +810,9 @@ func extractBoolFeature(features model.JSON, key string) bool {
 
 // buildPublicTiers 从 JSON 解析 tier 列表并转公开视图
 func buildPublicTiers(raw model.JSON) []PublicPriceTier {
+	if !hasTieredPricing(raw) {
+		return nil
+	}
 	data := decodePriceTiersJSON(raw)
 	if data == nil || len(data.Tiers) == 0 {
 		return nil
@@ -585,7 +829,11 @@ func hasTieredPricing(raw model.JSON) bool {
 	if len(data.Tiers) > 1 {
 		return true
 	}
-	return !data.Tiers[0].IsDefaultTier()
+	return !isDefaultCatchAllTier(data.Tiers[0])
+}
+
+func isDefaultCatchAllTier(t model.PriceTier) bool {
+	return t.IsDefaultTier() || (t.InputMin == 0 && t.InputMax == nil && t.OutputMin == 0 && t.OutputMax == nil)
 }
 
 // Stats 返回模型统计数量（总数/已启用/在线），直接聚合全量数据，不受分页限制
@@ -857,6 +1105,18 @@ func (h *AIModelHandler) Create(c *gin.Context) {
 	}
 
 	// 前端发 input_price_rmb → 后端 input_cost_rmb
+	modelName := strings.TrimSpace(fmt.Sprint(payload["model_name"]))
+	supplierID := uintFromPayload(payload["supplier_id"])
+	if modelName == "" || supplierID == 0 {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrValidation.Code, "model_name and supplier_id are required")
+		return
+	}
+	var existing model.AIModel
+	if err := database.DB.Where("supplier_id = ? AND LOWER(model_name) = LOWER(?)", supplierID, modelName).First(&existing).Error; err == nil {
+		response.ErrorMsg(c, http.StatusConflict, errcode.ErrBadRequest.Code, fmt.Sprintf("model %s already exists for this supplier", modelName))
+		return
+	}
+
 	if v, ok := payload["input_price_rmb"]; ok {
 		payload["input_cost_rmb"] = v
 		delete(payload, "input_price_rmb")
@@ -998,7 +1258,7 @@ func (h *AIModelHandler) Update(c *gin.Context) {
 				updates[field] = model.JSON(nil)
 			} else {
 				// 对 price_tiers：如果是数组，包装为 PriceTiersData，并对每个阶梯调用 Normalize()
-				// 以自动生成 Name（当前端留空时）和同步新旧字段
+				// 以自动生成 Name（当前端留空时）并补齐当前字段默认值
 				if field == "price_tiers" {
 					if arr, ok := val.([]interface{}); ok {
 						// 先将 arr 序列化 → 反序列化为 []PriceTier，以调用 Normalize
@@ -1032,6 +1292,11 @@ func (h *AIModelHandler) Update(c *gin.Context) {
 	delete(updates, "selling_input_rmb")
 	delete(updates, "selling_output_rmb")
 	delete(updates, "selling_output_thinking_rmb")
+
+	var current model.AIModel
+	if err := database.DB.First(&current, uint(id)).Error; err == nil {
+		applyAutomaticCacheUpdates(current, updates)
+	}
 
 	if err := h.svc.Update(c.Request.Context(), uint(id), updates); err != nil {
 		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrBadRequest.Code, err.Error())
@@ -1075,6 +1340,56 @@ func (h *AIModelHandler) Update(c *gin.Context) {
 
 	invalidatePublicModelsCache()
 	response.Success(c, gin.H{"message": "updated"})
+}
+
+func applyAutomaticCacheUpdates(current model.AIModel, updates map[string]interface{}) {
+	if updates == nil {
+		return
+	}
+	modelName := current.ModelName
+	if rawName, ok := updates["model_name"].(string); ok && strings.TrimSpace(rawName) != "" {
+		modelName = rawName
+	}
+	ratio, ok := openAICacheInputRatio(modelName)
+	if !ok {
+		return
+	}
+	inputCost := current.InputCostRMB
+	if value, ok := numericUpdate(updates["input_cost_rmb"]); ok {
+		inputCost = value
+	}
+	if inputCost <= 0 {
+		return
+	}
+	updates["supports_cache"] = true
+	updates["cache_mechanism"] = "auto"
+	if value, ok := numericUpdate(updates["cache_min_tokens"]); !ok || value <= 0 {
+		updates["cache_min_tokens"] = 1024
+	}
+	if value, ok := numericUpdate(updates["cache_input_price_rmb"]); !ok || value <= 0 {
+		updates["cache_input_price_rmb"] = math.Round(inputCost*ratio*1000000) / 1000000
+	}
+	updates["cache_explicit_input_price_rmb"] = 0
+	updates["cache_write_price_rmb"] = 0
+	updates["cache_storage_price_rmb"] = 0
+}
+
+func numericUpdate(value interface{}) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case json.Number:
+		parsed, err := v.Float64()
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
 }
 
 // Delete 删除AI模型 DELETE /api/v1/admin/ai-models/:id
@@ -1197,6 +1512,68 @@ func (h *AIModelHandler) Reactivate(c *gin.Context) {
 	// 3. 清除公开模型缓存
 	invalidatePublicModelsCache()
 	response.Success(c, gin.H{"message": "model reactivated", "status": "online", "log_id": log.ID})
+}
+
+// GetOfficialPriceURL 获取模型的官方定价页 URL,按优先级解析:
+//
+//	AIModel.OfficialPriceURL > Supplier.PricingURLs[type_hint 匹配] > Supplier.PricingURL
+//
+// 用于前端「打开官网价格页」按钮,前端点击 URL 字段后直接打开。
+//
+// 响应:
+//
+//	{ url: "https://...", source: "model_override|supplier_typed|supplier_default|unset", hint: "LLM" }
+func (h *AIModelHandler) GetOfficialPriceURL(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || id == 0 {
+		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
+		return
+	}
+	var m model.AIModel
+	if err := database.DB.WithContext(c.Request.Context()).
+		Preload("Supplier").
+		First(&m, uint(id)).Error; err != nil {
+		response.ErrorMsg(c, http.StatusNotFound, errcode.ErrNotFound.Code, "模型不存在")
+		return
+	}
+	result := pricesync.ResolveOfficialPriceURL(c.Request.Context(), database.DB, &m)
+	response.Success(c, result)
+}
+
+// SetOfficialPriceURL 管理员手动覆盖单个模型的官方定价页 URL。
+//
+// 请求:
+//
+//	{ url: "https://example.com/pricing" }
+//
+// 传空字符串清除覆盖,后续走 Supplier 默认解析逻辑。
+func (h *AIModelHandler) SetOfficialPriceURL(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || id == 0 {
+		response.Error(c, http.StatusBadRequest, errcode.ErrValidation)
+		return
+	}
+	var req struct {
+		URL string `json:"url"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrValidation.Code, err.Error())
+		return
+	}
+	url := strings.TrimSpace(req.URL)
+	if url != "" && !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		response.ErrorMsg(c, http.StatusBadRequest, errcode.ErrValidation.Code, "URL 必须以 http:// 或 https:// 开头")
+		return
+	}
+	if err := database.DB.WithContext(c.Request.Context()).
+		Model(&model.AIModel{}).
+		Where("id = ?", uint(id)).
+		Update("official_price_url", url).Error; err != nil {
+		response.ErrorMsg(c, http.StatusInternalServerError, errcode.ErrInternal.Code, err.Error())
+		return
+	}
+	invalidatePublicModelsCache()
+	response.Success(c, gin.H{"message": "official_price_url updated", "url": url})
 }
 
 // ========== 模型下线扫描与批量下线 ==========
@@ -1552,10 +1929,12 @@ func (h *AIModelHandler) ScanOfflineAll(c *gin.Context) {
 
 // BulkDeprecateRequest 批量下线请求
 type BulkDeprecateRequest struct {
-	ModelIDs            []uint `json:"model_ids" binding:"required,min=1"`
-	OfflineDays         int    `json:"offline_days"` // 多少天后正式下线，默认 7
-	AnnouncementTitle   string `json:"announcement_title"`
-	AnnouncementContent string `json:"announcement_content"`
+	ModelIDs              []uint `json:"model_ids" binding:"required,min=1"`
+	OfflineDays           int    `json:"offline_days"` // 多少天后正式下线，默认 7
+	AnnouncementTitle     string `json:"announcement_title"`
+	AnnouncementTitleEn   string `json:"announcement_title_en"`
+	AnnouncementContent   string `json:"announcement_content"`
+	AnnouncementContentEn string `json:"announcement_content_en"`
 }
 
 // BulkDeprecate POST /admin/models/bulk-deprecate
@@ -1611,6 +1990,30 @@ func (h *AIModelHandler) BulkDeprecate(c *gin.Context) {
 		}
 		content = "以下模型将于 **" + offlineAt.Format("2006-01-02") + "** 正式下线，请提前完成迁移：\n\n" + modelList + "\n如有疑问请联系客服。"
 	}
+	titleEn := req.AnnouncementTitleEn
+	if titleEn == "" {
+		modelNames := make([]string, 0, len(affectedModels))
+		for _, m := range affectedModels {
+			name := m.DisplayName
+			if name == "" {
+				name = m.ModelName
+			}
+			modelNames = append(modelNames, name)
+		}
+		titleEn = "Model retirement notice: " + strings.Join(modelNames, ", ")
+	}
+	contentEn := req.AnnouncementContentEn
+	if contentEn == "" {
+		modelList := ""
+		for _, m := range affectedModels {
+			name := m.DisplayName
+			if name == "" {
+				name = m.ModelName
+			}
+			modelList += "- `" + name + "`\n"
+		}
+		contentEn = "The following models will be officially retired on **" + offlineAt.Format("2006-01-02") + "**. Please complete your migration in advance:\n\n" + modelList + "\nContact support if you have any questions."
+	}
 
 	// 创建模型下线公告
 	expiresAt := offlineAt.AddDate(0, 0, 7) // 公告在下线后7天过期
@@ -1618,7 +2021,9 @@ func (h *AIModelHandler) BulkDeprecate(c *gin.Context) {
 	modelIDsJSON, _ := json.Marshal(req.ModelIDs)
 	ann := &model.Announcement{
 		Title:      title,
+		TitleEn:    titleEn,
 		Content:    content,
+		ContentEn:  contentEn,
 		Type:       "model_deprecation",
 		Priority:   "high",
 		Status:     "active",
@@ -1742,6 +2147,7 @@ func (h *AIModelHandler) MarkOfficialDeprecated(c *gin.Context) {
 		now := time.Now()
 		// 按 RetireDate 分组，生成结构化内容
 		modelLines := ""
+		modelLinesEn := ""
 		for _, m := range matchedModels {
 			if m.Status == "offline" {
 				continue // 仅包含本次新下线的
@@ -1772,16 +2178,33 @@ func (h *AIModelHandler) MarkOfficialDeprecated(c *gin.Context) {
 				line += "\n  " + dep.Reason
 			}
 			modelLines += line + "\n"
+
+			lineEn := "- `" + name + "`"
+			if dep.RetireDate != "" {
+				lineEn += " (retirement date: " + dep.RetireDate + ")"
+			}
+			if dep.Replacement != "" {
+				lineEn += " -> recommended alternative: `" + dep.Replacement + "`"
+			}
+			if dep.Reason != "" {
+				lineEn += "\n  " + dep.Reason
+			}
+			modelLinesEn += lineEn + "\n"
 		}
 
+		supplierNameEn := announcementSupplierNameEn(supplier.Name)
 		title := "【" + supplier.Name + "】官方下线模型通知（" + strconv.Itoa(len(newlyOfflineIDs)) + " 个）"
+		titleEn := "[" + supplierNameEn + "] Official model retirement notice (" + strconv.Itoa(len(newlyOfflineIDs)) + ")"
 		content := "根据 **" + supplier.Name + "** 官方下线公告，以下模型已标记为下线，请尽快迁移到推荐替代模型：\n\n" + modelLines + "\n> 数据来源：供应商官方下线公告"
+		contentEn := "Based on the official retirement notice from **" + supplierNameEn + "**, the following models have been marked offline. Please migrate to the recommended alternatives as soon as possible:\n\n" + modelLinesEn + "\n> Source: provider official retirement notice"
 
 		expiresAt := now.AddDate(0, 1, 0) // 公告保留 1 个月
 		modelIDsJSON, _ := json.Marshal(newlyOfflineIDs)
 		ann := &model.Announcement{
 			Title:      title,
+			TitleEn:    titleEn,
 			Content:    content,
+			ContentEn:  contentEn,
 			Type:       "model_deprecation",
 			Priority:   "high",
 			Status:     "active",
@@ -1806,6 +2229,51 @@ func (h *AIModelHandler) MarkOfficialDeprecated(c *gin.Context) {
 		"announcement_id":  announcementID,
 		"details":          details,
 	})
+}
+
+func announcementSupplierNameEn(name string) string {
+	switch strings.TrimSpace(name) {
+	case "百度千帆":
+		return "Baidu Qianfan"
+	case "百度文心":
+		return "Baidu Wenxin"
+	case "阿里云百炼":
+		return "Alibaba Cloud Bailian"
+	case "阿里云":
+		return "Alibaba Cloud"
+	case "通义千问":
+		return "Qwen"
+	case "火山引擎":
+		return "Volcengine"
+	case "腾讯混元":
+		return "Tencent Hunyuan"
+	case "智谱":
+		return "Zhipu AI"
+	case "月之暗面":
+		return "Moonshot AI"
+	default:
+		return name
+	}
+}
+
+func uintFromPayload(value interface{}) uint {
+	switch v := value.(type) {
+	case float64:
+		if v > 0 {
+			return uint(v)
+		}
+	case int:
+		if v > 0 {
+			return uint(v)
+		}
+	case uint:
+		return v
+	case string:
+		if n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64); err == nil {
+			return uint(n)
+		}
+	}
+	return 0
 }
 
 // BatchRetag POST /admin/models/batch-retag

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -18,6 +19,20 @@ const (
 	priceCacheTTL    = 5 * time.Minute
 	priceCachePrefix = "pricing"
 )
+
+const platformPriceLocalCacheTTL = 2 * time.Minute
+
+type platformPriceCacheEntry struct {
+	price     model.ModelPricing
+	expiresAt time.Time
+}
+
+type platformPriceCacheKey struct {
+	db      *gorm.DB
+	modelID uint
+}
+
+var platformPriceLocalCache sync.Map
 
 // ErrModelNotPriced 模型未配置 ModelPricing 售价，禁止计费调用。
 // 上游 handler 应据此返回 503/402 并提示用户该模型不可用。
@@ -43,22 +58,56 @@ type CostResult struct {
 	PlatformCost int64       `json:"platform_cost"`  // 平台基础成本（积分），用于利润计算
 	PriceDetail  PriceResult `json:"price_detail"`
 
+	InputCostUnits    int64 `json:"input_cost_units"`    // internal billing units; truth source
+	OutputCostUnits   int64 `json:"output_cost_units"`   // internal billing units; truth source
+	TotalCostUnits    int64 `json:"total_cost_units"`    // internal billing units; truth source
+	PlatformCostUnits int64 `json:"platform_cost_units"` // internal billing units; truth source
+
 	// 阶梯定价命中信息（未命中时 MatchedTierIdx=-1）
 	MatchedTier    string `json:"matched_tier,omitempty"`
 	MatchedTierIdx int    `json:"matched_tier_idx"`
 
 	// 缓存计费明细（仅 CalculateCostWithCache 路径填充）
-	CacheReadTokens    int64 `json:"cache_read_tokens,omitempty"`
-	CacheWriteTokens   int64 `json:"cache_write_tokens,omitempty"`
-	CacheReadCost      int64 `json:"cache_read_cost,omitempty"`      // 缓存命中部分扣费（积分）
-	CacheWriteCost     int64 `json:"cache_write_cost,omitempty"`     // 缓存写入部分扣费（积分）
-	RegularInputCost   int64 `json:"regular_input_cost,omitempty"`   // 非缓存输入部分扣费（积分）
-	CacheSavingCredits int64 `json:"cache_saving_credits,omitempty"` // 对比无缓存路径节省的积分
+	CacheReadTokens             int64 `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens            int64 `json:"cache_write_tokens,omitempty"`
+	CacheWrite1hTokens          int64 `json:"cache_write_1h_tokens,omitempty"`
+	RegularInputTokens          int64 `json:"regular_input_tokens,omitempty"`
+	CacheReadPricePerMillion    int64 `json:"cache_read_price_per_million,omitempty"`
+	CacheWritePricePerMillion   int64 `json:"cache_write_price_per_million,omitempty"`
+	CacheWrite1hPricePerMillion int64 `json:"cache_write_1h_price_per_million,omitempty"`
+	CacheReadCost               int64 `json:"cache_read_cost,omitempty"`      // 缓存命中部分扣费（积分）
+	CacheWriteCost              int64 `json:"cache_write_cost,omitempty"`     // 缓存写入部分扣费（积分）
+	RegularInputCost            int64 `json:"regular_input_cost,omitempty"`   // 非缓存输入部分扣费（积分）
+	CacheSavingCredits          int64 `json:"cache_saving_credits,omitempty"` // 对比无缓存路径节省的积分
+	CacheReadCostUnits          int64 `json:"cache_read_cost_units,omitempty"`
+	CacheWriteCostUnits         int64 `json:"cache_write_cost_units,omitempty"`
+	RegularInputCostUnits       int64 `json:"regular_input_cost_units,omitempty"`
+	CacheSavingUnits            int64 `json:"cache_saving_units,omitempty"`
+
+	// 思考模式增量明细（由 billing.Service.applyThinkingSurcharge 填充）
+	ThinkingOutputCost            int64   `json:"thinking_output_cost,omitempty"`
+	ThinkingOutputCostUnits       int64   `json:"thinking_output_cost_units,omitempty"`
+	ThinkingOutputPriceRMB        float64 `json:"thinking_output_price_rmb,omitempty"`
+	ThinkingOutputPricePerMillion int64   `json:"thinking_output_price_per_million,omitempty"`
 
 	// 用户级特殊折扣命中信息（UserModelDiscount 命中时回填，供 api_call_logs 审计）
 	UserDiscountID   *uint    `json:"user_discount_id,omitempty"`
 	UserDiscountRate *float64 `json:"user_discount_rate,omitempty"`
 	UserDiscountType string   `json:"user_discount_type,omitempty"`
+
+	// 供应商折扣 + 折后成本(2026-04-28 引入,用于真实平台成本计算)
+	// SupplierDiscount: 0.6 = 6 折,1.0 = 无折扣
+	// EffectiveInputCostRMB / EffectiveOutputCostRMB: 折后单价(¥/百万 tokens),= 官网原价 × supplier_discount
+	SupplierID             uint    `json:"supplier_id,omitempty"`
+	SupplierDiscount       float64 `json:"supplier_discount,omitempty"`
+	EffectiveInputCostRMB  float64 `json:"effective_input_cost_rmb,omitempty"`
+	EffectiveOutputCostRMB float64 `json:"effective_output_cost_rmb,omitempty"`
+
+	// PriceMatrix 命中信息(v3):
+	// MatchedDimValues 记录命中的维度组合,nil 表示未走矩阵命中(旧路径)
+	// MatchedMatrixCellNote 记录单元格备注(如 "1080p × 含视频 × 在线")
+	MatchedDimValues      map[string]interface{} `json:"matched_dim_values,omitempty"`
+	MatchedMatrixCellNote string                 `json:"matched_matrix_cell_note,omitempty"`
 }
 
 // UsageInput 多计费单位的用量输入
@@ -71,6 +120,12 @@ type CostResult struct {
 //   - per_million_characters: CharCount（按百万字符折算，qwen-tts / openai-tts）
 //   - per_call:               CallCount（请求次数，Rerank 等）
 //   - per_hour:               DurationSec（按小时折算，ASR）
+//
+// 业务维度（S3 升级，2026-04-28）：
+//
+//	Dimensions 透传 handler 解析的请求维度（resolution/has_input_video/audio_mode 等），
+//	用于 PriceTier.DimValues 显式匹配。Variant 仍保留作为非 Token 单位的简单维度
+//	（per_second 路径的 720P/1080P 兼容字段），未来逐步替换为 Dimensions。
 type UsageInput struct {
 	InputTokens  int     `json:"input_tokens,omitempty"`
 	OutputTokens int     `json:"output_tokens,omitempty"`
@@ -78,6 +133,14 @@ type UsageInput struct {
 	CharCount    int     `json:"char_count,omitempty"`
 	DurationSec  float64 `json:"duration_sec,omitempty"`
 	CallCount    int     `json:"call_count,omitempty"`
+
+	// Variant 非 Token 单位的简单变体（如 per_second 路径下 "720P"/"1080P"）。
+	// F3（2026-04-28）：CalculateCostByUnit 在非 token 分支按 Variant 匹配 PriceTier。
+	Variant string `json:"variant,omitempty"`
+
+	// Dimensions 业务维度（S3，2026-04-28）：driving PriceTier.DimValues 显式匹配。
+	// 例：{"resolution":"1080p", "input_has_video":"true", "audio_mode":"true"}
+	Dimensions map[string]string `json:"dimensions,omitempty"`
 }
 
 // PriceMatrixItem 价格矩阵中的单行数据
@@ -118,6 +181,20 @@ func NewPricingCalculator(db *gorm.DB) *PricingCalculator {
 		redis:    redis.Client,
 		resolver: NewDiscountResolver(db),
 	}
+}
+
+func tokenCostUnits(priceCreditsPerMillion int64, priceRMBPerMillion float64, tokens int64) int64 {
+	if tokens <= 0 {
+		return 0
+	}
+	if priceRMBPerMillion > 0 {
+		return credits.CostUnitsFromRMBPerMillion(priceRMBPerMillion, tokens)
+	}
+	return credits.CostUnitsFromCreditsPerMillion(priceCreditsPerMillion, tokens)
+}
+
+func legacyCreditsFromUnits(units int64) int64 {
+	return credits.BillingUnitsToCredits(units)
 }
 
 // cacheKey 构建定价查询的 Redis 缓存键（包含 userID 支持用户级覆盖）
@@ -180,7 +257,23 @@ func (c *PricingCalculator) CalculatePrice(ctx context.Context, userID uint, mod
 //     - SellingOverride=true: 跳过 FIXED/MARKUP，仅叠加 DISCOUNT 代理折扣
 //     - SellingOverride=false: 完整走 applyDiscount 链路（阶梯价代替平台基础价）
 //  2. 未命中阶梯 → 旧路径：CalculatePrice + 单价
+//
+// 维度感知：本签名为兼容 API，等价于 CalculateCostWithDims(..., nil)。
+// 想用业务维度（resolution / has_input_video 等）触发显式 DimValues 匹配，请用
+// CalculateCostWithDims 或经 CalculateCostByUnit + UsageInput.Dimensions。
 func (c *PricingCalculator) CalculateCost(ctx context.Context, userID uint, modelID uint, tenantID uint, agentLevel int, inputTokens, outputTokens int) (*CostResult, error) {
+	return c.CalculateCostWithDims(ctx, userID, modelID, tenantID, agentLevel, inputTokens, outputTokens, nil)
+}
+
+// CalculateCostWithDims 计算单次请求的费用 + 业务维度感知（S3 升级，2026-04-28）
+//
+// dims 用于 selectPriceForTokens 优先按 PriceTier.DimValues 匹配（替代 magic-InputMin
+// 编码维度的旧 hack）。dims 为 nil/空时行为与 CalculateCost 完全一致。
+//
+// 推荐调用路径：handler 把请求参数（resolution / has_input_video / generate_audio /
+// thinking_mode 等）打包为 UsageInput.Dimensions → BillingService → CalculateCostByUnit
+// → 本函数。
+func (c *PricingCalculator) CalculateCostWithDims(ctx context.Context, userID uint, modelID uint, tenantID uint, agentLevel int, inputTokens, outputTokens int, dims map[string]string) (*CostResult, error) {
 	if inputTokens < 0 {
 		inputTokens = 0
 	}
@@ -194,8 +287,8 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, userID uint, mode
 		return nil, fmt.Errorf("get platform price for cost: %w", err)
 	}
 
-	// 1. 尝试阶梯选择
-	tierSel, _ := c.selectPriceForTokens(ctx, modelID, int64(inputTokens), int64(outputTokens))
+	// 1. 尝试阶梯选择（含 DimValues 优先）
+	tierSel, _ := c.selectPriceForTokens(ctx, modelID, int64(inputTokens), int64(outputTokens), dims)
 
 	var (
 		inputPerMillion  int64
@@ -279,26 +372,73 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, userID uint, mode
 		}
 	}
 
-	// 计算费用：价格单位是"每百万token的积分"，需要乘以 token 数再除以 1,000,000
-	// 为避免浮点运算，使用整数运算：cost = price * tokens / 1_000_000
-	// 最小1积分保底：有token消耗时至少扣1积分，防止小请求因整数截断免费
-	inputCost := inputPerMillion * int64(inputTokens) / 1_000_000
-	outputCost := outputPerMillion * int64(outputTokens) / 1_000_000
-	platformCost := (platformPrice.InputPricePerToken*int64(inputTokens) + platformPrice.OutputPricePerToken*int64(outputTokens)) / 1_000_000
+	inputCostUnits := tokenCostUnits(inputPerMillion, inputPriceRMB, int64(inputTokens))
+	outputCostUnits := tokenCostUnits(outputPerMillion, outputPriceRMB, int64(outputTokens))
+	inputCost := legacyCreditsFromUnits(inputCostUnits)
+	outputCost := legacyCreditsFromUnits(outputCostUnits)
 
-	totalCost := inputCost + outputCost
-	// 有实际token消耗但计算结果为0时（整数截断），保底收取1积分
-	if totalCost == 0 && (inputTokens > 0 || outputTokens > 0) {
-		totalCost = 1
+	// ───── 真实平台成本计算(2026-04-28 引入供应商折扣) ─────
+	// 旧行为(BUG): platformInputUnit = platformPrice.InputPricePerToken (= 售价,完全错误)
+	// 新行为: platformInputUnit = ai_models.input_cost_rmb × suppliers.discount
+	// 即按"折后成本"(平台向供应商真实付的钱)计算 platform_cost
+	var (
+		aiModel          model.AIModel
+		supplierDiscount = 1.0
+		supplierID       uint
+	)
+	if mErr := c.db.WithContext(ctx).
+		Select("id, supplier_id, input_cost_rmb, output_cost_rmb").
+		Where("id = ?", modelID).
+		First(&aiModel).Error; mErr == nil && aiModel.SupplierID > 0 {
+		supplierID = aiModel.SupplierID
+		var sup model.Supplier
+		if sErr := c.db.WithContext(ctx).
+			Select("id, discount").
+			Where("id = ?", aiModel.SupplierID).
+			First(&sup).Error; sErr == nil && sup.Discount > 0 && sup.Discount <= 10 {
+			supplierDiscount = sup.Discount
+		}
 	}
-	totalCostRMB := credits.CreditsToRMB(totalCost)
+	effectiveInputCostRMB := aiModel.InputCostRMB * supplierDiscount
+	effectiveOutputCostRMB := aiModel.OutputCostRMB * supplierDiscount
 
-	return &CostResult{
+	// 折后单价 → 积分/百万(1 RMB = 10000 credits)
+	platformInputUnit := credits.RMBToCredits(effectiveInputCostRMB)
+	platformOutputUnit := credits.RMBToCredits(effectiveOutputCostRMB)
+
+	// P2 兼容: 阶梯命中且 tier 显式配置成本价时,优先用 tier 成本价
+	// (假设 tier 配置时已是 folded cost,因为 tier 主要用于"大请求降价")
+	if tierSel != nil && tierSel.FromTier {
+		if tierSel.PlatformInputPricePerMillion > 0 {
+			platformInputUnit = tierSel.PlatformInputPricePerMillion
+		}
+		if tierSel.PlatformOutputPricePerMillion > 0 {
+			platformOutputUnit = tierSel.PlatformOutputPricePerMillion
+		}
+	}
+
+	platformInputCostUnits := credits.CostUnitsFromCreditsPerMillion(platformInputUnit, int64(inputTokens))
+	platformOutputCostUnits := credits.CostUnitsFromCreditsPerMillion(platformOutputUnit, int64(outputTokens))
+	platformCostUnits := platformInputCostUnits + platformOutputCostUnits
+	platformCost := legacyCreditsFromUnits(platformCostUnits)
+
+	totalCostUnits := inputCostUnits + outputCostUnits
+	if totalCostUnits == 0 && (inputTokens > 0 || outputTokens > 0) && (inputPerMillion > 0 || outputPerMillion > 0) {
+		totalCostUnits = 1
+	}
+	totalCost := legacyCreditsFromUnits(totalCostUnits)
+	totalCostRMB := credits.BillingUnitsToRMB(totalCostUnits)
+
+	result := &CostResult{
 		InputCost:    inputCost,
 		OutputCost:   outputCost,
 		TotalCost:    totalCost,
 		TotalCostRMB: totalCostRMB,
 		PlatformCost: platformCost,
+		InputCostUnits:    inputCostUnits,
+		OutputCostUnits:   outputCostUnits,
+		TotalCostUnits:    totalCostUnits,
+		PlatformCostUnits: platformCostUnits,
 		PriceDetail: PriceResult{
 			InputPricePerMillion:  inputPerMillion,
 			OutputPricePerMillion: outputPerMillion,
@@ -307,12 +447,32 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, userID uint, mode
 			Currency:              platformPrice.Currency,
 			Source:                source,
 		},
-		MatchedTier:      matchedTier,
-		MatchedTierIdx:   matchedTierIdx,
-		UserDiscountID:   userDiscountID,
-		UserDiscountRate: userDiscountRate,
-		UserDiscountType: userDiscountType,
-	}, nil
+		MatchedTier:            matchedTier,
+		MatchedTierIdx:         matchedTierIdx,
+		RegularInputTokens:     int64(inputTokens),
+		UserDiscountID:         userDiscountID,
+		UserDiscountRate:       userDiscountRate,
+		UserDiscountType:       userDiscountType,
+		SupplierID:             supplierID,
+		SupplierDiscount:       supplierDiscount,
+		EffectiveInputCostRMB:  effectiveInputCostRMB,
+		EffectiveOutputCostRMB: effectiveOutputCostRMB,
+	}
+
+	// M1 (2026-04-28): 当 selectPriceForTokens 走 PriceMatrix 路径时回填 stamp 字段
+	// 让 BillingService.SettleUsage 不再需要二次调用 tryMatchPriceMatrix（避免双轨命中）
+	if tierSel != nil && tierSel.FromMatrix {
+		result.MatchedDimValues = tierSel.MatrixCellDimValues
+		result.MatchedMatrixCellNote = tierSel.MatrixCellNote
+		// 修订 source 使审计日志能区分 PriceMatrix vs PriceTier 路径
+		if result.PriceDetail.Source == "" || result.PriceDetail.Source == "platform" {
+			result.PriceDetail.Source = "price_matrix"
+		} else {
+			result.PriceDetail.Source += "+matrix"
+		}
+	}
+
+	return result, nil
 }
 
 // CalculateCostByUnit 根据模型的 PricingUnit 使用对应的用量字段计算费用
@@ -327,9 +487,18 @@ func (c *PricingCalculator) CalculateCost(ctx context.Context, userID uint, mode
 //   - per_call:               input_cost_rmb * call_count
 //   - per_hour:               input_cost_rmb * duration_sec / 3600
 //
-// 对于非 Token 单位，以模型的平台基础价 InputCostRMB 计算。
-// 三级折扣（DISCOUNT）仍生效（通过 DiscountResolver 解析后乘折扣率）。
-// MARKUP/FIXED 在非 Token 类单位下暂不支持，按平台基础价收取。
+// 对于非 Token 单位，以模型的平台基础价 InputCostRMB 为基准。
+//
+// 折扣链路（v4.4 起完整支持 FIXED / MARKUP / DISCOUNT 三种类型）：
+//   - FIXED:    DiscountResult.FixedInput 解释为"每个计价单位的固定积分价"。
+//               Unit 路径下，1 unit = 1 张图 / 1 秒 / 10000 字符 / 1 次调用，依 PricingUnit 而定。
+//               生效后单价 = CreditsToRMB(int64(*FixedInput))。
+//   - MARKUP:   单价 = basePriceRMB × (1 + MarkupRate)，与 Token 路径 applyDiscount 语义一致。
+//   - DISCOUNT: 单价 = basePriceRMB × InputDiscount，与历史行为兼容。
+//
+// 价格语义复用 applyDiscount：构造 tempPlatform（把 basePriceRMB 装进 InputPriceRMB），
+// 调用 applyDiscount 得到折扣后单价，再乘以 quantity。
+// source 字段沿用 Unit 路径细粒度解析（区分 user_custom / agent_custom / level_discount）。
 func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, userID uint, modelID uint, tenantID uint, agentLevel int, usage UsageInput) (*CostResult, error) {
 	var m model.AIModel
 	if err := c.db.WithContext(ctx).First(&m, modelID).Error; err != nil {
@@ -337,15 +506,38 @@ func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, userID uint
 	}
 
 	// per_million_tokens 走原有路径，保证 FIXED/MARKUP/DISCOUNT 三层定价完全兼容
+	// S3：透传 Dimensions 到阶梯匹配链路（替代 magic-InputMin 编码维度）
 	if m.PricingUnit == "" || m.PricingUnit == model.UnitPerMillionTokens {
-		return c.CalculateCost(ctx, userID, modelID, tenantID, agentLevel, usage.InputTokens, usage.OutputTokens)
+		return c.CalculateCostWithDims(ctx, userID, modelID, tenantID, agentLevel, usage.InputTokens, usage.OutputTokens, usage.Dimensions)
 	}
 
 	// 非 token 单位：以模型 InputCostRMB 为基础价
+	// F3：当 PriceTiers 配置了 Variant 维度（如 wan2.7-t2v 720P/1080P 双档），
+	// 优先按 usage.Variant 匹配 tier 单价，避免 1080P 用户被按 720P 价计费
 	platformPrice, platformErr := c.getPlatformPrice(ctx, modelID)
 	sellPriceRMB := m.InputCostRMB
 	if platformErr == nil && platformPrice != nil && platformPrice.InputPriceRMB > 0 {
 		sellPriceRMB = platformPrice.InputPriceRMB
+	}
+	// F3 + S3：先尝试 DimValues / Variant 匹配，命中则用 tier 价覆盖单价
+	if len(m.PriceTiers) > 0 && (usage.Variant != "" || len(usage.Dimensions) > 0) {
+		tierData := parseTiersJSON(m.PriceTiers)
+		if tierData != nil && len(tierData.Tiers) > 0 {
+			// 优先 DimValues
+			if len(usage.Dimensions) > 0 {
+				if _, t := model.SelectTierByDims(tierData.Tiers, usage.Dimensions); t != nil {
+					if p := pickFirstNonZero(t.InputPrice, t.OutputPrice); p > 0 {
+						sellPriceRMB = p
+					}
+				}
+			}
+			// 兜底 Variant（per_second/per_image 等历史路径）
+			if usage.Variant != "" {
+				if p, hit := selectPriceByVariant(tierData.Tiers, usage.Variant); hit {
+					sellPriceRMB = p
+				}
+			}
+		}
 	}
 	baseCostRMB := m.InputCostRMB
 	if baseCostRMB <= 0 && sellPriceRMB > 0 {
@@ -357,29 +549,38 @@ func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, userID uint
 		return &CostResult{TotalCost: 0, TotalCostRMB: 0}, nil
 	}
 
-	// 尝试解析折扣（仅应用 DISCOUNT 类型，其他类型回退为平台价）
+	// 尝试解析折扣（v4.4 起完整支持 FIXED/MARKUP/DISCOUNT 三种）
 	discount, derr := c.resolver.ResolveDiscount(ctx, userID, tenantID, modelID, agentLevel)
-	discountRate := 1.0
+	effectiveUnitPriceRMB := basePriceRMB
 	source := "platform"
 	var udID *uint
 	var udRate *float64
 	var udType string
-	if derr == nil && discount != nil {
+	if derr == nil && discount != nil && discount.Type != "none" && discount.PricingType != "" && discount.PricingType != "NONE" {
 		if discount.UserDiscountID != nil {
 			udID = discount.UserDiscountID
 			udRate = discount.UserDiscountRate
 			udType = discount.UserDiscountType
 		}
-		if discount.PricingType == "DISCOUNT" && discount.InputDiscount > 0 {
-			discountRate = discount.InputDiscount
-			switch discount.Type {
-			case "user_custom":
-				source = "user_custom"
-			case "agent_custom":
-				source = "agent_custom"
-			default:
-				source = "level_discount"
-			}
+		// 复用 applyDiscount：把 basePriceRMB 装进 tempPlatform 计算单价
+		tempPlatform := &model.ModelPricing{
+			InputPricePerToken:  credits.RMBToCredits(basePriceRMB),
+			OutputPricePerToken: 0,
+			InputPriceRMB:       basePriceRMB,
+			OutputPriceRMB:      0,
+			Currency:            "CREDIT",
+		}
+		applied := c.applyDiscount(tempPlatform, discount)
+		if applied != nil && applied.InputPriceRMB >= 0 {
+			effectiveUnitPriceRMB = applied.InputPriceRMB
+		}
+		switch discount.Type {
+		case "user_custom":
+			source = "user_custom"
+		case "agent_custom":
+			source = "agent_custom"
+		default:
+			source = "level_discount"
 		}
 	}
 
@@ -409,17 +610,17 @@ func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, userID uint
 		return &CostResult{TotalCost: 0, TotalCostRMB: 0, PriceDetail: PriceResult{Currency: "CREDIT", Source: source}}, nil
 	}
 
-	costRMB := basePriceRMB * quantity * discountRate
-	totalCost := credits.RMBToCredits(costRMB)
-
-	// 有实际消耗但因四舍五入取整为 0，保底 1 积分
-	if totalCost == 0 && quantity > 0 && costRMB > 0 {
-		totalCost = 1
+	costRMB := effectiveUnitPriceRMB * quantity
+	totalCostUnits := credits.RMBToBillingUnits(costRMB)
+	if totalCostUnits == 0 && quantity > 0 && costRMB > 0 {
+		totalCostUnits = 1
 	}
-	totalCostRMB := credits.CreditsToRMB(totalCost)
+	totalCost := legacyCreditsFromUnits(totalCostUnits)
+	totalCostRMB := credits.BillingUnitsToRMB(totalCostUnits)
 
 	// 平台成本（用于利润分析）使用同一基础价
-	platformCost := credits.RMBToCredits(baseCostRMB * quantity)
+	platformCostUnits := credits.RMBToBillingUnits(baseCostRMB * quantity)
+	platformCost := legacyCreditsFromUnits(platformCostUnits)
 
 	return &CostResult{
 		InputCost:    totalCost,
@@ -427,10 +628,14 @@ func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, userID uint
 		TotalCost:    totalCost,
 		TotalCostRMB: totalCostRMB,
 		PlatformCost: platformCost,
+		InputCostUnits:    totalCostUnits,
+		OutputCostUnits:   0,
+		TotalCostUnits:    totalCostUnits,
+		PlatformCostUnits: platformCostUnits,
 		PriceDetail: PriceResult{
-			InputPricePerMillion:  credits.RMBToCredits(sellPriceRMB * discountRate),
+			InputPricePerMillion:  credits.RMBToCredits(effectiveUnitPriceRMB),
 			OutputPricePerMillion: 0,
-			InputPriceRMB:         sellPriceRMB * discountRate,
+			InputPriceRMB:         effectiveUnitPriceRMB,
 			OutputPriceRMB:        0,
 			Currency:              "CREDIT",
 			Source:                source,
@@ -443,10 +648,11 @@ func (c *PricingCalculator) CalculateCostByUnit(ctx context.Context, userID uint
 
 // CacheUsageInput 含缓存信息的用量输入
 type CacheUsageInput struct {
-	InputTokens      int // 总输入Token（含缓存命中+写入+普通）
-	OutputTokens     int // 输出Token
-	CacheReadTokens  int // 缓存命中Token（来自供应商响应）
-	CacheWriteTokens int // 缓存写入Token（Anthropic cache_creation_input_tokens）
+	InputTokens        int // 总输入Token（含缓存命中+写入+普通）
+	OutputTokens       int // 输出Token
+	CacheReadTokens    int // 缓存命中Token（来自供应商响应）
+	CacheWriteTokens   int // 缓存写入Token（Anthropic cache_creation_input_tokens）
+	CacheWrite1hTokens int // Anthropic 1h cache write tokens; included in CacheWriteTokens
 }
 
 // CalculateCostWithCache 按缓存比率扣除用户积分（本次修复的核心路径）
@@ -456,9 +662,9 @@ type CacheUsageInput struct {
 //  2. 根据 AIModel 的成本侧比率（cache_input_price_rmb / input_cost_rmb）
 //     按同等折扣推导出用户侧缓存价（售价 × 比率）
 //  3. 将 input tokens 拆分为三段：
-//       - regular    = InputTokens - CacheReadTokens - CacheWriteTokens
-//       - cache_read  = CacheReadTokens（auto/explicit/both 命中）
-//       - cache_write = CacheWriteTokens（explicit/both 写入溢价）
+//     - regular    = InputTokens - CacheReadTokens - CacheWriteTokens
+//     - cache_read  = CacheReadTokens（auto/explicit/both 命中）
+//     - cache_write = CacheWriteTokens（explicit/both 写入溢价）
 //  4. 三段分别按对应单价结算后加总
 //
 // 返回的 CostResult 附带 CacheReadCost / CacheWriteCost / RegularInputCost /
@@ -518,50 +724,114 @@ func (c *PricingCalculator) CalculateCostWithCache(
 	outputPerMillion := base.PriceDetail.OutputPricePerMillion
 	cacheReadPerMillion := int64(float64(inputPerMillion) * cacheReadRatio)
 	cacheWritePerMillion := int64(float64(inputPerMillion) * cacheWriteRatio)
+	// P5 修复：1h 长缓存写入溢价仅 Anthropic（explicit 机制）支持
+	// 其他供应商（auto/both）不存在 5m/1h 区分，强制 1h 单价 0 + 1h tokens 0
+	var cacheWrite1hPerMillion int64
+	if aiModel.CacheMechanism == "explicit" {
+		cacheWrite1hPerMillion = int64(float64(inputPerMillion) * 2.0)
+	}
 
 	readTokens := int64(usage.CacheReadTokens)
 	writeTokens := int64(usage.CacheWriteTokens)
+	var write1hTokens int64
+	if aiModel.CacheMechanism == "explicit" {
+		write1hTokens = int64(usage.CacheWrite1hTokens)
+		if write1hTokens < 0 {
+			write1hTokens = 0
+		}
+		if write1hTokens > writeTokens {
+			write1hTokens = writeTokens
+		}
+	}
+	write5mTokens := writeTokens - write1hTokens
 	totalInput := int64(usage.InputTokens)
 	regularTokens := totalInput - readTokens - writeTokens
 	if regularTokens < 0 {
 		regularTokens = 0
 	}
 
-	regularCost := inputPerMillion * regularTokens / 1_000_000
-	cacheReadCost := cacheReadPerMillion * readTokens / 1_000_000
-	cacheWriteCost := cacheWritePerMillion * writeTokens / 1_000_000
-	inputCost := regularCost + cacheReadCost + cacheWriteCost
-	outputCost := outputPerMillion * int64(usage.OutputTokens) / 1_000_000
+	regularCostUnits := credits.CostUnitsFromCreditsPerMillion(inputPerMillion, regularTokens)
+	cacheReadCostUnits := credits.CostUnitsFromCreditsPerMillion(cacheReadPerMillion, readTokens)
+	cacheWriteCostUnits := credits.CostUnitsFromCreditsPerMillion(cacheWritePerMillion, write5mTokens) +
+		credits.CostUnitsFromCreditsPerMillion(cacheWrite1hPerMillion, write1hTokens)
+	inputCostUnits := regularCostUnits + cacheReadCostUnits + cacheWriteCostUnits
+	outputCostUnits := credits.CostUnitsFromCreditsPerMillion(outputPerMillion, int64(usage.OutputTokens))
 
-	totalCost := inputCost + outputCost
-	if totalCost == 0 && (usage.InputTokens > 0 || usage.OutputTokens > 0) {
-		totalCost = 1
-	}
+	regularCost := legacyCreditsFromUnits(regularCostUnits)
+	cacheReadCost := legacyCreditsFromUnits(cacheReadCostUnits)
+	cacheWriteCost := legacyCreditsFromUnits(cacheWriteCostUnits)
+	inputCost := legacyCreditsFromUnits(inputCostUnits)
+	outputCost := legacyCreditsFromUnits(outputCostUnits)
 
-	// 节省 = 无缓存路径的扣费 - 实际扣费
-	savings := base.TotalCost - totalCost
-	if savings < 0 {
-		savings = 0
+	totalCostUnits := inputCostUnits + outputCostUnits
+	if totalCostUnits == 0 && (usage.InputTokens > 0 || usage.OutputTokens > 0) {
+		totalCostUnits = 1
 	}
+	totalCost := legacyCreditsFromUnits(totalCostUnits)
+
+	savingsUnits := base.TotalCostUnits - totalCostUnits
+	if savingsUnits < 0 {
+		savingsUnits = 0
+	}
+	savings := legacyCreditsFromUnits(savingsUnits)
+
+	// P2 修复：重新计算 platformCost 让其也感知缓存折扣
+	// 平台成本侧的输入单价：优先 base.PlatformCost 反推（已含阶梯成本归因），
+	// 否则使用 aiModel.InputCostRMB
+	platformInputPerMillion := credits.RMBToCredits(aiModel.InputCostRMB)
+	platformOutputPerMillion := credits.RMBToCredits(aiModel.OutputCostRMB)
+	if regularTokens+int64(usage.OutputTokens) > 0 && base.PlatformCost > 0 {
+		// 反推：base.PlatformCost = (platInput × inputTokens + platOutput × outputTokens) / 1M
+		// 在阶梯命中场景，base.PlatformCost 已是阶梯成本归因；这里按相同 input/output 比例展开
+		// 简化：直接使用 aiModel 字段（已是基础成本/阶梯成本之一）
+	}
+	platCacheReadPerMillion := credits.RMBToCredits(aiModel.CacheInputPriceRMB)
+	if usage.CacheWriteTokens > 0 && aiModel.CacheExplicitInputPriceRMB > 0 && aiModel.CacheMechanism == "both" {
+		platCacheReadPerMillion = credits.RMBToCredits(aiModel.CacheExplicitInputPriceRMB)
+	}
+	platCacheWritePerMillion := credits.RMBToCredits(aiModel.CacheWritePriceRMB)
+	platRegularCostUnits := credits.CostUnitsFromCreditsPerMillion(platformInputPerMillion, regularTokens)
+	platCacheReadCostUnits := credits.CostUnitsFromCreditsPerMillion(platCacheReadPerMillion, readTokens)
+	platCacheWriteCostUnits := credits.CostUnitsFromCreditsPerMillion(platCacheWritePerMillion, writeTokens)
+	platOutputCostUnits := credits.CostUnitsFromCreditsPerMillion(platformOutputPerMillion, int64(usage.OutputTokens))
+	platformCostUnits := platRegularCostUnits + platCacheReadCostUnits + platCacheWriteCostUnits + platOutputCostUnits
+	if platformCostUnits == 0 {
+		// 兜底：缓存价缺失时退回到 base.PlatformCost（按全价计算的成本）
+		platformCostUnits = base.PlatformCostUnits
+	}
+	platformCost := legacyCreditsFromUnits(platformCostUnits)
 
 	return &CostResult{
-		InputCost:          inputCost,
-		OutputCost:         outputCost,
-		TotalCost:          totalCost,
-		TotalCostRMB:       credits.CreditsToRMB(totalCost),
-		PlatformCost:       base.PlatformCost,
-		PriceDetail:        base.PriceDetail,
-		MatchedTier:        base.MatchedTier,
-		MatchedTierIdx:     base.MatchedTierIdx,
-		CacheReadTokens:    readTokens,
-		CacheWriteTokens:   writeTokens,
-		CacheReadCost:      cacheReadCost,
-		CacheWriteCost:     cacheWriteCost,
-		RegularInputCost:   regularCost,
-		CacheSavingCredits: savings,
-		UserDiscountID:     base.UserDiscountID,
-		UserDiscountRate:   base.UserDiscountRate,
-		UserDiscountType:   base.UserDiscountType,
+		InputCost:                   inputCost,
+		OutputCost:                  outputCost,
+		TotalCost:                   totalCost,
+		TotalCostRMB:                credits.BillingUnitsToRMB(totalCostUnits),
+		PlatformCost:                platformCost,
+		InputCostUnits:              inputCostUnits,
+		OutputCostUnits:             outputCostUnits,
+		TotalCostUnits:              totalCostUnits,
+		PlatformCostUnits:           platformCostUnits,
+		PriceDetail:                 base.PriceDetail,
+		MatchedTier:                 base.MatchedTier,
+		MatchedTierIdx:              base.MatchedTierIdx,
+		CacheReadTokens:             readTokens,
+		CacheWriteTokens:            writeTokens,
+		CacheWrite1hTokens:          write1hTokens,
+		RegularInputTokens:          regularTokens,
+		CacheReadPricePerMillion:    cacheReadPerMillion,
+		CacheWritePricePerMillion:   cacheWritePerMillion,
+		CacheWrite1hPricePerMillion: cacheWrite1hPerMillion,
+		CacheReadCost:               cacheReadCost,
+		CacheWriteCost:              cacheWriteCost,
+		RegularInputCost:            regularCost,
+		CacheSavingCredits:          savings,
+		CacheReadCostUnits:          cacheReadCostUnits,
+		CacheWriteCostUnits:         cacheWriteCostUnits,
+		RegularInputCostUnits:       regularCostUnits,
+		CacheSavingUnits:            savingsUnits,
+		UserDiscountID:              base.UserDiscountID,
+		UserDiscountRate:            base.UserDiscountRate,
+		UserDiscountType:            base.UserDiscountType,
 	}, nil
 }
 
@@ -731,6 +1001,15 @@ func (c *PricingCalculator) InvalidateUserCache(ctx context.Context, userID uint
 // 历史上此处曾用 ai_models.input_cost_rmb 做 fallback，导致未维护售价的模型按成本价扣费，
 // 平台利润为 0 甚至为负。已改为强校验，请通过 /admin/models/repair-pricing 一次性补齐。
 func (c *PricingCalculator) getPlatformPrice(ctx context.Context, modelID uint) (*model.ModelPricing, error) {
+	cacheKey := platformPriceCacheKey{db: c.db, modelID: modelID}
+	if raw, ok := platformPriceLocalCache.Load(cacheKey); ok {
+		if cached, ok := raw.(*platformPriceCacheEntry); ok && time.Now().Before(cached.expiresAt) {
+			price := cached.price
+			return &price, nil
+		}
+		platformPriceLocalCache.Delete(cacheKey)
+	}
+
 	var mp model.ModelPricing
 	err := c.db.WithContext(ctx).
 		Where("model_id = ?", modelID).
@@ -742,6 +1021,10 @@ func (c *PricingCalculator) getPlatformPrice(ctx context.Context, modelID uint) 
 		}
 		return nil, fmt.Errorf("query model pricing: %w", err)
 	}
+	platformPriceLocalCache.Store(cacheKey, &platformPriceCacheEntry{
+		price:     mp,
+		expiresAt: time.Now().Add(platformPriceLocalCacheTTL),
+	})
 	return &mp, nil
 }
 

@@ -2,6 +2,15 @@ package model
 
 import "time"
 
+const (
+	SupportTicketCategoryAPI                  = "api"
+	SupportTicketCategoryAPIInterfaceFeedback = "api_interface_feedback"
+	SupportTicketCategoryBilling              = "billing"
+	SupportTicketCategoryChannel              = "channel"
+	SupportTicketCategoryAccount              = "account"
+	SupportTicketCategoryOther                = "other"
+)
+
 // ================= AI 客服 + 工单系统数据模型 =================
 // 本文件定义 9 张表，覆盖 AI 客服对话、RAG 知识库、工单、长期记忆、
 // 供应商文档引用、热门问题、采纳答案、模型配置
@@ -14,8 +23,8 @@ type SupportSession struct {
 	BaseModel
 	UserID       uint       `gorm:"index;not null" json:"user_id"`
 	Title        string     `gorm:"type:varchar(200)" json:"title"`
-	Locale       string     `gorm:"type:varchar(10);default:'zh'" json:"locale"`         // 会话界面语言
-	OriginalLang string     `gorm:"type:varchar(10)" json:"original_lang,omitempty"`     // 首条消息检测到的语言
+	Locale       string     `gorm:"type:varchar(10);default:'zh'" json:"locale"`           // 会话界面语言
+	OriginalLang string     `gorm:"type:varchar(10)" json:"original_lang,omitempty"`       // 首条消息检测到的语言
 	Status       string     `gorm:"type:varchar(20);default:'active';index" json:"status"` // active / escalated / closed
 	MsgCount     int        `gorm:"default:0" json:"msg_count"`
 	TokenCost    int64      `gorm:"default:0" json:"token_cost"` // 累计 token 消耗
@@ -30,8 +39,8 @@ func (SupportSession) TableName() string { return "support_sessions" }
 type SupportMessage struct {
 	BaseModel
 	SessionID    uint       `gorm:"index;not null" json:"session_id"`
-	Role         string     `gorm:"type:varchar(20);not null" json:"role"` // user / assistant
-	Content      string     `gorm:"type:mediumtext" json:"content"`         // 原语言正文
+	Role         string     `gorm:"type:varchar(20);not null" json:"role"`       // user / assistant
+	Content      string     `gorm:"type:mediumtext" json:"content"`              // 原语言正文
 	ContentZh    string     `gorm:"type:mediumtext" json:"content_zh,omitempty"` // 用户问题的中文翻译版（仅 user role 填充，用于检索）
 	ModelID      string     `gorm:"type:varchar(100)" json:"model_id,omitempty"` // 实际调用的模型 key
 	TokensIn     int        `json:"tokens_in"`
@@ -52,16 +61,16 @@ func (SupportMessage) TableName() string { return "support_messages" }
 type KnowledgeChunk struct {
 	BaseModel
 	SourceType    string `gorm:"type:varchar(30);not null;index" json:"source_type"`
-	SourceID      uint   `gorm:"index" json:"source_id"`                           // 关联原表 id（doc_articles / hot_questions 等）
+	SourceID      uint   `gorm:"index" json:"source_id"` // 关联原表 id（doc_articles / hot_questions 等）
 	SourceSlug    string `gorm:"type:varchar(150);index" json:"source_slug,omitempty"`
 	Title         string `gorm:"type:varchar(300)" json:"title"`
-	Content       string `gorm:"type:text;not null" json:"content"`                // 400-800 字片段（中文）
-	ChunkIndex    int    `json:"chunk_index"`                                      // 同一 source 切出多段时的序号
-	Embedding     string `gorm:"type:mediumtext" json:"-"`                         // JSON float32[] 1024 维
-	EmbeddingHash string `gorm:"type:varchar(64);index" json:"embedding_hash"`     // md5(content)，内容变化时触发重建
+	Content       string `gorm:"type:text;not null" json:"content"`            // 400-800 字片段（中文）
+	ChunkIndex    int    `json:"chunk_index"`                                  // 同一 source 切出多段时的序号
+	Embedding     string `gorm:"type:mediumtext" json:"-"`                     // JSON float32[] 1024 维
+	EmbeddingHash string `gorm:"type:varchar(64);index" json:"embedding_hash"` // md5(content)，内容变化时触发重建
 	Tokens        int    `json:"tokens"`
-	Priority      int    `gorm:"default:0" json:"priority"`                        // 召回加权：doc=0 / faq=5 / accepted_qa=10 / hot_question=10
-	HitCount      int    `gorm:"default:0" json:"hit_count"`                       // 被召回次数（管理员按热度统计用）
+	Priority      int    `gorm:"default:0" json:"priority"`  // 召回加权：doc=0 / faq=5 / accepted_qa=10 / hot_question=10
+	HitCount      int    `gorm:"default:0" json:"hit_count"` // 被召回次数（管理员按热度统计用）
 	IsActive      bool   `gorm:"default:true;index" json:"is_active"`
 }
 
@@ -95,7 +104,7 @@ type AcceptedAnswer struct {
 	BaseModel
 	UserID       uint       `gorm:"index;not null" json:"user_id"`
 	SessionID    uint       `gorm:"index;not null" json:"session_id"`
-	MessageID    uint       `gorm:"uniqueIndex" json:"message_id"` // 一条消息只能被采纳一次
+	MessageID    uint       `gorm:"uniqueIndex" json:"message_id"`      // 一条消息只能被采纳一次
 	Question     string     `gorm:"type:text;not null" json:"question"` // 脱敏后的中文问题
 	Answer       string     `gorm:"type:text;not null" json:"answer"`   // 脱敏后的中文答案
 	Status       string     `gorm:"type:varchar(20);default:'pending_review';index" json:"status"`
@@ -113,15 +122,15 @@ func (AcceptedAnswer) TableName() string { return "accepted_answers" }
 // 发布后自动生成 knowledge_chunks（source_type=hot_question, priority=10），参与 RAG 检索
 type HotQuestion struct {
 	BaseModel
-	Title         string `gorm:"type:varchar(300);not null" json:"title"`          // 问题标题
-	QuestionBody  string `gorm:"type:text;not null" json:"question_body"`          // 详细描述（多种表达方式，帮助 RAG 召回）
-	CuratedAnswer string `gorm:"type:text;not null" json:"curated_answer"`         // 管理员编辑的 Markdown 答案
-	Category      string `gorm:"type:varchar(30);index" json:"category"`           // api / billing / channel / account / sdk
-	Tags          string `gorm:"type:varchar(300)" json:"tags,omitempty"`          // 逗号分隔
-	Priority      int    `gorm:"default:10" json:"priority"`                       // RAG 加权（默认 10，高于 doc_article）
-	HitCount      int    `gorm:"default:0" json:"hit_count"`                       // 被 RAG 召回次数
-	IsPublished   bool   `gorm:"default:false;index" json:"is_published"`          // 发布后才参与检索
-	ChunkID       *uint  `json:"chunk_id,omitempty"`                               // 发布后关联的 chunk id
+	Title         string `gorm:"type:varchar(300);not null" json:"title"`  // 问题标题
+	QuestionBody  string `gorm:"type:text;not null" json:"question_body"`  // 详细描述（多种表达方式，帮助 RAG 召回）
+	CuratedAnswer string `gorm:"type:text;not null" json:"curated_answer"` // 管理员编辑的 Markdown 答案
+	Category      string `gorm:"type:varchar(30);index" json:"category"`   // api / billing / channel / account / sdk
+	Tags          string `gorm:"type:varchar(300)" json:"tags,omitempty"`  // 逗号分隔
+	Priority      int    `gorm:"default:10" json:"priority"`               // RAG 加权（默认 10，高于 doc_article）
+	HitCount      int    `gorm:"default:0" json:"hit_count"`               // 被 RAG 召回次数
+	IsPublished   bool   `gorm:"default:false;index" json:"is_published"`  // 发布后才参与检索
+	ChunkID       *uint  `json:"chunk_id,omitempty"`                       // 发布后关联的 chunk id
 	AuthorID      uint   `gorm:"index" json:"author_id"`
 	LastEditedBy  *uint  `gorm:"index" json:"last_edited_by,omitempty"`
 }

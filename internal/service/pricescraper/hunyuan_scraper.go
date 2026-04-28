@@ -183,8 +183,11 @@ func (s *HunyuanScraper) doFetchModelList(ctx context.Context) ([]hunyuanAPIMode
 // mergeModels 合并 API 模型列表与补充价格数据
 func (s *HunyuanScraper) mergeModels(apiModels []hunyuanAPIModel, supplementary []ScrapedModel) []ScrapedModel {
 	suppMap := make(map[string]ScrapedModel, len(supplementary))
+	suppKeys := make([]string, 0, len(supplementary))
 	for _, sm := range supplementary {
-		suppMap[normalizeHunyuanID(sm.ModelName)] = sm
+		key := normalizeHunyuanID(sm.ModelName)
+		suppMap[key] = sm
+		suppKeys = append(suppKeys, key)
 	}
 
 	processed := make(map[string]bool)
@@ -209,13 +212,19 @@ func (s *HunyuanScraper) mergeModels(apiModels []hunyuanAPIModel, supplementary 
 			PricingUnit: inferHunyuanPricingUnit(m.ID),
 		}
 
-		if supp, ok := suppMap[key]; ok {
+		if supp, ok := lookupHunyuanSupplement(key, suppMap, suppKeys); ok {
 			sm.InputPrice = supp.InputPrice
 			sm.OutputPrice = supp.OutputPrice
 			sm.PriceTiers = supp.PriceTiers
-			sm.DisplayName = supp.DisplayName
-			sm.ModelType = supp.ModelType
-			sm.PricingUnit = supp.PricingUnit
+			if normalizeHunyuanID(supp.ModelName) == key {
+				sm.DisplayName = supp.DisplayName
+			}
+			if supp.ModelType != "" {
+				sm.ModelType = supp.ModelType
+			}
+			if supp.PricingUnit != "" {
+				sm.PricingUnit = supp.PricingUnit
+			}
 		}
 
 		// 腾讯云混元官方定价页（https://cloud.tencent.com/document/product/1729/97731）
@@ -275,6 +284,32 @@ func getHunyuanSupplementaryPrices() []ScrapedModel {
 			Currency:    "CNY",
 			PricingUnit: PricingUnitPerMillionTokens,
 			ModelType:   "LLM",
+		},
+		{
+			ModelName:   "hunyuan-2.0-thinking",
+			DisplayName: "Tencent HY 2.0 Think",
+			InputPrice:  3.975,
+			OutputPrice: 15.9,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+			PriceTiers: []model.PriceTier{
+				{Name: "0-32k", InputMax: i64Hunyuan(32000), InputPrice: 3.975, OutputPrice: 15.9},
+				{Name: "32k-128k", InputMin: 32000, InputMinExclusive: true, InputMax: i64Hunyuan(128000), InputPrice: 5.3, OutputPrice: 21.2},
+			},
+		},
+		{
+			ModelName:   "hunyuan-2.0-instruct",
+			DisplayName: "Tencent HY 2.0 Instruct",
+			InputPrice:  3.18,
+			OutputPrice: 7.95,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+			PriceTiers: []model.PriceTier{
+				{Name: "0-32k", InputMax: i64Hunyuan(32000), InputPrice: 3.18, OutputPrice: 7.95},
+				{Name: "32k-128k", InputMin: 32000, InputMinExclusive: true, InputMax: i64Hunyuan(128000), InputPrice: 4.505, OutputPrice: 11.13},
+			},
 		},
 		{
 			ModelName:   "hunyuan-pro",
@@ -412,6 +447,15 @@ func getHunyuanSupplementaryPrices() []ScrapedModel {
 			PricingUnit: PricingUnitPerMillionTokens,
 			ModelType:   "VLM",
 		},
+		{
+			ModelName:   "hunyuan-t1-vision",
+			DisplayName: "Hunyuan T1 Vision",
+			InputPrice:  3,
+			OutputPrice: 9,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "VLM",
+		},
 
 		// ---- T1 深度推理系列（对标 DeepSeek-R1）----
 		{
@@ -463,6 +507,15 @@ func getHunyuanSupplementaryPrices() []ScrapedModel {
 			PricingUnit: PricingUnitPerMillionTokens,
 			ModelType:   "LLM",
 		},
+		{
+			ModelName:   "hunyuan-large-role",
+			DisplayName: "Hunyuan Large Role",
+			InputPrice:  2.4,
+			OutputPrice: 9.6,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "LLM",
+		},
 
 		// ---- 视觉扩展 ----
 		{
@@ -470,6 +523,15 @@ func getHunyuanSupplementaryPrices() []ScrapedModel {
 			DisplayName: "Hunyuan Standard Vision",
 			InputPrice:  8,
 			OutputPrice: 12,
+			Currency:    "CNY",
+			PricingUnit: PricingUnitPerMillionTokens,
+			ModelType:   "VLM",
+		},
+		{
+			ModelName:   "hunyuan-vision-1.5-instruct",
+			DisplayName: "Tencent HY Vision 1.5 Instruct",
+			InputPrice:  3,
+			OutputPrice: 9,
 			Currency:    "CNY",
 			PricingUnit: PricingUnitPerMillionTokens,
 			ModelType:   "VLM",
@@ -497,8 +559,8 @@ func getHunyuanSupplementaryPrices() []ScrapedModel {
 		{
 			ModelName:   "hunyuan-a13b",
 			DisplayName: "Hunyuan A13B (Open Source)",
-			InputPrice:  0,
-			OutputPrice: 0,
+			InputPrice:  0.5,
+			OutputPrice: 2,
 			Currency:    "CNY",
 			PricingUnit: PricingUnitPerMillionTokens,
 			ModelType:   "LLM",
@@ -555,7 +617,23 @@ func i64Hunyuan(v int64) *int64 { return &v }
 
 // normalizeHunyuanID 规范化模型 ID 用于比较
 func normalizeHunyuanID(id string) string {
-	return strings.ToLower(strings.TrimSpace(id))
+	return NormalizeModelName(id)
+}
+
+func lookupHunyuanSupplement(apiKey string, suppMap map[string]ScrapedModel, suppKeys []string) (ScrapedModel, bool) {
+	if v, ok := suppMap[apiKey]; ok {
+		return v, true
+	}
+	bestKey := ""
+	for _, k := range suppKeys {
+		if strings.HasPrefix(apiKey, k+"-") && len(k) > len(bestKey) {
+			bestKey = k
+		}
+	}
+	if bestKey != "" {
+		return suppMap[bestKey], true
+	}
+	return ScrapedModel{}, false
 }
 
 // inferHunyuanDisplayName 根据模型 ID 推断展示名称

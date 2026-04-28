@@ -140,6 +140,73 @@ func TestIsAuditRelevant(t *testing.T) {
 	}
 }
 
+func TestLookupAuditMeta_FallbackForSensitiveWrite(t *testing.T) {
+	meta, ok := LookupAuditMeta("PATCH", "/api/v1/user/preferences")
+	if !ok {
+		t.Fatal("user write fallback should be audit-relevant")
+	}
+	if meta.Menu != "用户中心" || meta.Resource != "user" {
+		t.Fatalf("fallback meta = %+v, want user center meta", meta)
+	}
+
+	if _, ok := LookupAuditMeta("GET", "/api/v1/user/preferences"); ok {
+		t.Fatal("GET should not be audit-relevant")
+	}
+	if _, ok := LookupAuditMeta("POST", "/api/v1/admin/unregistered"); ok {
+		t.Fatal("unregistered admin writes must not use fallback; PermissionGate needs explicit metadata")
+	}
+}
+
+func TestRouteMap_CurrentAdminWriteCoverage(t *testing.T) {
+	required := []string{
+		"POST /api/v1/admin/model-aliases",
+		"POST /api/v1/admin/model-aliases/infer",
+		"POST /api/v1/admin/model-ops/batch-execute",
+		"POST /api/v1/admin/models/check-preview",
+		"POST /api/v1/admin/models/check-task",
+		"PUT /api/v1/admin/models/batch-status",
+		"DELETE /api/v1/admin/models/batch-delete",
+		"PUT /api/v1/admin/channel-models/:id",
+		"POST /api/v1/admin/custom-channels",
+		"PATCH /api/v1/admin/custom-channels/:id/toggle",
+		"POST /api/v1/admin/tasks",
+		"POST /api/v1/admin/tasks/:id/apply-prices",
+		"POST /api/v1/admin/param-mappings",
+		"PUT /api/v1/admin/param-mappings/supplier/:code",
+		"POST /api/v1/admin/param-mappings/templates/recommended/apply",
+		"POST /api/v1/admin/reconciliation/snapshots",
+		"POST /api/v1/admin/cache/clear/:prefix",
+	}
+	for _, key := range required {
+		method, path := splitKey(key)
+		if _, ok := Lookup(method, path); !ok {
+			t.Errorf("missing route metadata for %s", key)
+			continue
+		}
+		if !IsAuditRelevant(method, path) {
+			t.Errorf("route %s should be audit-relevant", key)
+		}
+	}
+}
+
+func TestRouteMap_NoMojibakeInDisplayFields(t *testing.T) {
+	suspicious := []string{"�", "锟", "Ã", "Â", "瀹", "鏂", "鐢", "绠"}
+	check := func(name string, m map[string]RouteMeta) {
+		for key, meta := range m {
+			fields := []string{meta.Menu, meta.Feature}
+			for _, field := range fields {
+				for _, bad := range suspicious {
+					if strings.Contains(field, bad) {
+						t.Errorf("%s[%q] has mojibake-like display field %q", name, key, field)
+					}
+				}
+			}
+		}
+	}
+	check("routeMap", routeMap)
+	check("readRouteMap", readRouteMap)
+}
+
 // TestRouteMapEntries_Completeness 返回的条目数等于两表之和
 func TestRouteMapEntries_Completeness(t *testing.T) {
 	entries := RouteMapEntries()

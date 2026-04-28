@@ -103,6 +103,41 @@ func TestExtractChatExtraParamsKeepsOpenAIAdvancedFields(t *testing.T) {
 	}
 }
 
+func TestNormalizeChatCompletionRequestUsesMaxCompletionTokens(t *testing.T) {
+	raw := mustRawMap(t, `{
+		"model":"gpt-4o",
+		"messages":[{"role":"user","content":"hello"}],
+		"max_completion_tokens":321
+	}`)
+	req := chatCompletionRequest{Model: "gpt-4o"}
+
+	normalizeChatCompletionRequest(&req, raw)
+
+	if req.MaxTokens != 321 {
+		t.Fatalf("MaxTokens=%d, want 321 from max_completion_tokens", req.MaxTokens)
+	}
+	extra := extractChatExtraParams(raw)
+	if _, exists := extra["max_completion_tokens"]; exists {
+		t.Fatalf("max_completion_tokens should be handled by system MaxTokens, got extra=%#v", extra)
+	}
+}
+
+func TestNormalizeChatCompletionRequestKeepsMaxTokensPriority(t *testing.T) {
+	raw := mustRawMap(t, `{
+		"model":"gpt-4o",
+		"messages":[{"role":"user","content":"hello"}],
+		"max_tokens":123,
+		"max_completion_tokens":321
+	}`)
+	req := chatCompletionRequest{Model: "gpt-4o", MaxTokens: 123}
+
+	normalizeChatCompletionRequest(&req, raw)
+
+	if req.MaxTokens != 123 {
+		t.Fatalf("MaxTokens=%d, want existing max_tokens priority", req.MaxTokens)
+	}
+}
+
 func mustRawMap(t *testing.T, body string) map[string]json.RawMessage {
 	t.Helper()
 	var raw map[string]json.RawMessage

@@ -82,19 +82,21 @@ func TestSelectTier_MultiTier_BoundaryMatch(t *testing.T) {
 
 // TestCacheRatioComputation 验收项 3：缓存费率推导公式
 // 测试 CalculateCostWithCache 中 ratio 闭包的核心语义：
-//   cache_ratio = cache_input_price_rmb / input_cost_rmb
+//
+//	cache_ratio = cache_input_price_rmb / input_cost_rmb
+//
 // （当 input_cost_rmb=0 时使用 fallback：auto=0.5 / explicit=0.1 / both=0.2）
 func TestCacheRatioComputation(t *testing.T) {
 	cases := []struct {
-		name           string
-		inputCostRMB   float64
-		cacheInputRMB  float64
-		expectedRatio  float64
+		name          string
+		inputCostRMB  float64
+		cacheInputRMB float64
+		expectedRatio float64
 	}{
-		{"claude_typical", 1.5, 0.15, 0.10},        // 10%
-		{"doubao_typical", 0.8, 0.32, 0.40},        // 40%（火山）
-		{"qwen_implicit", 1.0, 0.20, 0.20},         // 20%（阿里 auto）
-		{"gpt_4o_style", 2.5, 1.25, 0.50},          // 50%（OpenAI auto）
+		{"claude_typical", 1.5, 0.15, 0.10}, // 10%
+		{"doubao_typical", 0.8, 0.32, 0.40}, // 40%（火山）
+		{"qwen_implicit", 1.0, 0.20, 0.20},  // 20%（阿里 auto）
+		{"gpt_4o_style", 2.5, 1.25, 0.50},   // 50%（OpenAI auto）
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -120,10 +122,12 @@ func TestCacheRatioComputation(t *testing.T) {
 // 阶梯二 (32k, +∞):  input=10元/M, output=40元/M
 //
 // 请求 1：输入 30k tokens, 输出 2k tokens（命中 tier1）
-//   cost = 30000 × 6/1M + 2000 × 24/1M = 0.18 + 0.048 = 0.228 元
+//
+//	cost = 30000 × 6/1M + 2000 × 24/1M = 0.18 + 0.048 = 0.228 元
 //
 // 请求 2：输入 50k tokens, 输出 3k tokens（命中 tier2，更贵）
-//   cost = 50000 × 10/1M + 3000 × 40/1M = 0.5 + 0.12 = 0.62 元
+//
+//	cost = 50000 × 10/1M + 3000 × 40/1M = 0.5 + 0.12 = 0.62 元
 //
 // 关键断言：同样的 token 数，命中不同阶梯时价格必须差异化
 func TestTierBillingFormula(t *testing.T) {
@@ -145,15 +149,15 @@ func TestTierBillingFormula(t *testing.T) {
 	}
 
 	cases := []struct {
-		name       string
-		in, out    int64
-		wantTier   int
-		wantCost   float64
+		name     string
+		in, out  int64
+		wantTier int
+		wantCost float64
 	}{
-		{"tier1_boundary_30k", 30_000, 2_000, 0, 0.228},      // 30k 命中 tier1
-		{"tier1_at_32k", 32_000, 1_000, 0, 0.216},           // 32k 闭区间上界仍 tier1: 32000×6/M + 1000×24/M = 0.192 + 0.024 = 0.216
-		{"tier2_50k", 50_000, 3_000, 1, 0.62},                // 50k 命中 tier2
-		{"tier2_large_100k", 100_000, 5_000, 1, 1.2},         // 100k 命中 tier2: 100000×10/M + 5000×40/M = 1.0 + 0.2 = 1.2
+		{"tier1_boundary_30k", 30_000, 2_000, 0, 0.228}, // 30k 命中 tier1
+		{"tier1_at_32k", 32_000, 1_000, 0, 0.216},       // 32k 闭区间上界仍 tier1: 32000×6/M + 1000×24/M = 0.192 + 0.024 = 0.216
+		{"tier2_50k", 50_000, 3_000, 1, 0.62},           // 50k 命中 tier2
+		{"tier2_large_100k", 100_000, 5_000, 1, 1.2},    // 100k 命中 tier2: 100000×10/M + 5000×40/M = 1.0 + 0.2 = 1.2
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -184,10 +188,11 @@ func TestTierBillingFormula(t *testing.T) {
 // 用户请求：1M input，其中 500k 缓存命中；0 write tokens；100k output
 // 参数：input 1.0元/M，cache_input 0.1元/M（×0.1 ratio），output 2.0元/M
 // 预期：
-//   非缓存部分：500k × 1.0/1M = 0.5 元
-//   缓存部分：   500k × 0.1/1M = 0.05 元
-//   输出部分：   100k × 2.0/1M = 0.2 元
-//   合计：0.75 元
+//
+//	非缓存部分：500k × 1.0/1M = 0.5 元
+//	缓存部分：   500k × 0.1/1M = 0.05 元
+//	输出部分：   100k × 2.0/1M = 0.2 元
+//	合计：0.75 元
 func TestCacheCostFormula(t *testing.T) {
 	inputPricePerM := 1.0
 	cacheRatio := 0.1

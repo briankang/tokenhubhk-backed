@@ -45,6 +45,15 @@ func TestRunSeedWangsuVideo(t *testing.T) {
 	if math.Abs(sora.InputCostRMB-wantCost) > 0.000001 {
 		t.Fatalf("sora cost=%f, want %f", sora.InputCostRMB, wantCost)
 	}
+	if sora.PriceSourceCurrency != "USD" {
+		t.Fatalf("sora source currency=%q, want USD", sora.PriceSourceCurrency)
+	}
+	if math.Abs(sora.PriceSourceExchangeRate-USDCNYSnapshot) > 0.000001 {
+		t.Fatalf("sora exchange rate=%f, want %f", sora.PriceSourceExchangeRate, USDCNYSnapshot)
+	}
+	if math.Abs(sora.InputCostUSD-0.10) > 0.000001 {
+		t.Fatalf("sora source usd=%f, want %f", sora.InputCostUSD, 0.10)
+	}
 	var pricing model.ModelPricing
 	if err := db.Where("model_id = ?", sora.ID).First(&pricing).Error; err != nil {
 		t.Fatal(err)

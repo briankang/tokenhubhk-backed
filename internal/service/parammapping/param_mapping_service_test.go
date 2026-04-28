@@ -700,3 +700,185 @@ func TestCacheInvalidation(t *testing.T) {
 		t.Error("expected cache to be empty after invalidation")
 	}
 }
+
+func TestGetCoverageReport(t *testing.T) {
+	ctx := context.Background()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	supplier := &model.Supplier{
+		Name:       "Coverage Supplier",
+		Code:       "coverage_supplier_" + suffix,
+		IsActive:   true,
+		Status:     "active",
+		AccessType: "api",
+	}
+	if err := testDB.Create(supplier).Error; err != nil {
+		t.Fatalf("create supplier: %v", err)
+	}
+
+	category := &model.ModelCategory{SupplierID: supplier.ID, Name: "Coverage", Code: "coverage_" + suffix}
+	if err := testDB.Create(category).Error; err != nil {
+		t.Fatalf("create category: %v", err)
+	}
+	if err := testDB.Create(&model.AIModel{
+		CategoryID: category.ID,
+		SupplierID: supplier.ID,
+		ModelName:  "coverage-model-" + suffix,
+		ModelType:  "LLM",
+		Status:     "online",
+		IsActive:   true,
+	}).Error; err != nil {
+		t.Fatalf("create ai model: %v", err)
+	}
+
+	p1 := &model.PlatformParam{ParamName: uniqueParamName("coverage_supported"), ParamType: "bool", Category: "thinking", IsActive: true}
+	p2 := &model.PlatformParam{ParamName: uniqueParamName("coverage_unsupported"), ParamType: "int", Category: "thinking", IsActive: true}
+	p3 := &model.PlatformParam{ParamName: uniqueParamName("coverage_missing"), ParamType: "json", Category: "format", IsActive: true}
+	for _, p := range []*model.PlatformParam{p1, p2, p3} {
+		if err := testSvc.CreateParam(ctx, p); err != nil {
+			t.Fatalf("create param: %v", err)
+		}
+		defer testSvc.DeleteParam(ctx, p.ID)
+	}
+
+	if err := testSvc.UpsertMapping(ctx, &model.SupplierParamMapping{
+		PlatformParamID: p1.ID,
+		SupplierCode:    supplier.Code,
+		VendorParamName: p1.ParamName,
+		TransformType:   "direct",
+		Supported:       true,
+	}); err != nil {
+		t.Fatalf("upsert supported mapping: %v", err)
+	}
+	if err := testSvc.UpsertMapping(ctx, &model.SupplierParamMapping{
+		PlatformParamID: p2.ID,
+		SupplierCode:    supplier.Code,
+		VendorParamName: p2.ParamName,
+		TransformType:   "none",
+		Supported:       false,
+	}); err != nil {
+		t.Fatalf("upsert unsupported mapping: %v", err)
+	}
+
+	report, err := testSvc.GetCoverageReport(ctx)
+	if err != nil {
+		t.Fatalf("GetCoverageReport: %v", err)
+	}
+	var got *SupplierParamCoverage
+	for i := range report.Suppliers {
+		if report.Suppliers[i].SupplierCode == supplier.Code {
+			got = &report.Suppliers[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("coverage supplier not found in report")
+	}
+	if got.ActiveModelCount != 1 {
+		t.Fatalf("active model count=%d, want 1", got.ActiveModelCount)
+	}
+	if got.SupportedMappings < 1 || got.UnsupportedMappings < 1 || got.MissingMappings < 1 {
+		t.Fatalf("unexpected coverage counts: %+v", got)
+	}
+	if got.CoveragePercent <= 0 {
+		t.Fatalf("coverage percent should be positive: %+v", got)
+	}
+}
+
+func TestApplyRecommendedTemplate(t *testing.T) {
+	ctx := context.Background()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	params := []*model.PlatformParam{
+		{ParamName: uniqueParamName("temperature"), ParamType: "float", Category: "penalty", IsActive: true},
+		{ParamName: uniqueParamName("reasoning_effort"), ParamType: "string", Category: "thinking", IsActive: true},
+		{ParamName: uniqueParamName("enable_thinking"), ParamType: "bool", Category: "thinking", IsActive: true},
+	}
+	params[0].ParamName = "temperature_" + suffix
+	params[1].ParamName = "reasoning_effort"
+	params[2].ParamName = "enable_thinking"
+	for _, p := range params {
+		_ = testDB.Unscoped().Where("param_name = ?", p.ParamName).Delete(&model.PlatformParam{}).Error
+		if err := testSvc.CreateParam(ctx, p); err != nil {
+			t.Fatalf("create param %s: %v", p.ParamName, err)
+		}
+		defer testSvc.DeleteParam(ctx, p.ID)
+	}
+
+	preview, err := testSvc.PreviewRecommendedTemplate(ctx, "openai", false)
+	if err != nil {
+		t.Fatalf("PreviewRecommendedTemplate: %v", err)
+	}
+	if preview.Created == 0 {
+		t.Fatalf("expected preview changes, got %+v", preview)
+	}
+
+	applied, err := testSvc.ApplyRecommendedTemplate(ctx, "openai", false)
+	if err != nil {
+		t.Fatalf("ApplyRecommendedTemplate: %v", err)
+	}
+	if !applied.Applied || applied.Created == 0 {
+		t.Fatalf("unexpected apply result: %+v", applied)
+	}
+
+	var unsupported model.SupplierParamMapping
+	if err := testDB.Where("supplier_code = ? AND platform_param_id = ?", "openai", params[2].ID).First(&unsupported).Error; err != nil {
+		t.Fatalf("find unsupported mapping: %v", err)
+	}
+	if unsupported.Supported {
+		t.Fatalf("enable_thinking should be marked unsupported for openai")
+	}
+
+	second, err := testSvc.PreviewRecommendedTemplate(ctx, "openai", false)
+	if err != nil {
+		t.Fatalf("second preview: %v", err)
+	}
+	if second.Created != 0 || second.Updated != 0 {
+		t.Fatalf("non-overwrite preview should skip existing mappings: %+v", second)
+	}
+}
+
+func TestEnsureStandardParamDefinitions(t *testing.T) {
+	ctx := context.Background()
+	for _, name := range []string{"temperature", "top_p", "presence_penalty", "frequency_penalty", "response_format", "enable_search", "reasoning_effort", "enable_thinking", "thinking_budget", "top_k", "seed", "stop"} {
+		_ = testDB.Unscoped().Where("param_name = ?", name).Delete(&model.PlatformParam{}).Error
+	}
+
+	preview, err := testSvc.PreviewStandardParamDefinitions(ctx, false)
+	if err != nil {
+		t.Fatalf("PreviewStandardParamDefinitions: %v", err)
+	}
+	if preview.Created == 0 {
+		t.Fatalf("expected standard params to be created: %+v", preview)
+	}
+
+	applied, err := testSvc.EnsureStandardParamDefinitions(ctx, false)
+	if err != nil {
+		t.Fatalf("EnsureStandardParamDefinitions: %v", err)
+	}
+	if !applied.Applied || applied.Created == 0 {
+		t.Fatalf("unexpected ensure result: %+v", applied)
+	}
+
+	var temperature model.PlatformParam
+	if err := testDB.Where("param_name = ?", "temperature").First(&temperature).Error; err != nil {
+		t.Fatalf("temperature param missing: %v", err)
+	}
+	if temperature.ParamType != "float" || temperature.Category != "sampling" || !temperature.IsActive {
+		t.Fatalf("unexpected temperature definition: %+v", temperature)
+	}
+
+	second, err := testSvc.PreviewStandardParamDefinitions(ctx, false)
+	if err != nil {
+		t.Fatalf("second preview: %v", err)
+	}
+	if second.Created != 0 || second.Updated != 0 {
+		t.Fatalf("expected second preview to skip existing definitions: %+v", second)
+	}
+
+	overwrite, err := testSvc.PreviewStandardParamDefinitions(ctx, true)
+	if err != nil {
+		t.Fatalf("overwrite preview: %v", err)
+	}
+	if overwrite.Updated == 0 {
+		t.Fatalf("expected overwrite preview to update existing definitions: %+v", overwrite)
+	}
+}

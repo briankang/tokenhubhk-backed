@@ -46,6 +46,8 @@ type FreezeRecord struct {
 	FrozenAmountRMB float64 `gorm:"type:decimal(16,4);default:0" json:"frozenAmountRmb"` // 预扣冻结金额（人民币）
 	ActualCost     int64   `gorm:"type:bigint;default:0" json:"actualCost"`           // 实际消费金额（积分 credits）
 	ActualCostRMB  float64 `gorm:"type:decimal(16,4);default:0" json:"actualCostRmb"` // 实际消费金额（人民币）
+	FrozenUnits    int64   `gorm:"type:bigint;default:0" json:"frozenUnits"`          // 预扣冻结金额（billing_units）
+	ActualCostUnits int64  `gorm:"type:bigint;default:0" json:"actualCostUnits"`      // 实际消费金额（billing_units）
 	Status         string  `gorm:"size:20;default:FROZEN;index" json:"status"`        // FROZEN / SETTLED / RELEASED
 	ModelName      string  `gorm:"size:100" json:"modelName"`
 	RequestID      string  `gorm:"size:50" json:"requestId"`

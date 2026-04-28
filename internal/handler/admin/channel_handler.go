@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -26,6 +27,7 @@ func NewChannelHandler(svc *channelsvc.ChannelService) *ChannelHandler {
 // Register 注册渠道管理路由到路由组
 func (h *ChannelHandler) Register(rg *gin.RouterGroup) {
 	rg.GET("/channels", h.List)
+	rg.GET("/channels/custom-params/schema", h.CustomParamSchema)
 	rg.POST("/channels", h.Create)
 	rg.GET("/channels/:id", h.GetByID)
 	rg.PUT("/channels/:id", h.Update)
@@ -37,19 +39,26 @@ func (h *ChannelHandler) Register(rg *gin.RouterGroup) {
 
 // createChannelReq is the request body for creating a channel.
 type createChannelReq struct {
-	Name                  string `json:"name" binding:"required"`
-	SupplierID            uint   `json:"supplier_id" binding:"required"`
-	Type                  string `json:"type" binding:"required"`
-	Endpoint              string `json:"endpoint" binding:"required"`
-	APIKey                string `json:"api_key" binding:"required"`
-	Models                []byte `json:"models,omitempty"`
-	Weight                int    `json:"weight"`
-	Priority              int    `json:"priority"`
-	Status                string `json:"status"`
-	MaxConcurrency        int    `json:"max_concurrency"`
-	QPM                   int    `json:"qpm"`
-	PreferenceTag         string `json:"preference_tag"`         // 偏好标签: availability/cost/speed
-	SupportedCapabilities string `json:"supported_capabilities"` // 支持能力，逗号分隔: chat,image,video,tts,asr,embedding
+	Name                  string          `json:"name" binding:"required"`
+	SupplierID            uint            `json:"supplier_id" binding:"required"`
+	Type                  string          `json:"type" binding:"required"`
+	Endpoint              string          `json:"endpoint" binding:"required"`
+	APIKey                string          `json:"api_key" binding:"required"`
+	Models                []byte          `json:"models,omitempty"`
+	Weight                int             `json:"weight"`
+	Priority              int             `json:"priority"`
+	Status                string          `json:"status"`
+	MaxConcurrency        int             `json:"max_concurrency"`
+	QPM                   int             `json:"qpm"`
+	PreferenceTag         string          `json:"preference_tag"`         // 偏好标签: availability/cost/speed
+	SupportedCapabilities string          `json:"supported_capabilities"` // 支持能力，逗号分隔: chat,image,video,tts,asr,embedding
+	ChannelType           string          `json:"channel_type"`
+	ApiProtocol           string          `json:"api_protocol"`
+	ApiPath               string          `json:"api_path"`
+	AuthMethod            string          `json:"auth_method"`
+	AuthHeader            string          `json:"custom_auth_header"`
+	ContextLength         int             `json:"context_length"`
+	CustomParams          json.RawMessage `json:"custom_params,omitempty"`
 }
 
 // channelFromCreateReq converts a create request to a model.Channel.
@@ -72,6 +81,13 @@ func channelFromCreateReq(req *createChannelReq) *model.Channel {
 		QPM:                   req.QPM,
 		PreferenceTag:         req.PreferenceTag,
 		SupportedCapabilities: caps,
+		ChannelType:           req.ChannelType,
+		ApiProtocol:           req.ApiProtocol,
+		ApiPath:               req.ApiPath,
+		AuthMethod:            req.AuthMethod,
+		AuthHeader:            req.AuthHeader,
+		ContextLength:         req.ContextLength,
+		CustomParams:          req.CustomParams,
 	}
 }
 
@@ -120,6 +136,12 @@ func (h *ChannelHandler) List(c *gin.Context) {
 	response.PageResult(c, channels, total, page, pageSize)
 }
 
+// CustomParamSchema returns the custom_params schema for the selected supplier.
+func (h *ChannelHandler) CustomParamSchema(c *gin.Context) {
+	code := c.Query("supplier_code")
+	response.Success(c, channelsvc.GetCustomParamSchema(code))
+}
+
 // GetByID handles GET /channels/:id
 func (h *ChannelHandler) GetByID(c *gin.Context) {
 	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
@@ -161,6 +183,10 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 		if s, isStr := v.(string); isStr && s == "" {
 			delete(updates, "api_key")
 		}
+	}
+	if v, ok := updates["custom_auth_header"]; ok {
+		updates["auth_header"] = v
+		delete(updates, "custom_auth_header")
 	}
 
 	if err := h.svc.Update(c.Request.Context(), uint(id), updates); err != nil {
